@@ -43,8 +43,8 @@ results/
 *.ckpt
 
 # Data
+data/
 *.pkl
 *.pickle
 *.h5
 *.hdf5
-
