@@ -666,8 +666,12 @@ def effective_config_grid(configs: Sequence[Config]) -> tuple[list[Config], dict
     if not effective:
         raise ValueError("config ladder is empty")
     families = {config.family for config in effective}
-    if families != {"off", "strict_order", "relaxed_order"}:
-        raise ValueError(f"config ladder must cover all three families, got {sorted(families)}")
+    required_families = {"off", "strict_order"}
+    if not required_families.issubset(families):
+        raise ValueError(
+            "config ladder must cover the formal off and strict_order families, "
+            f"got {sorted(families)}"
+        )
     proof_groups = [
         {
             "semantic_key": list(key),
@@ -687,8 +691,12 @@ def effective_config_grid(configs: Sequence[Config]) -> tuple[list[Config], dict
             "one canonical representative is retained per ef_search"
         ),
         "iterative_budget_semantics": (
-            "strict_order and relaxed_order use explicit correlated budget rungs; "
+            "present iterative families use explicit correlated budget rungs; "
             "max_scan_tuples and scan_mem_multiplier are never Cartesian-expanded"
+        ),
+        "families": sorted(families, key=family_order.__getitem__),
+        "required_formal_families": sorted(
+            required_families, key=family_order.__getitem__
         ),
         "groups": proof_groups,
     }
@@ -697,7 +705,11 @@ def effective_config_grid(configs: Sequence[Config]) -> tuple[list[Config], dict
 
 def family_max_budget_configs(configs: Sequence[Config]) -> dict[str, Config]:
     result: dict[str, Config] = {}
-    for family in ("off", "strict_order", "relaxed_order"):
+    family_order = {"off": 0, "strict_order": 1, "relaxed_order": 2}
+    present_families = sorted(
+        {config.family for config in configs}, key=family_order.__getitem__
+    )
+    for family in present_families:
         family_configs = [config for config in configs if config.family == family]
         result[family] = max(
             family_configs,

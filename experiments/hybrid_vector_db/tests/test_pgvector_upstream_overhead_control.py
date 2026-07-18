@@ -87,6 +87,21 @@ class PgvectorUpstreamOverheadControlTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "conflicting budget_rank"):
             runner.effective_config_grid(conflicting)
 
+    def test_formal_grid_does_not_require_exploratory_relaxed_order(self):
+        configs = [
+            runner.Config(100, "off", 100_000, 1.0, 0),
+            runner.Config(100, "strict_order", 100_000, 1.0, 1),
+            runner.Config(100, "strict_order", 5_000_000, 32.0, 3),
+        ]
+
+        effective, proof = runner.effective_config_grid(configs)
+        max_budget = runner.family_max_budget_configs(effective)
+
+        self.assertEqual(proof["families"], ["off", "strict_order"])
+        self.assertEqual(proof["required_formal_families"], ["off", "strict_order"])
+        self.assertEqual(set(max_budget), {"off", "strict_order"})
+        self.assertEqual(max_budget["strict_order"].budget_rank, 3)
+
     def test_default_query_count_bound_is_53200_per_implementation(self):
         counts = runner.default_query_count_bounds(28)
 
