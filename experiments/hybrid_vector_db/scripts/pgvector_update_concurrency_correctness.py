@@ -43,10 +43,18 @@ OPERATIONS = (
 DURING_BUILD_OPERATIONS = set(OPERATIONS) - {"truncate_tid_reuse"}
 PHASES = ("build_before_write", "write_during_fragment_build", "write_before_load")
 QUERY_VECTORS = ("[0,0,0]", "[0.25,0.25,0.25]", "[1,1,1]")
+ARTIFACT_SCHEMA_VERSION = "pgvector_update_concurrency_correctness.v2"
+CORRECTNESS_CONTRACT = "same_transaction_snapshot_v2"
+TIE_CONTRACT = "distance,id_or_distance_boundary_v1"
+DISTANCE_TOLERANCE = 1e-12
 
 
 class StrictCorrectnessFailure(RuntimeError):
     """Raised when a guided result is not exactly equal to SQL truth."""
+
+
+class GuidedPlanChanged(RuntimeError):
+    """Raised when adding the deterministic id tie-break removes the HNSW path."""
 
 
 @dataclass(frozen=True)
@@ -135,6 +143,61 @@ def validate_result(result_ids: Iterable[int], truth_ids: Iterable[int]) -> None
         raise StrictCorrectnessFailure(
             f"ordered mismatch: result={list(result)} truth={list(truth)}"
         )
+
+
+def validate_tie_aware_result(
+    result_rows: Iterable[tuple[int, float]],
+    boundary_rows: Iterable[tuple[int, float]],
+    k: int,
+    *,
+    tolerance: float = DISTANCE_TOLERANCE,
+) -> None:
+    """Validate top-k while allowing arbitrary IDs at the kth distance tie.
+
+    ``boundary_rows`` is the exact, distance-ordered set through the kth
+    distance.  Rows strictly closer than that boundary are mandatory; rows at
+    the boundary may be substituted because an HNSW plan is not required to
+    impose a secondary heap-id ordering.
+    """
+    result = tuple((int(row[0]), float(row[1])) for row in result_rows)
+    boundary = tuple((int(row[0]), float(row[1])) for row in boundary_rows)
+    target = min(k, len(boundary))
+    if len(result) != target:
+        raise StrictCorrectnessFailure(
+            f"tie-aware cardinality mismatch: result={len(result)} truth={target}"
+        )
+    if not boundary:
+        return
+    kth_distance = boundary[target - 1][1]
+    required = {
+        row_id for row_id, distance in boundary
+        if distance < kth_distance - tolerance
+    }
+    result_ids = {row_id for row_id, _ in result}
+    missing = sorted(required - result_ids)
+    if missing:
+        raise StrictCorrectnessFailure(
+            f"false negative before tie boundary: missing={missing} boundary={kth_distance}"
+        )
+    outside = [row_id for row_id, distance in result if distance > kth_distance + tolerance]
+    if outside:
+        raise StrictCorrectnessFailure(
+            f"result crosses tie boundary: ids={outside} boundary={kth_distance}"
+        )
+
+
+def _comparison_isolation(schedule_isolation: str) -> str:
+    """Return the isolation that makes the two oracle statements one snapshot.
+
+    PostgreSQL READ COMMITTED assigns a snapshot per statement.  The harness
+    therefore uses a short REPEATABLE READ comparison transaction for RC
+    schedule cases and records that distinction in every result row.
+    """
+    if schedule_isolation == "read_committed":
+        return "repeatable_read"
+    if schedule_isolation == "repeatable_read":
+        return "repeatable_read"
+    raise ValueError(f"unknown isolation: {schedule_isolation}")
 
 
 def strict_failure_status(records: Iterable[dict[str, Any]]) -> int:
@@ -258,6 +321,18 @@ def _begin(cur: Any, isolation: str) -> None:
     cur.execute(f"BEGIN ISOLATION LEVEL {level}")
 
 
+def _start_comparison_transaction(conn: Any, cur: Any, schedule_isolation: str) -> tuple[Any, str]:
+    """Put the query backend in a transaction with one stable oracle snapshot."""
+    comparison_isolation = _comparison_isolation(schedule_isolation)
+    if schedule_isolation == "read_committed":
+        # RC's current transaction remains responsible for the schedule
+        # barriers.  Its query statements must not be paired across snapshots.
+        conn.commit()
+        cur = conn.cursor()
+        _begin(cur, comparison_isolation)
+    return cur, comparison_isolation
+
+
 def _epoch(cur: Any, table: str) -> int:
     cur.execute(
         "SELECT epoch FROM public.pgvector_hnsw_fragment_epoch "
@@ -277,13 +352,23 @@ def _activate(cur: Any, table: str, index: str, atom: str, kind: str) -> dict[st
     return _json_profile(cur.fetchone()[0])
 
 
-def _query_statement(sql: Any, table: str, predicate: str, *, exact: bool) -> Any:
-    order = sql.SQL("embedding <-> %s::vector, id") if exact else sql.SQL("embedding <-> %s::vector")
+def _query_statement(
+    sql: Any,
+    table: str,
+    predicate: str,
+    *,
+    exact: bool,
+    tie_break: bool = True,
+    include_distance: bool = False,
+) -> Any:
+    distance = sql.SQL("embedding <-> %s::vector")
+    select = sql.SQL("id, {} AS distance").format(distance) if include_distance else sql.SQL("id")
+    order = distance + (sql.SQL(", id") if tie_break else sql.SQL(""))
     binding = sql.SQL("") if exact else sql.SQL(
         "(SELECT vector_hnsw_guidance_bind(%s::regclass, %s::text[], %s) OFFSET 0) AND "
     )
-    return sql.SQL("SELECT id FROM {} WHERE {}{} ORDER BY {} LIMIT %s").format(
-        _table_ident(sql, table), binding, sql.SQL(predicate), order
+    return sql.SQL("SELECT {} FROM {} WHERE {}{} ORDER BY {} LIMIT %s").format(
+        select, _table_ident(sql, table), binding, sql.SQL(predicate), order
     )
 
 
@@ -312,17 +397,51 @@ def _run_sql_query(
     exact: bool,
     atom: str = "",
     guidance_kind: str = "",
-) -> list[int]:
-    statement = _query_statement(sql, table, predicate, exact=exact)
-    params = (vector, k) if exact else (f"public.{index}", [atom], guidance_kind, vector, k)
+    tie_break: bool = True,
+    include_distance: bool = False,
+) -> list[Any]:
+    statement = _query_statement(
+        sql, table, predicate, exact=exact, tie_break=tie_break, include_distance=include_distance
+    )
+    vector_params = (vector, vector, k) if include_distance else (vector, k)
+    if exact:
+        params = vector_params
+    elif include_distance:
+        # The projected distance placeholder appears before the bind
+        # function in the SQL text; keep positional parameters aligned.
+        params = (vector, f"public.{index}", [atom], guidance_kind, vector, k)
+    else:
+        params = (f"public.{index}", [atom], guidance_kind, *vector_params)
     if not exact:
         cur.execute(sql.SQL("EXPLAIN (FORMAT JSON) ") + statement, params)
         plan_row = cur.fetchone()
         names = _plan_index_names(plan_row[0] if plan_row else [])
         if index not in names:
+            if tie_break:
+                raise GuidedPlanChanged(
+                    f"guided query with tie-break did not use {index}: index_names={names}"
+                )
             raise RuntimeError(f"guided query did not use {index}: index_names={names}")
     cur.execute(statement, params)
-    return [int(row[0]) for row in cur.fetchall()]
+    rows = cur.fetchall()
+    if include_distance:
+        return [(int(row[0]), float(row[1])) for row in rows]
+    return [int(row[0]) for row in rows]
+
+
+def _boundary_statement(sql: Any, table: str, predicate: str) -> Any:
+    return sql.SQL(
+        "SELECT id, distance FROM ("
+        "SELECT id, embedding <-> %s::vector AS distance FROM {} WHERE {}"
+        ") AS candidates WHERE distance <= %s ORDER BY distance, id"
+    ).format(_table_ident(sql, table), sql.SQL(predicate))
+
+
+def _run_boundary_query(
+    cur: Any, sql: Any, table: str, vector: str, predicate: str, boundary: float
+) -> list[tuple[int, float]]:
+    cur.execute(_boundary_statement(sql, table, predicate), (vector, boundary))
+    return [(int(row[0]), float(row[1])) for row in cur.fetchall()]
 
 
 def _query_pair(
@@ -341,10 +460,62 @@ def _query_pair(
     build_error: str,
     atom: str,
     guidance_kind: str,
+    schedule_isolation: str,
+    comparison_isolation: str,
 ) -> dict[str, Any]:
+    if comparison_isolation != "repeatable_read":
+        raise RuntimeError("oracle comparison must use a transaction-level snapshot")
+    cur.execute("SELECT pg_current_snapshot()")
+    snapshot_id = str(cur.fetchone()[0])
     cur.execute("SELECT vector_hnsw_reset_scan_profile()")
     _set_guided(cur, sql, rows)
-    guided_ids = _run_sql_query(
+    try:
+        guided_rows = _run_sql_query(
+            cur,
+            sql,
+            table,
+            f"{table}_hnsw",
+            vector,
+            predicate,
+            k,
+            exact=False,
+            atom=atom,
+            guidance_kind=guidance_kind,
+            tie_break=True,
+            include_distance=True,
+        )
+        tie_contract = "distance,id"
+        guided_plan_tie_break = True
+    except GuidedPlanChanged:
+        # A secondary sort key can make PostgreSQL abandon the pgvector HNSW
+        # path.  Keep the guided plan and compare by its exact distance
+        # boundary instead of silently changing the access path.
+        guided_rows = _run_sql_query(
+            cur,
+            sql,
+            table,
+            f"{table}_hnsw",
+            vector,
+            predicate,
+            k,
+            exact=False,
+            atom=atom,
+            guidance_kind=guidance_kind,
+            tie_break=False,
+            include_distance=True,
+        )
+        tie_contract = "distance_boundary"
+        guided_plan_tie_break = False
+    cur.execute("SELECT vector_hnsw_last_scan_profile()")
+    scan_profile = _json_profile(cur.fetchone()[0])
+    cur.execute("SELECT vector_hnsw_guidance_profile()")
+    guide_after = _json_profile(cur.fetchone()[0])
+
+    # Force a heap sort for exact SQL truth in the same explicit transaction
+    # snapshot.  Keep the backend-local guide alive so the safe-guided
+    # statement still exercises its committed-epoch fail-open behavior.
+    _set_exact(cur)
+    truth_rows = _run_sql_query(
         cur,
         sql,
         table,
@@ -352,34 +523,47 @@ def _query_pair(
         vector,
         predicate,
         k,
-        exact=False,
-        atom=atom,
-        guidance_kind=guidance_kind,
+        exact=True,
+        tie_break=True,
+        include_distance=True,
     )
-    cur.execute("SELECT vector_hnsw_last_scan_profile()")
-    scan_profile = _json_profile(cur.fetchone()[0])
-    cur.execute("SELECT vector_hnsw_guidance_profile()")
-    guide_after = _json_profile(cur.fetchone()[0])
-
-    # Force a heap sort for exact SQL truth on the same backend snapshot.  Keep
-    # the backend-local guide alive: the next safe-guided statement must be
-    # able to observe and fail open on a committed epoch change.
-    _set_exact(cur)
-    truth_ids = _run_sql_query(
-        cur, sql, table, f"{table}_hnsw", vector, predicate, k, exact=True
-    )
-    false_negative = any(value not in guided_ids for value in truth_ids)
-    ordered_mismatch = tuple(guided_ids) != tuple(truth_ids)
+    guided_ids = [row[0] for row in guided_rows]
+    truth_ids = [row[0] for row in truth_rows]
+    boundary_rows: list[tuple[int, float]] = []
+    boundary_distance: float | None = None
+    false_negative = False
+    ordered_mismatch = False
     error = ""
     try:
-        validate_result(guided_ids, truth_ids)
+        if tie_contract == "distance,id":
+            validate_result(guided_ids, truth_ids)
+        elif truth_rows:
+            boundary_distance = float(truth_rows[-1][1])
+            boundary_rows = _run_boundary_query(cur, sql, table, vector, predicate, boundary_distance)
+            validate_tie_aware_result(guided_rows, boundary_rows, k)
+        else:
+            validate_tie_aware_result(guided_rows, [], k)
     except StrictCorrectnessFailure as exc:
         error = _error_text(exc)
+        false_negative = "false negative" in error or "boundary" in error
+        ordered_mismatch = tie_contract == "distance,id" and not false_negative
 
     return {
         "phase": phase,
         "query_no": query_no,
         "query_vector": vector,
+        "snapshot_id": snapshot_id,
+        "guided_snapshot_id": snapshot_id,
+        "truth_snapshot_id": snapshot_id,
+        "same_snapshot": True,
+        "snapshot_scope": "transaction",
+        "schedule_isolation": schedule_isolation,
+        "comparison_isolation": comparison_isolation,
+        "comparison_transaction": "one transaction for guided and exact",
+        "tie_contract": tie_contract,
+        "guided_plan_tie_break": guided_plan_tie_break,
+        "tie_boundary_distance": boundary_distance,
+        "tie_boundary_ids": [row[0] for row in boundary_rows],
         "epoch_before": epoch_before,
         "epoch_after": epoch_after,
         "epoch_observed_before": guide_before.get("relation_epoch"),
@@ -457,11 +641,16 @@ def _apply_operation(cur: Any, sql: Any, table: str, operation: str, rows: int) 
 
 def _base_record(spec: CaseSpec, table: str, index: str, rows: int, predicate: str, atom: str) -> dict[str, Any]:
     return {
+        "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+        "correctness_contract": CORRECTNESS_CONTRACT,
         "case_id": f"{spec.operation}-{spec.phase}-{spec.isolation}-{spec.guidance_kind}-r{spec.repeat}",
         "scenario": spec.operation,
         "phase": spec.phase,
         "operation": spec.operation,
         "isolation": spec.isolation,
+        "schedule_isolation": spec.isolation,
+        "snapshot_contract": "same_transaction_snapshot",
+        "tie_contract": TIE_CONTRACT,
         "guidance_kind": spec.guidance_kind,
         "filter_strategy": "safe_guided",
         "write_outcome": "rollback" if spec.operation == "rollback_insert" else "commit",
@@ -505,6 +694,7 @@ def _reader_build_before_write(
             _wait(barrier)
             _wait(barrier)
             if spec.operation != "truncate_tid_reuse":
+                cur, comparison_isolation = _start_comparison_transaction(conn, cur, spec.isolation)
                 for query_no, vector in enumerate(QUERY_VECTORS[: state.query_count]):
                     records.append(
                         _base_record(spec, state.table, state.index, state.rows, state.predicate, state.atom)
@@ -513,11 +703,15 @@ def _reader_build_before_write(
                             cur, sql, state.table, vector, state.predicate, state.query_k, state.rows,
                             state.guide_before or {}, state.epoch_before, state.epoch_before,
                             "precommit", query_no, state.activation_error, state.atom, spec.guidance_kind,
+                            spec.isolation, comparison_isolation,
                         )
                     )
+                if spec.isolation == "read_committed":
+                    conn.commit()
                 _wait(barrier)
                 _wait(barrier)
                 state.epoch_after = int(shared.get("epoch_after", state.epoch_before))
+                cur, comparison_isolation = _start_comparison_transaction(conn, cur, spec.isolation)
                 for query_no, vector in enumerate(QUERY_VECTORS[: state.query_count]):
                     records.append(
                         _base_record(spec, state.table, state.index, state.rows, state.predicate, state.atom)
@@ -526,12 +720,14 @@ def _reader_build_before_write(
                             cur, sql, state.table, vector, state.predicate, state.query_k, state.rows,
                             state.guide_before or {}, state.epoch_before, state.epoch_after,
                             "postcommit", query_no, state.activation_error, state.atom, spec.guidance_kind,
+                            spec.isolation, comparison_isolation,
                         )
                     )
             else:
                 _wait(barrier)
                 _wait(barrier)
                 state.epoch_after = int(shared.get("epoch_after", state.epoch_before))
+                cur, comparison_isolation = _start_comparison_transaction(conn, cur, spec.isolation)
                 for query_no, vector in enumerate(QUERY_VECTORS[: state.query_count]):
                     records.append(
                         _base_record(spec, state.table, state.index, state.rows, state.predicate, state.atom)
@@ -540,6 +736,7 @@ def _reader_build_before_write(
                             cur, sql, state.table, vector, state.predicate, state.query_k, state.rows,
                             state.guide_before or {}, state.epoch_before, state.epoch_after,
                             "postcommit", query_no, state.activation_error, state.atom, spec.guidance_kind,
+                            spec.isolation, comparison_isolation,
                         )
                     )
             conn.rollback()
@@ -682,6 +879,7 @@ def _run_during_build(cfg: Any, sql: Any, spec: CaseSpec, state: HarnessState) -
             cur = conn.cursor()
             _begin(cur, spec.isolation)
             state.guide_before = {}
+        cur, comparison_isolation = _start_comparison_transaction(conn, cur, spec.isolation)
         records = []
         for query_no, vector in enumerate(QUERY_VECTORS[: state.query_count]):
             records.append(
@@ -692,6 +890,7 @@ def _run_during_build(cfg: Any, sql: Any, spec: CaseSpec, state: HarnessState) -
                     state.guide_before, state.epoch_before, int(shared.get("epoch_after", state.epoch_before)),
                     "postcommit", query_no, state.build_error or state.activation_error,
                     state.atom, spec.guidance_kind,
+                    spec.isolation, comparison_isolation,
                 )
             )
         conn.rollback()
@@ -760,12 +959,14 @@ def _run_before_load(cfg: Any, sql: Any, spec: CaseSpec, state: HarnessState) ->
                 cur = query_conn.cursor()
                 _begin(cur, spec.isolation)
                 state.guide_before = {}
+            cur, comparison_isolation = _start_comparison_transaction(query_conn, cur, spec.isolation)
             for query_no, vector in enumerate(QUERY_VECTORS[: state.query_count]):
                 row = _query_pair(
                     cur, sql, state.table, vector, state.predicate, state.query_k, state.rows,
                     state.guide_before, state.epoch_before, state.epoch_after or state.epoch_before,
                     "postcommit", query_no, state.build_error or state.activation_error,
                     state.atom, spec.guidance_kind,
+                    spec.isolation, comparison_isolation,
                 )
                 row["stale_store_bypass"] = bool(
                     spec.guidance_kind in {"page", "bloom"}
@@ -871,6 +1072,14 @@ def _manifest(cfg: Any, cur: Any) -> dict[str, Any]:
         vector_library_error = _error_text(exc)
         cur.connection.rollback()
     return {
+        "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+        "correctness_contract": CORRECTNESS_CONTRACT,
+        "correctness_provenance": {
+            "snapshot_scope": "one PostgreSQL transaction for guided and exact",
+            "read_committed_schedule": "comparison runs in a separate REPEATABLE READ transaction at the barrier visibility point",
+            "repeatable_read_schedule": "comparison uses the existing reader transaction snapshot",
+            "tie_contract": TIE_CONTRACT,
+        },
         "build_id": build_id,
         "build_id_error": build_error,
         "vector_library_path": vector_library_path,
@@ -886,6 +1095,13 @@ def _manifest(cfg: Any, cur: Any) -> dict[str, Any]:
 
 def validate_runtime_provenance(manifest: dict[str, Any]) -> list[str]:
     errors: list[str] = []
+    if manifest.get("artifact_schema_version") != ARTIFACT_SCHEMA_VERSION:
+        errors.append("artifact schema is absent or incompatible")
+    if manifest.get("correctness_contract") != CORRECTNESS_CONTRACT:
+        errors.append("correctness snapshot contract is absent or incompatible")
+    correctness_provenance = manifest.get("correctness_provenance")
+    if not isinstance(correctness_provenance, dict) or correctness_provenance.get("tie_contract") != TIE_CONTRACT:
+        errors.append("correctness provenance is absent or incompatible")
     build_id = str(manifest.get("build_id", ""))
     library_sha = str(manifest.get("vector_library_sha256", ""))
     if manifest.get("build_id_error") or not build_id.startswith("sqlens-v11-"):
@@ -894,6 +1110,43 @@ def validate_runtime_provenance(manifest: dict[str, Any]) -> list[str]:
         char not in "0123456789abcdef" for char in library_sha.lower()
     ):
         errors.append("loaded vector.so SHA-256 is absent or invalid")
+    return errors
+
+
+def validate_artifact_payload(payload: dict[str, Any]) -> list[str]:
+    """Fail closed for artifacts/checkpoints produced before the v2 contract."""
+    errors: list[str] = []
+    if payload.get("artifact") != "pgvector_update_concurrency_correctness":
+        errors.append("artifact identity is absent or incompatible")
+    if payload.get("artifact_schema_version") != ARTIFACT_SCHEMA_VERSION:
+        errors.append("artifact schema is absent or incompatible")
+    manifest = payload.get("manifest")
+    if not isinstance(manifest, dict):
+        errors.append("artifact manifest is absent")
+        return errors
+    errors.extend(validate_runtime_provenance(manifest))
+    records = payload.get("records")
+    if not isinstance(records, list):
+        errors.append("artifact records are absent")
+        return errors
+    for position, row in enumerate(records):
+        if not isinstance(row, dict):
+            errors.append(f"record {position} is not an object")
+            continue
+        if row.get("artifact_schema_version") != ARTIFACT_SCHEMA_VERSION:
+            errors.append(f"record {position} has an incompatible schema")
+        if row.get("correctness_contract") != CORRECTNESS_CONTRACT:
+            errors.append(f"record {position} has an incompatible correctness contract")
+        if row.get("same_snapshot") is not True or row.get("snapshot_scope") != "transaction":
+            errors.append(f"record {position} does not prove one transaction snapshot")
+        if not row.get("snapshot_id"):
+            errors.append(f"record {position} has no PostgreSQL snapshot ID")
+        if row.get("guided_snapshot_id") != row.get("truth_snapshot_id"):
+            errors.append(f"record {position} has mismatched guided/truth snapshots")
+        if row.get("comparison_isolation") != "repeatable_read":
+            errors.append(f"record {position} has an invalid comparison isolation")
+        if row.get("tie_contract") not in {"distance,id", "distance_boundary"}:
+            errors.append(f"record {position} has an invalid tie contract")
     return errors
 
 
@@ -972,6 +1225,13 @@ def _write_outputs(
 ) -> None:
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
+    validation_errors = list(validation_errors)
+    validation_errors.extend(validate_artifact_payload({
+        "artifact": "pgvector_update_concurrency_correctness",
+        "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+        "manifest": manifest,
+        "records": records,
+    }))
     strict_failures = sum(
         1 for row in records
         if row.get("false_negative") or row.get("ordered_mismatch") or row.get("error")
@@ -980,6 +1240,9 @@ def _write_outputs(
     csv_records = [
         row
         | {
+            "manifest_artifact_schema_version": manifest.get("artifact_schema_version", ""),
+            "manifest_correctness_contract": manifest.get("correctness_contract", ""),
+            "manifest_tie_contract": (manifest.get("correctness_provenance") or {}).get("tie_contract", ""),
             "manifest_build_id": manifest.get("build_id", ""),
             "manifest_postgres_version": manifest.get("postgres_version", ""),
             "manifest_source_hash_sha256": manifest.get("source_hash_sha256", ""),
@@ -989,8 +1252,11 @@ def _write_outputs(
     ]
     fieldnames = sorted(
         {key for row in csv_records for key in row}
-        | {"manifest_build_id", "manifest_postgres_version", "manifest_source_hash_sha256",
-           "manifest_vector_library_sha256"}
+        | {
+            "manifest_artifact_schema_version", "manifest_correctness_contract",
+            "manifest_tie_contract", "manifest_build_id", "manifest_postgres_version",
+            "manifest_source_hash_sha256", "manifest_vector_library_sha256",
+        }
     )
     csv_tmp = out_csv.with_name(f".{out_csv.name}.{os.getpid()}.tmp")
     json_tmp = out_json.with_name(f".{out_json.name}.{os.getpid()}.tmp")
@@ -1010,6 +1276,7 @@ def _write_outputs(
 
         payload = {
             "artifact": "pgvector_update_concurrency_correctness",
+            "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
             "artifact_valid": artifact_valid,
             "status": "complete" if artifact_valid else "invalid",
             "validation_errors": validation_errors,

@@ -5,25 +5,35 @@ import unittest
 from psycopg import sql
 
 from experiments.hybrid_vector_db.scripts.pgvector_update_concurrency_correctness import (
+    ARTIFACT_SCHEMA_VERSION,
+    CORRECTNESS_CONTRACT,
     DURING_BUILD_OPERATIONS,
     GUIDANCE_KINDS,
     ISOLATIONS,
     OPERATIONS,
     PHASES,
     StrictCorrectnessFailure,
+    TIE_CONTRACT,
+    _comparison_isolation,
     build_schedule_grid,
     _plan_index_names,
     _query_statement,
+    _run_sql_query,
     strict_failure_status,
+    validate_artifact_payload,
     validate_runtime_provenance,
     validate_schedule_completeness,
     validate_result,
+    validate_tie_aware_result,
 )
 
 
 class PgvectorUpdateConcurrencyCorrectnessTests(unittest.TestCase):
     def test_runtime_provenance_requires_loaded_binary_hash(self):
         valid = {
+            "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+            "correctness_contract": CORRECTNESS_CONTRACT,
+            "correctness_provenance": {"tie_contract": TIE_CONTRACT},
             "build_id": "sqlens-v11-test",
             "build_id_error": "",
             "vector_library_sha256": "a" * 64,
@@ -61,6 +71,56 @@ class PgvectorUpdateConcurrencyCorrectnessTests(unittest.TestCase):
         self.assertIn("vector_hnsw_guidance_bind", guided)
         self.assertIn("OFFSET 0", guided)
         self.assertNotIn("vector_hnsw_guidance_bind", exact)
+        self.assertIn("ORDER BY embedding <-> %s::vector, id", guided)
+        self.assertIn("ORDER BY embedding <-> %s::vector, id", exact)
+
+    def test_read_committed_comparison_is_explicitly_repeatable_read(self):
+        self.assertEqual(_comparison_isolation("read_committed"), "repeatable_read")
+        self.assertEqual(_comparison_isolation("repeatable_read"), "repeatable_read")
+        with self.assertRaisesRegex(ValueError, "unknown isolation"):
+            _comparison_isolation("serializable")
+
+    def test_distance_projection_keeps_guided_parameter_order_aligned(self):
+        class Cursor:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, statement, params=None):
+                self.calls.append((statement, params))
+
+            def fetchone(self):
+                return ([{"Plan": {"Index Name": "fixture_hnsw"}}],)
+
+            def fetchall(self):
+                return [(7, 0.25)]
+
+        cursor = Cursor()
+        rows = _run_sql_query(
+            cursor, sql, "fixture", "fixture_hnsw", "[0,0,0]", "tenant_id = 1", 1,
+            exact=False, atom="page:sql:tenant_id = 1", guidance_kind="page",
+            include_distance=True,
+        )
+        self.assertEqual(rows, [(7, 0.25)])
+        self.assertEqual(
+            cursor.calls[0][1],
+            ("[0,0,0]", "public.fixture_hnsw", ["page:sql:tenant_id = 1"], "page", "[0,0,0]", 1),
+        )
+
+    def test_tie_aware_boundary_allows_boundary_id_substitution(self):
+        boundary = [(1, 0.1), (2, 0.2), (3, 0.2)]
+        validate_tie_aware_result([(1, 0.1), (3, 0.2)], boundary, 2)
+        with self.assertRaisesRegex(StrictCorrectnessFailure, "before tie boundary"):
+            validate_tie_aware_result([(2, 0.2), (3, 0.2)], boundary, 2)
+
+    def test_old_artifact_schema_fails_closed(self):
+        old_payload = {
+            "artifact": "pgvector_update_concurrency_correctness",
+            "manifest": {"build_id": "sqlens-v11-old"},
+            "records": [],
+        }
+        errors = validate_artifact_payload(old_payload)
+        self.assertTrue(errors)
+        self.assertTrue(any("schema" in error for error in errors))
 
     def test_grid_is_deterministic_and_repeats_are_explicit(self):
         first = build_schedule_grid(
