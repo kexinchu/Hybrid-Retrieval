@@ -1600,29 +1600,65 @@ def load_graph_identity(
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ProvenanceGateError("graph identity must be a JSON object")
-    if payload.get("same_heap") is not True or payload.get("logical_equal") is not True:
+    comparison = payload.get("comparison")
+    if not isinstance(comparison, dict):
         raise ProvenanceGateError(
-            "graph identity must prove same_heap=true and logical_equal=true"
+            "graph identity must contain the canonical comparison object"
+        )
+    required_true = (
+        "same_heap",
+        "entry_equal",
+        "logical_equal",
+        "definition_equal",
+        "tuple_coverage_equal",
+    )
+    failed = [name for name in required_true if comparison.get(name) is not True]
+    if failed:
+        raise ProvenanceGateError(
+            "graph identity failed required equivalence checks: " + ", ".join(failed)
+        )
+    if comparison.get("format") != "sqlens-hnsw-compare-v2":
+        raise ProvenanceGateError("graph identity has an unsupported comparison format")
+    if comparison.get("physical_equal") is not False:
+        raise ProvenanceGateError(
+            "graph identity must prove a physically distinct layout"
         )
     declared_source = str(payload.get("source_index", payload.get("source", "")))
     declared_clone = str(payload.get("clone_index", payload.get("clone", "")))
-    if declared_source and declared_source != source_index:
+    if declared_source != source_index:
         raise ProvenanceGateError("graph identity source index does not match CLI")
-    if declared_clone and declared_clone != clone_index:
+    if declared_clone != clone_index:
         raise ProvenanceGateError("graph identity clone index does not match CLI")
-    logical = str(
-        payload.get("logical_digest", payload.get("source_logical_digest", ""))
+    equal_digest_pairs = (
+        ("left_definition_digest", "right_definition_digest"),
+        ("left_tuple_coverage_digest", "right_tuple_coverage_digest"),
+        ("left_logical_digest", "right_logical_digest"),
     )
-    if not logical:
-        raise ProvenanceGateError("graph identity is missing its logical graph digest")
+    for left, right in equal_digest_pairs:
+        left_value = str(comparison.get(left, ""))
+        right_value = str(comparison.get(right, ""))
+        if not left_value or left_value != right_value:
+            raise ProvenanceGateError(
+                f"graph identity has unequal or missing {left}/{right}"
+            )
+    left_physical = str(comparison.get("left_physical_digest", ""))
+    right_physical = str(comparison.get("right_physical_digest", ""))
+    if not left_physical or not right_physical or left_physical == right_physical:
+        raise ProvenanceGateError("graph identity has invalid physical layout digests")
+    logical = str(comparison["left_logical_digest"])
     return {
         "path": str(path),
         "sha256": sha256_file(path),
         "source_index": source_index,
         "clone_index": clone_index,
         "same_heap": True,
+        "entry_equal": True,
         "logical_equal": True,
+        "definition_equal": True,
+        "tuple_coverage_equal": True,
+        "physical_equal": False,
         "logical_digest": logical,
+        "stable_fingerprint_sha256": payload.get("stable_fingerprint_sha256"),
         "proof": payload,
     }
 

@@ -343,25 +343,45 @@ class PgvectorUpstreamOverheadControlTests(unittest.TestCase):
     def test_graph_identity_requires_same_heap_logical_equivalence(self):
         with TemporaryDirectory() as temporary:
             path = Path(temporary) / "graph.json"
-            path.write_text(
-                json.dumps(
-                    {
-                        "source_index": "public.source_idx",
-                        "clone_index": "public.clone_idx",
-                        "same_heap": True,
-                        "logical_equal": True,
-                        "logical_digest": "sha256:abc",
-                    }
-                ),
-                encoding="utf-8",
-            )
+            payload = {
+                "source_index": "public.source_idx",
+                "clone_index": "public.clone_idx",
+                "stable_fingerprint_sha256": "f" * 64,
+                "comparison": {
+                    "format": "sqlens-hnsw-compare-v2",
+                    "same_heap": True,
+                    "entry_equal": True,
+                    "logical_equal": True,
+                    "definition_equal": True,
+                    "tuple_coverage_equal": True,
+                    "physical_equal": False,
+                    "left_definition_digest": "sha256:def",
+                    "right_definition_digest": "sha256:def",
+                    "left_tuple_coverage_digest": "sha256:tid",
+                    "right_tuple_coverage_digest": "sha256:tid",
+                    "left_logical_digest": "sha256:logical",
+                    "right_logical_digest": "sha256:logical",
+                    "left_physical_digest": "sha256:left",
+                    "right_physical_digest": "sha256:right",
+                },
+            }
+            path.write_text(json.dumps(payload), encoding="utf-8")
             identity = runner.load_graph_identity(
                 path, "public.source_idx", "public.clone_idx"
             )
             self.assertTrue(identity["logical_equal"])
+            self.assertFalse(identity["physical_equal"])
+            self.assertEqual(identity["logical_digest"], "sha256:logical")
 
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            payload["logical_equal"] = False
+            payload["comparison"]["logical_equal"] = False
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaises(runner.ProvenanceGateError):
+                runner.load_graph_identity(
+                    path, "public.source_idx", "public.clone_idx"
+                )
+
+            payload["comparison"]["logical_equal"] = True
+            payload["comparison"]["right_logical_digest"] = "sha256:other"
             path.write_text(json.dumps(payload), encoding="utf-8")
             with self.assertRaises(runner.ProvenanceGateError):
                 runner.load_graph_identity(
