@@ -16,7 +16,7 @@
 #include "utils/sampling.h"
 #include "vector.h"
 
-#define SQLENS_BUILD_ID "sqlens-v11-bfs-locality-proof-ef100000-20260718-r9"
+#define SQLENS_BUILD_ID "sqlens-v11-bfs-locality-proof-ef100000-20260718-r10"
 
 #if PG_VERSION_NUM >= 190000
 typedef Pointer Item;
@@ -401,6 +401,15 @@ typedef struct HnswScanProfile
 	int64		indexPageElementDistinctPages;
 	int64		indexPagePrefetches;
 	bool		indexPageDistinctCountsExact;
+	int64		indexPageLoads;
+	int64		indexPageRuns;
+	int64		indexPageDistinctPages;
+	BlockNumber indexPageLastBlock;
+	bool		indexPageDistinctPagesExact;
+	int64		heapTidReturns;
+	int64		heapTidPageRuns;
+	int64		heapTidDistinctPages;
+	bool		heapTidDistinctPagesExact;
 	int64		blksHitBefore;
 	int64		blksHitAfter;
 	int64		blksReadBefore;
@@ -434,6 +443,10 @@ typedef struct HnswIndexPageProfile
 	int64		elementDistinctPages;
 	int64		prefetches;
 	bool		distinctCountsExact;
+	int64		loads;
+	int64		runs;
+	int64		distinctPages;
+	BlockNumber lastBlock;
 }			HnswIndexPageProfile;
 
 typedef struct HnswIndexPageSet
@@ -450,6 +463,7 @@ typedef struct HnswIndexPageProfileState
 	BlockNumber lastElementBlock;
 	HnswIndexPageSet neighborPages;
 	HnswIndexPageSet elementPages;
+	HnswIndexPageSet pages;
 } HnswIndexPageProfileState;
 
 typedef struct HnswPageAccessItem
@@ -669,6 +683,7 @@ typedef struct HnswScanOpaqueData
 	double		previousDistance;
 	Size		maxMemory;
 	MemoryContext tmpCtx;
+	MemoryContext profileCtx;
 	HnswPageAccessItem *pageItems;
 	int			pageItemCount;
 	int			pageItemIndex;
@@ -683,6 +698,12 @@ typedef struct HnswScanOpaqueData
 	int64		guidanceChecks;
 	int64		guidanceMatches;
 	int64		guidanceSkips;
+	int64		heapTidReturns;
+	int64		heapTidPageRuns;
+	int64		heapTidDistinctPages;
+	BlockNumber heapTidLastBlock;
+	HnswIndexPageSet heapTidPages;
+	bool		heapTidDistinctPagesExact;
 	HnswTraversalProfile traversal;
 	HnswIndexPageProfileState indexPageProfile;
 	void	   *guidancePlan;
@@ -736,11 +757,13 @@ void		HnswInit(void);
 List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, int64 *distanceComputations, HnswTraversalProfile *traversalProfile, HnswScanGuidance *guidance, HnswTraversalGuidanceState *traversalGuidance, HnswIndexPageProfileState *indexPageProfile);
 HnswElement HnswGetEntryPoint(Relation index);
 void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
+void		HnswGetMetaPageInfoTracked(Relation index, int *m, HnswElement * entryPoint, HnswIndexPageProfileState *profile);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);
 HnswElement HnswInitElement(char *base, ItemPointer tid, int m, double ml, int maxLevel, HnswAllocator * alloc);
 HnswElement HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno);
 void		HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, HnswSupport * support, int m, int efConstruction, bool existing);
 HnswSearchCandidate *HnswEntryCandidate(char *base, HnswElement entryPoint, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec);
+HnswSearchCandidate *HnswEntryCandidateTracked(char *base, HnswElement entryPoint, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, HnswIndexPageProfileState *profile);
 void		HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building);
 void		HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m);
 void		HnswAddHeapTid(HnswElement element, ItemPointer heaptid);
@@ -778,6 +801,7 @@ void		HnswResetScanProfile(void);
 void		HnswGetLastScanProfile(HnswScanProfile *profile);
 void		HnswInitIndexPageProfile(HnswIndexPageProfileState *state,
 								 MemoryContext context);
+void		HnswRecordHeapTid(HnswScanOpaque scan, ItemPointer tid);
 bool		HnswGuidanceIsActive(void);
 bool		HnswGuidanceIsActiveForHeap(Oid heapOid);
 void		HnswGuidanceRegisterExecutorScans(QueryDesc *queryDesc, uint64 frameId);

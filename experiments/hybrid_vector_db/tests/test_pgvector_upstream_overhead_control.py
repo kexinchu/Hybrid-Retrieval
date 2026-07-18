@@ -392,23 +392,24 @@ class PgvectorUpstreamOverheadControlTests(unittest.TestCase):
         self.assertEqual(len(cursor.statements), 1)
         self.assertNotIn("vector_sqlens_build_id", cursor.statements[0])
 
-    def test_sqlens_gate_defaults_to_v11_and_profile_semantics_four(self):
+    def test_sqlens_gate_defaults_to_v11_and_profile_semantics_seven(self):
         profile = {
-            "profile_semantics_version": 4,
+            "profile_semantics_version": 7,
             "graph_elements_visited": 10,
             "raw_index_tids_returned": 4,
             "hnsw_am_callback_ms": 1.0,
             "executor_residual_ms": 0.5,
         }
+        profile.update({field: 0 for field in runner.SQLENS_PROFILE_FIELDS if field not in profile})
         cursor = Cursor([("0.8.2",), ("sqlens-v11-amazon",), (json.dumps(profile),)])
 
         provenance = runner.gate_implementation(cursor, "sqlens_disabled")
 
         self.assertEqual(provenance["loaded_vector_sqlens_build_id"], "sqlens-v11-amazon")
         self.assertEqual(provenance["profile_gate"]["required_build_prefix"], "sqlens-v11-")
-        self.assertEqual(provenance["profile_gate"]["minimum_profile_semantics_version"], 4.0)
+        self.assertEqual(provenance["profile_gate"]["minimum_profile_semantics_version"], 7.0)
 
-        old = profile | {"profile_semantics_version": 3}
+        old = profile | {"profile_semantics_version": 6}
         with self.assertRaises(runner.ProvenanceGateError):
             runner.gate_implementation(
                 Cursor([("0.8.2",), ("sqlens-v11-amazon",), (json.dumps(old),)]),
@@ -682,7 +683,7 @@ class PgvectorUpstreamOverheadControlTests(unittest.TestCase):
             execution_stage="calibration",
             final_block=None,
             promotion_margin=0.02,
-            minimum_sqlens_profile_semantics=4.0,
+            minimum_sqlens_profile_semantics=7.0,
         )
         runner.validate_runtime_args(args)
 

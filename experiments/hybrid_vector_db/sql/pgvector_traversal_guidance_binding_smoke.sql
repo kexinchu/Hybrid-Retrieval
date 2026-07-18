@@ -133,7 +133,7 @@ BEGIN
         RAISE EXCEPTION 'seeded traversal-guided matched-result contract failed: exact %, stock %, guided %',
             exact_ids, stock_ids, guided_ids;
     END IF;
-    IF (guided_profile->>'profile_semantics_version')::int <> 6 OR
+    IF (guided_profile->>'profile_semantics_version')::int <> 7 OR
        NOT (guided_profile->>'planner_proof_succeeded')::boolean OR
        guided_profile->>'final_path' <> 'guided' OR
 	   guided_profile->>'traversal_guidance_scope' <>

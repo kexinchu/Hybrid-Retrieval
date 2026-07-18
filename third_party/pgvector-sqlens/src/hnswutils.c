@@ -74,6 +74,9 @@ CompareBlockNumbers(const void *a, const void *b)
 	return 0;
 }
 
+static bool HnswIndexPageSetAdd(HnswIndexPageProfileState *state,
+								HnswIndexPageSet *set, BlockNumber block);
+
 void
 HnswInitIndexPageProfile(HnswIndexPageProfileState *state,
 						 MemoryContext context)
@@ -82,7 +85,30 @@ HnswInitIndexPageProfile(HnswIndexPageProfileState *state,
 	state->context = context;
 	state->lastNeighborBlock = InvalidBlockNumber;
 	state->lastElementBlock = InvalidBlockNumber;
+	state->profile.lastBlock = InvalidBlockNumber;
 	state->profile.distinctCountsExact = true;
+}
+
+void
+HnswRecordHeapTid(HnswScanOpaque scan, ItemPointer tid)
+{
+	HnswIndexPageProfileState state;
+	BlockNumber block;
+
+	if (scan == NULL || tid == NULL || !ItemPointerIsValid(tid))
+		return;
+	block = ItemPointerGetBlockNumber(tid);
+	MemSet(&state, 0, sizeof(state));
+	state.context = scan->profileCtx;
+	state.profile.distinctCountsExact = true;
+	scan->heapTidReturns++;
+	if (block != scan->heapTidLastBlock)
+		scan->heapTidPageRuns++;
+	scan->heapTidLastBlock = block;
+	if (HnswIndexPageSetAdd(&state, &scan->heapTidPages, block))
+		scan->heapTidDistinctPages++;
+	if (!state.profile.distinctCountsExact)
+		scan->heapTidDistinctPagesExact = false;
 }
 
 static bool
@@ -130,6 +156,19 @@ HnswRecordIndexNeighborPage(HnswIndexPageProfileState *state,
 	state->lastNeighborBlock = block;
 	if (HnswIndexPageSetAdd(state, &state->neighborPages, block))
 		state->profile.neighborDistinctPages++;
+}
+
+static void
+HnswRecordIndexPage(HnswIndexPageProfileState *state, BlockNumber block)
+{
+	if (state == NULL || !BlockNumberIsValid(block))
+		return;
+	state->profile.loads++;
+	if (block != state->profile.lastBlock)
+		state->profile.runs++;
+	state->profile.lastBlock = block;
+	if (HnswIndexPageSetAdd(state, &state->pages, block))
+		state->profile.distinctPages++;
 }
 
 static void
@@ -459,11 +498,19 @@ HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno)
 void
 HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
 {
+	HnswGetMetaPageInfoTracked(index, m, entryPoint, NULL);
+}
+
+void
+HnswGetMetaPageInfoTracked(Relation index, int *m, HnswElement * entryPoint,
+						   HnswIndexPageProfileState *profile)
+{
 	Buffer		buf;
 	Page		page;
 	HnswMetaPage metap;
 
 	buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
+	HnswRecordIndexPage(profile, HNSW_METAPAGE_BLKNO);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	metap = HnswPageGetMeta(page);
@@ -692,7 +739,7 @@ HnswGetDistance(Datum a, Datum b, HnswSupport * support)
  * Load an element and optionally get its distance from q
  */
 static void
-HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element)
+HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element, HnswIndexPageProfileState *profile)
 {
 	Buffer		buf;
 	Page		page;
@@ -700,6 +747,7 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 
 	/* Read vector */
 	buf = ReadBuffer(index, blkno);
+	HnswRecordIndexPage(profile, blkno);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 
@@ -734,7 +782,7 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 void
 HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance)
 {
-	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element);
+	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element, NULL);
 }
 
 /*
@@ -768,13 +816,20 @@ HnswInitSearchCandidate(char *base, HnswElement element, double distance)
 HnswSearchCandidate *
 HnswEntryCandidate(char *base, HnswElement entryPoint, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec)
 {
+	return HnswEntryCandidateTracked(base, entryPoint, q, index, support, loadVec, NULL);
+}
+
+HnswSearchCandidate *
+HnswEntryCandidateTracked(char *base, HnswElement entryPoint, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, HnswIndexPageProfileState *profile)
+{
 	bool		inMemory = index == NULL;
 	double		distance;
 
 	if (inMemory)
 		distance = GetElementDistance(base, entryPoint, q, support);
 	else
-		HnswLoadElement(entryPoint, &distance, q, index, support, loadVec, NULL);
+		HnswLoadElementImpl(entryPoint->blkno, entryPoint->offno, &distance, q,
+							index, support, loadVec, NULL, &entryPoint, profile);
 
 	return HnswInitSearchCandidate(base, entryPoint, distance);
 }
@@ -995,8 +1050,8 @@ HnswLoadUnvisitedFromMemory(char *base, HnswElement element, HnswUnvisited * unv
 /*
  * Load neighbor index TIDs
  */
-bool
-HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc)
+static bool
+HnswLoadNeighborTidsTracked(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc, HnswIndexPageProfileState *profile)
 {
 	Buffer		buf;
 	Page		page;
@@ -1004,6 +1059,7 @@ HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation i
 	int			start;
 
 	buf = ReadBuffer(index, element->neighborPage);
+	HnswRecordIndexPage(profile, element->neighborPage);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 
@@ -1027,17 +1083,23 @@ HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation i
 	return true;
 }
 
+bool
+HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc)
+{
+	return HnswLoadNeighborTidsTracked(element, indextids, index, m, lm, lc, NULL);
+}
+
 /*
  * Load unvisited neighbors from disk
  */
 static bool
-HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, int m, int lm, int lc)
+HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, int m, int lm, int lc, HnswIndexPageProfileState *profile)
 {
 	ItemPointerData indextids[HNSW_MAX_M * 2];
 
 	*unvisitedLength = 0;
 
-	if (!HnswLoadNeighborTids(element, indextids, index, m, lm, lc))
+	if (!HnswLoadNeighborTidsTracked(element, indextids, index, m, lm, lc, profile))
 		return false;
 
 	for (int i = 0; i < lm; i++)
@@ -1113,6 +1175,7 @@ HnswTraversalGuidedLoadElement(ItemPointer indextid,
 	}
 
 	buf = ReadBuffer(search->index, blkno);
+	HnswRecordIndexPage(search->indexPageProfile, blkno);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	if (PageGetSpecialSize(page) != MAXALIGN(sizeof(HnswPageOpaqueData)) ||
@@ -1277,7 +1340,7 @@ HnswTraversalGuidedExpand(HnswTraversalGuidedSearch *search,
 								element->neighborPage);
 	if (!HnswLoadUnvisitedFromDisk(element, search->unvisited, &unvisitedLength,
 									 search->visited, search->index,
-									 search->m, search->lm, 0))
+									 search->m, search->lm, 0, search->indexPageProfile))
 	{
 		search->state->invalidNeighbor = true;
 		return false;
@@ -1667,7 +1730,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			if (!inserting)
 					HnswRecordIndexNeighborPage(indexPageProfile,
 						cElement->neighborPage);
-			(void) HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc);
+			(void) HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc, indexPageProfile);
 			if (!inserting)
 					HnswPrefetchUnvisitedIndexPages(index, unvisited,
 						unvisitedLength, indexPageProfile);
@@ -1711,7 +1774,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 				/* Avoid any allocations if not adding */
 				eElement = NULL;
-				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, (alwaysAdd || discarded != NULL || f == NULL) ? NULL : &f->distance, &eElement);
+				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, (alwaysAdd || discarded != NULL || f == NULL) ? NULL : &f->distance, &eElement, indexPageProfile);
 				if (distanceComputations != NULL)
 					(*distanceComputations)++;
 

@@ -765,7 +765,7 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 {
 	appendStringInfo(output,
 					"{\"valid\":%s,"
-					"\"profile_semantics_version\":6,"
+					"\"profile_semantics_version\":7,"
 					"\"total_scan_ms\":%.6f,"
 					"\"hnsw_search_ms\":%.6f,"
 					"\"heap_fetch_ms\":%.6f,"
@@ -815,7 +815,7 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 					"\"index_page_distinct_counts_exact\":%s,"
 					"\"index_page_distinct_page_limit\":%d,"
 					"\"index_page_distinct_scope\":\"sum_of_scan_local_unique_pages\","
-					"\"index_page_profile_scope\":\"search_neighbor_and_candidate_element_pages\","
+					"\"index_page_profile_scope\":\"search_readbuffer_sequence_all_metapage_entry_neighbor_candidate_element\","
 					"\"index_page_neighbor_distinct_pages\":" INT64_FORMAT ","
 					"\"index_page_element_loads\":" INT64_FORMAT ","
 					"\"index_page_element_runs\":" INT64_FORMAT ","
@@ -829,6 +829,8 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 					"\"idx_blks_read\":" INT64_FORMAT ","
 					"\"heap_blks_hit\":" INT64_FORMAT ","
 					"\"heap_blks_read\":" INT64_FORMAT ","
+					"\"heap_blks_scope\":\"executor_buffer_delta_residual_after_index_delta\","
+					"\"heap_blks_are_exact_heap_io\":false,"
 					"\"topk_count\":%d,"
 					"\"topk_ids\":[",
 					profile->valid ? "true" : "false",
@@ -906,7 +908,17 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 	}
 
 	appendStringInfo(output,
-					"],\"heap_validation_guidance_checks\":" INT64_FORMAT
+					"],\"index_page_loads\":" INT64_FORMAT
+					",\"index_page_runs\":" INT64_FORMAT
+					",\"index_page_distinct_pages\":" INT64_FORMAT
+					",\"index_page_last_block\":%u"
+					",\"index_page_distinct_pages_exact\":%s"
+					",\"heap_tid_returns\":" INT64_FORMAT
+					",\"heap_tid_page_runs\":" INT64_FORMAT
+					",\"heap_tid_distinct_pages\":" INT64_FORMAT
+					",\"heap_tid_distinct_pages_exact\":%s"
+					",\"heap_tid_sequence_scope\":\"sum_of_scan_local_actual_xs_heaptid_return_sequences\""
+					",\"heap_validation_guidance_checks\":" INT64_FORMAT
 					",\"heap_validation_guidance_matches\":" INT64_FORMAT
 					",\"heap_validation_guidance_skips\":" INT64_FORMAT
 					",\"pre_distance_membership_checks\":" INT64_FORMAT
@@ -952,6 +964,17 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 					",\"planner_proof_count\":%d"
 					",\"planner_proofs_truncated\":%s"
 					",\"planner_proofs\":[",
+					profile->indexPageLoads,
+					profile->indexPageRuns,
+					profile->indexPageDistinctPagesExact ?
+						profile->indexPageDistinctPages : -1,
+					profile->indexPageLastBlock,
+					profile->indexPageDistinctPagesExact ? "true" : "false",
+					profile->heapTidReturns,
+					profile->heapTidPageRuns,
+					profile->heapTidDistinctPagesExact ?
+						profile->heapTidDistinctPages : -1,
+					profile->heapTidDistinctPagesExact ? "true" : "false",
 					profile->guidanceChecks,
 					profile->guidanceMatches,
 					profile->guidanceSkips,

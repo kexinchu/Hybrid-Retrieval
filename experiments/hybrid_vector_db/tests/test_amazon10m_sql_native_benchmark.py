@@ -414,12 +414,13 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
 
     def test_sqlens_provenance_gate_rejects_old_or_incomplete_profiles(self):
         profile = {
-            "profile_semantics_version": 4,
+            "profile_semantics_version": 7,
             "graph_elements_visited": 0,
             "raw_index_tids_returned": 0,
             "hnsw_am_callback_ms": 0.0,
             "executor_residual_ms": 0.0,
         }
+        profile.update({field: 0 for field in benchmark.SQLENS_PROFILE_FIELDS if field not in profile})
         build_id, validated = benchmark.validate_sqlens_provenance(
             "sqlens-v11-test", profile
         )
@@ -430,11 +431,11 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
             benchmark.validate_sqlens_provenance("sqlens-v10-old", profile)
         with self.assertRaisesRegex(RuntimeError, "missing"):
             benchmark.validate_sqlens_provenance(
-                "sqlens-v11-test", {"profile_semantics_version": 4}
+                "sqlens-v11-test", {"profile_semantics_version": 7}
             )
-        with self.assertRaisesRegex(RuntimeError, "minimum=4"):
+        with self.assertRaisesRegex(RuntimeError, "minimum=7"):
             benchmark.validate_sqlens_provenance(
-                "sqlens-v11-test", profile | {"profile_semantics_version": 3}
+                "sqlens-v11-test", profile | {"profile_semantics_version": 6}
             )
 
     def test_explain_gate_requires_named_hnsw_for_approx_and_forbids_hnsw_for_exact(self):
@@ -554,7 +555,7 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
             benchmark.build_hybrid_sql("t", "rating = 5"),
         )
 
-    def test_bootstrap_lcb_is_reproducible_and_selection_is_independent(self):
+    def test_bootstrap_lcb_is_reproducible_and_mean_recall_selects_config(self):
         values = [0.91, 0.96, 0.99, 1.0]
         self.assertEqual(benchmark.bootstrap_bounds(values, 500, 17), benchmark.bootstrap_bounds(values, 500, 17))
         base = {
@@ -562,6 +563,7 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
             "filter_name": "f",
             "complete": True,
             "target_met": True,
+            "recall_mean": 0.96,
             "recall_lcb95": 0.96,
             "latency_mean_ms": 12.0,
             "config": "fast",
@@ -579,14 +581,15 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
             key=lambda config: (config.ef_search, config.label),
         )
 
-        def summary(config, target, lcb, latency):
-            met = lcb >= target
+        def summary(config, target, recall_mean, latency):
+            met = recall_mean >= target
             return {
                 "target_recall": target,
                 "complete": True,
                 "errors": 0,
                 "target_met": met,
-                "recall_lcb95": lcb,
+                "recall_mean": recall_mean,
+                "recall_lcb95": recall_mean,
                 "latency_mean_ms": latency if met else benchmark.NA,
                 "config": config.label,
             }
@@ -904,6 +907,40 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         self.assertTrue(summary["complete"])
         self.assertLess(float(summary["recall_lcb95"]), 0.90)
         self.assertEqual(summary["latency_p50_ms"], benchmark.NA)
+
+    def test_target_matching_uses_query_mean_and_reports_lcb_separately(self):
+        expected = {("join_acl", "f", q, 0) for q in (0, 1)}
+        rows = [
+            {
+                "workload": "join_acl",
+                "filter_name": "f",
+                "query_no": q,
+                "repeat": 0,
+                "e2e_ms": 10.0,
+                "query_ms": 10.0,
+                "recall": recall,
+                "error": "",
+            }
+            for q, recall in ((0, 1.0), (1, 0.8))
+        ]
+        summary = benchmark.summarize_rows(
+            rows,
+            expected_keys=expected,
+            target_recall=0.90,
+            bootstrap_samples=500,
+            seed=4,
+        )
+        self.assertAlmostEqual(float(summary["recall_mean"]), 0.90)
+        self.assertLess(float(summary["recall_lcb95"]), 0.90)
+        self.assertTrue(summary["target_met"])
+        self.assertEqual(summary["latency_mean_ms"], 10.0)
+
+    def test_scan_profile_export_is_explicit_and_complete(self):
+        profile = {field: index for index, field in enumerate(benchmark.SQLENS_PROFILE_EXPORT_FIELDS)}
+        self.assertEqual(benchmark.scan_profile_export(profile), profile)
+        missing = benchmark.scan_profile_export({})
+        self.assertEqual(set(missing), set(benchmark.SQLENS_PROFILE_EXPORT_FIELDS))
+        self.assertTrue(all(value == benchmark.NA for value in missing.values()))
 
     def test_primary_summary_uses_e2e_and_keeps_activation_and_query_components(self):
         expected = {("join_acl", "f", 0, 0), ("join_acl", "f", 1, 0)}

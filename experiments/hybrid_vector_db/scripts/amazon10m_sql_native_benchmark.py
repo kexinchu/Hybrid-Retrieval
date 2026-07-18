@@ -66,14 +66,34 @@ MODES = ("stock", "d1", "d1_d2", "d1_d2_d3")
 SQLENS_MODES = MODES[1:]
 NA = "N/A"
 SQLENS_BUILD_PREFIX = "sqlens-v11-"
-SQLENS_PROFILE_SEMANTICS = 4.0
-CHECKPOINT_VERSION = 4
+SQLENS_PROFILE_SEMANTICS = 7.0
+CHECKPOINT_VERSION = 5
 EXACT_TRUTH_ARTIFACT_VERSION = 4
 SQLENS_PROFILE_FIELDS = (
     "graph_elements_visited",
     "raw_index_tids_returned",
     "hnsw_am_callback_ms",
     "executor_residual_ms",
+    "index_page_loads",
+    "index_page_runs",
+    "index_page_distinct_pages",
+    "index_page_distinct_pages_exact",
+    "index_page_profile_scope",
+    "heap_tid_returns",
+    "heap_tid_page_runs",
+    "heap_tid_distinct_pages",
+    "heap_tid_distinct_pages_exact",
+    "heap_tid_sequence_scope",
+    "heap_blks_are_exact_heap_io",
+)
+SQLENS_PROFILE_EXPORT_FIELDS = SQLENS_PROFILE_FIELDS + (
+    "visited_tuples",
+    "returned_tuples",
+    "distance_compute_count",
+    "idx_blks_hit",
+    "idx_blks_read",
+    "heap_blks_hit",
+    "heap_blks_read",
 )
 TIMING_DEFINITION = (
     "activation_ms and query_ms are diagnostic sub-intervals. e2e_ms is one continuous "
@@ -799,7 +819,10 @@ def summarize_rows(
         _, latency_ci_low, latency_ci_high = bootstrap_bounds(
             list(latency_query.values()), bootstrap_samples, seed + 2
         )
-    target_met = bool(complete and (target_recall is None or recall_lcb >= target_recall))
+    recall_mean = statistics.fmean(recalls) if recalls else 0.0
+    target_met = bool(
+        complete and (target_recall is None or recall_mean >= target_recall)
+    )
     numeric = complete and (target_recall is None or target_met)
     result: dict[str, Any] = {
         "workload": workload,
@@ -811,7 +834,7 @@ def summarize_rows(
         "complete": complete,
         "target_recall": target_recall if target_recall is not None else "",
         "target_met": target_met,
-        "recall_mean": statistics.fmean(recalls) if recalls else NA,
+        "recall_mean": recall_mean if recalls else NA,
         "recall_lcb95": recall_lcb if recalls else NA,
         "recall_ci95_low": recall_ci_low if recalls else NA,
         "recall_ci95_high": recall_ci_high if recalls else NA,
@@ -841,7 +864,7 @@ def select_config(summaries: Sequence[dict[str, Any]], target: float) -> dict[st
         if bool(row.get("complete"))
         and bool(row.get("target_met"))
         and row.get("latency_mean_ms") not in (None, NA)
-        and float(row.get("recall_lcb95", 0.0)) >= target
+        and float(row.get("recall_mean", 0.0)) >= target
     ]
     return min(eligible, key=lambda row: (float(row["latency_mean_ms"]), str(row["config"]))) if eligible else None
 
@@ -1335,6 +1358,10 @@ def _profile_counter(profile: dict[str, Any], name: str) -> int:
         return int(profile.get(name, 0) or 0)
     except (TypeError, ValueError) as exc:
         raise RuntimeError(f"SQLens profile counter {name!r} is invalid") from exc
+
+
+def scan_profile_export(profile: dict[str, Any]) -> dict[str, Any]:
+    return {field: profile.get(field, NA) for field in SQLENS_PROFILE_EXPORT_FIELDS}
 
 
 def configure_guidance(
@@ -3398,6 +3425,7 @@ def run_measurements(
                     "guidance_checks": execution_proof["guidance_checks"],
                     "guidance_final_path": execution_proof["final_path"],
                     **adaptive,
+                    **scan_profile_export(scan_profile),
                     "scan_profile": scan_profile,
                     "error": error,
                 }

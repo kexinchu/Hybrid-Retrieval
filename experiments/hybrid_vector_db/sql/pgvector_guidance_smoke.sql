@@ -101,7 +101,7 @@ DO $$
 DECLARE
   profile jsonb := vector_hnsw_last_scan_profile()::jsonb;
 BEGIN
-  IF (profile ->> 'profile_semantics_version')::integer <> 6
+  IF (profile ->> 'profile_semantics_version')::integer <> 7
      OR (profile ->> 'heap_fetch_ms_is_residual_proxy')::boolean IS NOT TRUE
      OR profile ->> 'graph_elements_visited' IS DISTINCT FROM profile ->> 'visited_tuples'
      OR profile ->> 'raw_index_tids_returned' IS DISTINCT FROM profile ->> 'returned_tuples'

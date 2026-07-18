@@ -82,12 +82,23 @@ DENSE_12_EF_SEARCH = "250,500,750,1000,1500,2000,3000,4000,5000,7000,8500,10000"
 FORMAL_TARGETS = (0.90, 0.95, 0.99)
 TIE_AWARE_RECALL_CONTRACT = "distance_squared_threshold_tie_aware_v1"
 SQLENS_V11_BUILD_PREFIX = "sqlens-v11-"
-SQLENS_MIN_PROFILE_SEMANTICS = 6.0
+SQLENS_MIN_PROFILE_SEMANTICS = 7.0
 SQLENS_PROFILE_REQUIRED_FIELDS = (
     "graph_elements_visited",
     "raw_index_tids_returned",
     "hnsw_am_callback_ms",
     "executor_residual_ms",
+    "index_page_loads",
+    "index_page_runs",
+    "index_page_distinct_pages",
+    "index_page_distinct_pages_exact",
+    "index_page_profile_scope",
+    "heap_tid_returns",
+    "heap_tid_page_runs",
+    "heap_tid_distinct_pages",
+    "heap_tid_distinct_pages_exact",
+    "heap_tid_sequence_scope",
+    "heap_blks_are_exact_heap_io",
 )
 SQLENS_TRAVERSAL_PROFILE_REQUIRED_FIELDS = (
     "final_path",

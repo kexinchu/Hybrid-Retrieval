@@ -820,12 +820,13 @@ class TargetRecallRunnerTests(unittest.TestCase):
 
     def test_sqlens_runtime_provenance_records_loaded_contract_and_fails_closed(self):
         profile = {
-            "profile_semantics_version": 6,
+            "profile_semantics_version": 7,
             "graph_elements_visited": 1,
             "raw_index_tids_returned": 2,
             "hnsw_am_callback_ms": 0.1,
             "executor_residual_ms": 0.2,
         }
+        profile.update({field: 0 for field in SQLENS_PROFILE_REQUIRED_FIELDS if field not in profile})
         profile.update({field: 0 for field in SQLENS_TRAVERSAL_PROFILE_REQUIRED_FIELDS})
         profile.update(
             {
@@ -854,8 +855,8 @@ class TargetRecallRunnerTests(unittest.TestCase):
         self.assertEqual(provenance["loaded_vector_sqlens_build_id"], "sqlens-v11-test")
         self.assertEqual(provenance["loaded_vector_so_sha256"], binary_sha256)
         self.assertEqual(provenance["required_build_prefix"], "sqlens-v11-")
-        self.assertEqual(provenance["minimum_profile_semantics_version"], 6.0)
-        self.assertEqual(provenance["profile_semantics_version"], 6)
+        self.assertEqual(provenance["minimum_profile_semantics_version"], 7.0)
+        self.assertEqual(provenance["profile_semantics_version"], 7)
         self.assertEqual(provenance["required_profile_fields"], {
             key: profile[key]
             for key in SQLENS_PROFILE_REQUIRED_FIELDS + SQLENS_TRAVERSAL_PROFILE_REQUIRED_FIELDS
@@ -873,7 +874,7 @@ class TargetRecallRunnerTests(unittest.TestCase):
                 sqlens_runtime_provenance()
 
         profile.pop("executor_residual_ms")
-        profile["profile_semantics_version"] = 5
+        profile["profile_semantics_version"] = 6
         cursor.fetchone.side_effect = [
             ("sqlens-v11-test", "/usr/lib/postgresql/16/lib/vector.so", binary_sha256),
             (json.dumps(profile),),

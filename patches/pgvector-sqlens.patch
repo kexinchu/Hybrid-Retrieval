@@ -89,1015 +89,6 @@ index f7730a1..d12321b 100644
 +
 +REVOKE ALL ON FUNCTION vector_hnsw_graph_fingerprint(regclass) FROM PUBLIC;
 +REVOKE ALL ON FUNCTION vector_hnsw_graph_compare(regclass, regclass) FROM PUBLIC;
-diff --git a/sql/vector--0.8.2.sql b/sql/vector--0.8.2.sql
-new file mode 100644
-index 0000000..e286039
---- /dev/null
-+++ b/sql/vector--0.8.2.sql
-@@ -0,0 +1,1003 @@
-+-- complain if script is sourced in psql, rather than via CREATE EXTENSION
-+\echo Use "CREATE EXTENSION vector" to load this file. \quit
-+
-+-- vector type
-+
-+CREATE TYPE vector;
-+
-+CREATE FUNCTION vector_in(cstring, oid, integer) RETURNS vector
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_out(vector) RETURNS cstring
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_typmod_in(cstring[]) RETURNS integer
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_recv(internal, oid, integer) RETURNS vector
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_send(vector) RETURNS bytea
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE TYPE vector (
-+	INPUT     = vector_in,
-+	OUTPUT    = vector_out,
-+	TYPMOD_IN = vector_typmod_in,
-+	RECEIVE   = vector_recv,
-+	SEND      = vector_send,
-+	STORAGE   = external
-+);
-+
-+-- vector functions
-+
-+CREATE FUNCTION l2_distance(vector, vector) RETURNS float8
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION inner_product(vector, vector) RETURNS float8
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION cosine_distance(vector, vector) RETURNS float8
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION l1_distance(vector, vector) RETURNS float8
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_dims(vector) RETURNS integer
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_norm(vector) RETURNS float8
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION l2_normalize(vector) RETURNS vector
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION binary_quantize(vector) RETURNS bit
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION subvector(vector, int, int) RETURNS vector
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+-- vector private functions
-+
-+CREATE FUNCTION vector_add(vector, vector) RETURNS vector
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_sub(vector, vector) RETURNS vector
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_mul(vector, vector) RETURNS vector
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_concat(vector, vector) RETURNS vector
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_lt(vector, vector) RETURNS bool
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_le(vector, vector) RETURNS bool
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_eq(vector, vector) RETURNS bool
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_ne(vector, vector) RETURNS bool
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_ge(vector, vector) RETURNS bool
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_gt(vector, vector) RETURNS bool
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_cmp(vector, vector) RETURNS int4
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_l2_squared_distance(vector, vector) RETURNS float8
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_negative_inner_product(vector, vector) RETURNS float8
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_spherical_distance(vector, vector) RETURNS float8
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_hnsw_last_scan_profile() RETURNS text
-+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_hnsw_reset_scan_profile() RETURNS void
-+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL SAFE;
-+
-+-- kind = adaptive is backend-local D3/FragReuse admission. It observes the
-+-- first requests without pruning, then activates page/Bloom fragments only.
-+CREATE FUNCTION vector_hnsw_guidance_activate(regclass, text[], text) RETURNS int4
-+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
-+
-+-- A query must call this from an uncorrelated initplan with the same index,
-+-- atoms, and kind used at activation. Mismatches fail open to stock HNSW.
-+CREATE FUNCTION vector_hnsw_guidance_bind(regclass, text[], text) RETURNS boolean
-+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
-+
-+CREATE FUNCTION vector_hnsw_guidance_reset() RETURNS void
-+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_sqlens_build_id() RETURNS text
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_hnsw_graph_fingerprint(regclass) RETURNS jsonb
-+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT PARALLEL UNSAFE;
-+
-+COMMENT ON FUNCTION vector_hnsw_graph_fingerprint(regclass) IS
-+	'Canonical HNSW logical SHA-256 and physical-layout SHA-256. The logical digest covers format/options, canonical entrypoint identity, and every node ordered by its same-heap ordered heap-TID bundle, including level, version, exact vector bytes, and ordered per-level neighbor identities. The result also contains full sqlens-hnsw-bfs-locality-v1 statistics: zero-based deterministic BFS rank to physical index block/offset adjacency; same means delta 0, next means forward delta +1, nondecreasing counts block transitions with current >= previous, and page_runs counts maximal equal-block runs. rank_samples is capped at 256 with evenly spaced inclusive endpoints while full_statistics remains true.';
-+
-+CREATE FUNCTION vector_hnsw_graph_compare(regclass, regclass) RETURNS jsonb
-+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT PARALLEL UNSAFE;
-+
-+COMMENT ON FUNCTION vector_hnsw_graph_compare(regclass, regclass) IS
-+	'Compares canonical logical graph digests, physical-layout digests, entrypoint identity, exact node/heap-TID coverage, and heap identity for two HNSW indexes. It also returns source/clone-symmetric left_bfs_locality and right_bfs_locality objects under the sqlens-hnsw-bfs-locality-v1 metric contract.';
-+
-+REVOKE ALL ON FUNCTION vector_hnsw_graph_fingerprint(regclass) FROM PUBLIC;
-+REVOKE ALL ON FUNCTION vector_hnsw_graph_compare(regclass, regclass) FROM PUBLIC;
-+
-+CREATE FUNCTION vector_hnsw_fragment_epoch_bump_trigger() RETURNS trigger
-+	AS 'MODULE_PATHNAME' LANGUAGE C SECURITY DEFINER
-+	SET search_path = pg_catalog, pg_temp;
-+
-+CREATE FUNCTION vector_hnsw_fragment_tracking_enable(regclass) RETURNS int8
-+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
-+
-+CREATE FUNCTION vector_hnsw_guidance_profile() RETURNS text
-+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_hnsw_page_materialize(regclass, vector, int4, int4) RETURNS TABLE(rank int4, id int8, ctid text)
-+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
-+
-+CREATE FUNCTION vector_hnsw_page_materialize_profile() RETURNS text
-+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_hnsw_metadata_cache_build(regclass, text) RETURNS int8
-+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
-+
-+CREATE FUNCTION vector_hnsw_metadata_page_cache_build(regclass, text) RETURNS int8
-+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
-+
-+CREATE FUNCTION vector_hnsw_metadata_bloom_cache_build(regclass, text) RETURNS int8
-+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
-+
-+-- Compatibility symbol that raises an error: the legacy implementation could
-+-- return cached IDs without PostgreSQL heap/MVCC/predicate rechecks.
-+CREATE FUNCTION vector_hnsw_metadata_filter_search(regclass, vector, int4, int4, text) RETURNS TABLE(rank int4, id int8, ctid text)
-+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
-+
-+CREATE FUNCTION vector_hnsw_metadata_page_filter_candidates(regclass, vector, int4, text) RETURNS TABLE(rank int4, ctid text)
-+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
-+
-+CREATE FUNCTION vector_hnsw_metadata_bloom_filter_candidates(regclass, vector, int4, text) RETURNS TABLE(rank int4, ctid text)
-+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
-+
-+CREATE FUNCTION vector_hnsw_metadata_bloom_filter_candidates_limited(regclass, vector, int4, int4, text) RETURNS TABLE(rank int4, ctid text)
-+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
-+
-+CREATE FUNCTION vector_hnsw_metadata_filter_profile() RETURNS text
-+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_hnsw_metadata_cache_profile() RETURNS text
-+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_hnsw_metadata_cache_reset() RETURNS void
-+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_accum(double precision[], vector) RETURNS double precision[]
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_avg(double precision[]) RETURNS vector
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_combine(double precision[], double precision[]) RETURNS double precision[]
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+-- vector aggregates
-+
-+CREATE AGGREGATE avg(vector) (
-+	SFUNC = vector_accum,
-+	STYPE = double precision[],
-+	FINALFUNC = vector_avg,
-+	COMBINEFUNC = vector_combine,
-+	INITCOND = '{0}',
-+	PARALLEL = SAFE
-+);
-+
-+CREATE AGGREGATE sum(vector) (
-+	SFUNC = vector_add,
-+	STYPE = vector,
-+	COMBINEFUNC = vector_add,
-+	PARALLEL = SAFE
-+);
-+
-+-- vector cast functions
-+
-+CREATE FUNCTION vector(vector, integer, boolean) RETURNS vector
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION array_to_vector(integer[], integer, boolean) RETURNS vector
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION array_to_vector(real[], integer, boolean) RETURNS vector
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION array_to_vector(double precision[], integer, boolean) RETURNS vector
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION array_to_vector(numeric[], integer, boolean) RETURNS vector
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_to_float4(vector, integer, boolean) RETURNS real[]
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+-- vector casts
-+
-+CREATE CAST (vector AS vector)
-+	WITH FUNCTION vector(vector, integer, boolean) AS IMPLICIT;
-+
-+CREATE CAST (vector AS real[])
-+	WITH FUNCTION vector_to_float4(vector, integer, boolean) AS IMPLICIT;
-+
-+CREATE CAST (integer[] AS vector)
-+	WITH FUNCTION array_to_vector(integer[], integer, boolean) AS ASSIGNMENT;
-+
-+CREATE CAST (real[] AS vector)
-+	WITH FUNCTION array_to_vector(real[], integer, boolean) AS ASSIGNMENT;
-+
-+CREATE CAST (double precision[] AS vector)
-+	WITH FUNCTION array_to_vector(double precision[], integer, boolean) AS ASSIGNMENT;
-+
-+CREATE CAST (numeric[] AS vector)
-+	WITH FUNCTION array_to_vector(numeric[], integer, boolean) AS ASSIGNMENT;
-+
-+-- vector operators
-+
-+CREATE OPERATOR <-> (
-+	LEFTARG = vector, RIGHTARG = vector, PROCEDURE = l2_distance,
-+	COMMUTATOR = '<->'
-+);
-+
-+CREATE OPERATOR <#> (
-+	LEFTARG = vector, RIGHTARG = vector, PROCEDURE = vector_negative_inner_product,
-+	COMMUTATOR = '<#>'
-+);
-+
-+CREATE OPERATOR <=> (
-+	LEFTARG = vector, RIGHTARG = vector, PROCEDURE = cosine_distance,
-+	COMMUTATOR = '<=>'
-+);
-+
-+CREATE OPERATOR <+> (
-+	LEFTARG = vector, RIGHTARG = vector, PROCEDURE = l1_distance,
-+	COMMUTATOR = '<+>'
-+);
-+
-+CREATE OPERATOR + (
-+	LEFTARG = vector, RIGHTARG = vector, PROCEDURE = vector_add,
-+	COMMUTATOR = +
-+);
-+
-+CREATE OPERATOR - (
-+	LEFTARG = vector, RIGHTARG = vector, PROCEDURE = vector_sub
-+);
-+
-+CREATE OPERATOR * (
-+	LEFTARG = vector, RIGHTARG = vector, PROCEDURE = vector_mul,
-+	COMMUTATOR = *
-+);
-+
-+CREATE OPERATOR || (
-+	LEFTARG = vector, RIGHTARG = vector, PROCEDURE = vector_concat
-+);
-+
-+CREATE OPERATOR < (
-+	LEFTARG = vector, RIGHTARG = vector, PROCEDURE = vector_lt,
-+	COMMUTATOR = > , NEGATOR = >= ,
-+	RESTRICT = scalarltsel, JOIN = scalarltjoinsel
-+);
-+
-+CREATE OPERATOR <= (
-+	LEFTARG = vector, RIGHTARG = vector, PROCEDURE = vector_le,
-+	COMMUTATOR = >= , NEGATOR = > ,
-+	RESTRICT = scalarlesel, JOIN = scalarlejoinsel
-+);
-+
-+CREATE OPERATOR = (
-+	LEFTARG = vector, RIGHTARG = vector, PROCEDURE = vector_eq,
-+	COMMUTATOR = = , NEGATOR = <> ,
-+	RESTRICT = eqsel, JOIN = eqjoinsel
-+);
-+
-+CREATE OPERATOR <> (
-+	LEFTARG = vector, RIGHTARG = vector, PROCEDURE = vector_ne,
-+	COMMUTATOR = <> , NEGATOR = = ,
-+	RESTRICT = eqsel, JOIN = eqjoinsel
-+);
-+
-+CREATE OPERATOR >= (
-+	LEFTARG = vector, RIGHTARG = vector, PROCEDURE = vector_ge,
-+	COMMUTATOR = <= , NEGATOR = < ,
-+	RESTRICT = scalargesel, JOIN = scalargejoinsel
-+);
-+
-+CREATE OPERATOR > (
-+	LEFTARG = vector, RIGHTARG = vector, PROCEDURE = vector_gt,
-+	COMMUTATOR = < , NEGATOR = <= ,
-+	RESTRICT = scalargtsel, JOIN = scalargtjoinsel
-+);
-+
-+-- access methods
-+
-+CREATE FUNCTION ivfflathandler(internal) RETURNS index_am_handler
-+	AS 'MODULE_PATHNAME' LANGUAGE C;
-+
-+CREATE ACCESS METHOD ivfflat TYPE INDEX HANDLER ivfflathandler;
-+
-+COMMENT ON ACCESS METHOD ivfflat IS 'ivfflat index access method';
-+
-+CREATE FUNCTION hnswhandler(internal) RETURNS index_am_handler
-+	AS 'MODULE_PATHNAME' LANGUAGE C;
-+
-+CREATE ACCESS METHOD hnsw TYPE INDEX HANDLER hnswhandler;
-+
-+COMMENT ON ACCESS METHOD hnsw IS 'hnsw index access method';
-+
-+-- access method private functions
-+
-+CREATE FUNCTION ivfflat_halfvec_support(internal) RETURNS internal
-+	AS 'MODULE_PATHNAME' LANGUAGE C;
-+
-+CREATE FUNCTION ivfflat_bit_support(internal) RETURNS internal
-+	AS 'MODULE_PATHNAME' LANGUAGE C;
-+
-+CREATE FUNCTION hnsw_halfvec_support(internal) RETURNS internal
-+	AS 'MODULE_PATHNAME' LANGUAGE C;
-+
-+CREATE FUNCTION hnsw_bit_support(internal) RETURNS internal
-+	AS 'MODULE_PATHNAME' LANGUAGE C;
-+
-+CREATE FUNCTION hnsw_sparsevec_support(internal) RETURNS internal
-+	AS 'MODULE_PATHNAME' LANGUAGE C;
-+
-+-- vector opclasses
-+
-+CREATE OPERATOR CLASS vector_ops
-+	DEFAULT FOR TYPE vector USING btree AS
-+	OPERATOR 1 < ,
-+	OPERATOR 2 <= ,
-+	OPERATOR 3 = ,
-+	OPERATOR 4 >= ,
-+	OPERATOR 5 > ,
-+	FUNCTION 1 vector_cmp(vector, vector);
-+
-+CREATE OPERATOR CLASS vector_l2_ops
-+	DEFAULT FOR TYPE vector USING ivfflat AS
-+	OPERATOR 1 <-> (vector, vector) FOR ORDER BY float_ops,
-+	FUNCTION 1 vector_l2_squared_distance(vector, vector),
-+	FUNCTION 3 l2_distance(vector, vector);
-+
-+CREATE OPERATOR CLASS vector_ip_ops
-+	FOR TYPE vector USING ivfflat AS
-+	OPERATOR 1 <#> (vector, vector) FOR ORDER BY float_ops,
-+	FUNCTION 1 vector_negative_inner_product(vector, vector),
-+	FUNCTION 3 vector_spherical_distance(vector, vector),
-+	FUNCTION 4 vector_norm(vector);
-+
-+CREATE OPERATOR CLASS vector_cosine_ops
-+	FOR TYPE vector USING ivfflat AS
-+	OPERATOR 1 <=> (vector, vector) FOR ORDER BY float_ops,
-+	FUNCTION 1 vector_negative_inner_product(vector, vector),
-+	FUNCTION 2 vector_norm(vector),
-+	FUNCTION 3 vector_spherical_distance(vector, vector),
-+	FUNCTION 4 vector_norm(vector);
-+
-+CREATE OPERATOR CLASS vector_l2_ops
-+	FOR TYPE vector USING hnsw AS
-+	OPERATOR 1 <-> (vector, vector) FOR ORDER BY float_ops,
-+	FUNCTION 1 vector_l2_squared_distance(vector, vector);
-+
-+CREATE OPERATOR CLASS vector_ip_ops
-+	FOR TYPE vector USING hnsw AS
-+	OPERATOR 1 <#> (vector, vector) FOR ORDER BY float_ops,
-+	FUNCTION 1 vector_negative_inner_product(vector, vector);
-+
-+CREATE OPERATOR CLASS vector_cosine_ops
-+	FOR TYPE vector USING hnsw AS
-+	OPERATOR 1 <=> (vector, vector) FOR ORDER BY float_ops,
-+	FUNCTION 1 vector_negative_inner_product(vector, vector),
-+	FUNCTION 2 vector_norm(vector);
-+
-+CREATE OPERATOR CLASS vector_l1_ops
-+	FOR TYPE vector USING hnsw AS
-+	OPERATOR 1 <+> (vector, vector) FOR ORDER BY float_ops,
-+	FUNCTION 1 l1_distance(vector, vector);
-+
-+-- halfvec type
-+
-+CREATE TYPE halfvec;
-+
-+CREATE FUNCTION halfvec_in(cstring, oid, integer) RETURNS halfvec
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION halfvec_out(halfvec) RETURNS cstring
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION halfvec_typmod_in(cstring[]) RETURNS integer
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION halfvec_recv(internal, oid, integer) RETURNS halfvec
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION halfvec_send(halfvec) RETURNS bytea
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE TYPE halfvec (
-+	INPUT     = halfvec_in,
-+	OUTPUT    = halfvec_out,
-+	TYPMOD_IN = halfvec_typmod_in,
-+	RECEIVE   = halfvec_recv,
-+	SEND      = halfvec_send,
-+	STORAGE   = external
-+);
-+
-+-- halfvec functions
-+
-+CREATE FUNCTION l2_distance(halfvec, halfvec) RETURNS float8
-+	AS 'MODULE_PATHNAME', 'halfvec_l2_distance' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION inner_product(halfvec, halfvec) RETURNS float8
-+	AS 'MODULE_PATHNAME', 'halfvec_inner_product' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION cosine_distance(halfvec, halfvec) RETURNS float8
-+	AS 'MODULE_PATHNAME', 'halfvec_cosine_distance' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION l1_distance(halfvec, halfvec) RETURNS float8
-+	AS 'MODULE_PATHNAME', 'halfvec_l1_distance' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_dims(halfvec) RETURNS integer
-+	AS 'MODULE_PATHNAME', 'halfvec_vector_dims' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION l2_norm(halfvec) RETURNS float8
-+	AS 'MODULE_PATHNAME', 'halfvec_l2_norm' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION l2_normalize(halfvec) RETURNS halfvec
-+	AS 'MODULE_PATHNAME', 'halfvec_l2_normalize' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION binary_quantize(halfvec) RETURNS bit
-+	AS 'MODULE_PATHNAME', 'halfvec_binary_quantize' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION subvector(halfvec, int, int) RETURNS halfvec
-+	AS 'MODULE_PATHNAME', 'halfvec_subvector' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+-- halfvec private functions
-+
-+CREATE FUNCTION halfvec_add(halfvec, halfvec) RETURNS halfvec
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION halfvec_sub(halfvec, halfvec) RETURNS halfvec
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION halfvec_mul(halfvec, halfvec) RETURNS halfvec
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION halfvec_concat(halfvec, halfvec) RETURNS halfvec
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION halfvec_lt(halfvec, halfvec) RETURNS bool
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION halfvec_le(halfvec, halfvec) RETURNS bool
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION halfvec_eq(halfvec, halfvec) RETURNS bool
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION halfvec_ne(halfvec, halfvec) RETURNS bool
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION halfvec_ge(halfvec, halfvec) RETURNS bool
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION halfvec_gt(halfvec, halfvec) RETURNS bool
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION halfvec_cmp(halfvec, halfvec) RETURNS int4
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION halfvec_l2_squared_distance(halfvec, halfvec) RETURNS float8
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION halfvec_negative_inner_product(halfvec, halfvec) RETURNS float8
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION halfvec_spherical_distance(halfvec, halfvec) RETURNS float8
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION halfvec_accum(double precision[], halfvec) RETURNS double precision[]
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION halfvec_avg(double precision[]) RETURNS halfvec
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION halfvec_combine(double precision[], double precision[]) RETURNS double precision[]
-+	AS 'MODULE_PATHNAME', 'vector_combine' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+-- halfvec aggregates
-+
-+CREATE AGGREGATE avg(halfvec) (
-+	SFUNC = halfvec_accum,
-+	STYPE = double precision[],
-+	FINALFUNC = halfvec_avg,
-+	COMBINEFUNC = halfvec_combine,
-+	INITCOND = '{0}',
-+	PARALLEL = SAFE
-+);
-+
-+CREATE AGGREGATE sum(halfvec) (
-+	SFUNC = halfvec_add,
-+	STYPE = halfvec,
-+	COMBINEFUNC = halfvec_add,
-+	PARALLEL = SAFE
-+);
-+
-+-- halfvec cast functions
-+
-+CREATE FUNCTION halfvec(halfvec, integer, boolean) RETURNS halfvec
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION halfvec_to_vector(halfvec, integer, boolean) RETURNS vector
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_to_halfvec(vector, integer, boolean) RETURNS halfvec
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION array_to_halfvec(integer[], integer, boolean) RETURNS halfvec
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION array_to_halfvec(real[], integer, boolean) RETURNS halfvec
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION array_to_halfvec(double precision[], integer, boolean) RETURNS halfvec
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION array_to_halfvec(numeric[], integer, boolean) RETURNS halfvec
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION halfvec_to_float4(halfvec, integer, boolean) RETURNS real[]
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+-- halfvec casts
-+
-+CREATE CAST (halfvec AS halfvec)
-+	WITH FUNCTION halfvec(halfvec, integer, boolean) AS IMPLICIT;
-+
-+CREATE CAST (halfvec AS vector)
-+	WITH FUNCTION halfvec_to_vector(halfvec, integer, boolean) AS ASSIGNMENT;
-+
-+CREATE CAST (vector AS halfvec)
-+	WITH FUNCTION vector_to_halfvec(vector, integer, boolean) AS IMPLICIT;
-+
-+CREATE CAST (halfvec AS real[])
-+	WITH FUNCTION halfvec_to_float4(halfvec, integer, boolean) AS ASSIGNMENT;
-+
-+CREATE CAST (integer[] AS halfvec)
-+	WITH FUNCTION array_to_halfvec(integer[], integer, boolean) AS ASSIGNMENT;
-+
-+CREATE CAST (real[] AS halfvec)
-+	WITH FUNCTION array_to_halfvec(real[], integer, boolean) AS ASSIGNMENT;
-+
-+CREATE CAST (double precision[] AS halfvec)
-+	WITH FUNCTION array_to_halfvec(double precision[], integer, boolean) AS ASSIGNMENT;
-+
-+CREATE CAST (numeric[] AS halfvec)
-+	WITH FUNCTION array_to_halfvec(numeric[], integer, boolean) AS ASSIGNMENT;
-+
-+-- halfvec operators
-+
-+CREATE OPERATOR <-> (
-+	LEFTARG = halfvec, RIGHTARG = halfvec, PROCEDURE = l2_distance,
-+	COMMUTATOR = '<->'
-+);
-+
-+CREATE OPERATOR <#> (
-+	LEFTARG = halfvec, RIGHTARG = halfvec, PROCEDURE = halfvec_negative_inner_product,
-+	COMMUTATOR = '<#>'
-+);
-+
-+CREATE OPERATOR <=> (
-+	LEFTARG = halfvec, RIGHTARG = halfvec, PROCEDURE = cosine_distance,
-+	COMMUTATOR = '<=>'
-+);
-+
-+CREATE OPERATOR <+> (
-+	LEFTARG = halfvec, RIGHTARG = halfvec, PROCEDURE = l1_distance,
-+	COMMUTATOR = '<+>'
-+);
-+
-+CREATE OPERATOR + (
-+	LEFTARG = halfvec, RIGHTARG = halfvec, PROCEDURE = halfvec_add,
-+	COMMUTATOR = +
-+);
-+
-+CREATE OPERATOR - (
-+	LEFTARG = halfvec, RIGHTARG = halfvec, PROCEDURE = halfvec_sub
-+);
-+
-+CREATE OPERATOR * (
-+	LEFTARG = halfvec, RIGHTARG = halfvec, PROCEDURE = halfvec_mul,
-+	COMMUTATOR = *
-+);
-+
-+CREATE OPERATOR || (
-+	LEFTARG = halfvec, RIGHTARG = halfvec, PROCEDURE = halfvec_concat
-+);
-+
-+CREATE OPERATOR < (
-+	LEFTARG = halfvec, RIGHTARG = halfvec, PROCEDURE = halfvec_lt,
-+	COMMUTATOR = > , NEGATOR = >= ,
-+	RESTRICT = scalarltsel, JOIN = scalarltjoinsel
-+);
-+
-+CREATE OPERATOR <= (
-+	LEFTARG = halfvec, RIGHTARG = halfvec, PROCEDURE = halfvec_le,
-+	COMMUTATOR = >= , NEGATOR = > ,
-+	RESTRICT = scalarlesel, JOIN = scalarlejoinsel
-+);
-+
-+CREATE OPERATOR = (
-+	LEFTARG = halfvec, RIGHTARG = halfvec, PROCEDURE = halfvec_eq,
-+	COMMUTATOR = = , NEGATOR = <> ,
-+	RESTRICT = eqsel, JOIN = eqjoinsel
-+);
-+
-+CREATE OPERATOR <> (
-+	LEFTARG = halfvec, RIGHTARG = halfvec, PROCEDURE = halfvec_ne,
-+	COMMUTATOR = <> , NEGATOR = = ,
-+	RESTRICT = eqsel, JOIN = eqjoinsel
-+);
-+
-+CREATE OPERATOR >= (
-+	LEFTARG = halfvec, RIGHTARG = halfvec, PROCEDURE = halfvec_ge,
-+	COMMUTATOR = <= , NEGATOR = < ,
-+	RESTRICT = scalargesel, JOIN = scalargejoinsel
-+);
-+
-+CREATE OPERATOR > (
-+	LEFTARG = halfvec, RIGHTARG = halfvec, PROCEDURE = halfvec_gt,
-+	COMMUTATOR = < , NEGATOR = <= ,
-+	RESTRICT = scalargtsel, JOIN = scalargtjoinsel
-+);
-+
-+-- halfvec opclasses
-+
-+CREATE OPERATOR CLASS halfvec_ops
-+	DEFAULT FOR TYPE halfvec USING btree AS
-+	OPERATOR 1 < ,
-+	OPERATOR 2 <= ,
-+	OPERATOR 3 = ,
-+	OPERATOR 4 >= ,
-+	OPERATOR 5 > ,
-+	FUNCTION 1 halfvec_cmp(halfvec, halfvec);
-+
-+CREATE OPERATOR CLASS halfvec_l2_ops
-+	FOR TYPE halfvec USING ivfflat AS
-+	OPERATOR 1 <-> (halfvec, halfvec) FOR ORDER BY float_ops,
-+	FUNCTION 1 halfvec_l2_squared_distance(halfvec, halfvec),
-+	FUNCTION 3 l2_distance(halfvec, halfvec),
-+	FUNCTION 5 ivfflat_halfvec_support(internal);
-+
-+CREATE OPERATOR CLASS halfvec_ip_ops
-+	FOR TYPE halfvec USING ivfflat AS
-+	OPERATOR 1 <#> (halfvec, halfvec) FOR ORDER BY float_ops,
-+	FUNCTION 1 halfvec_negative_inner_product(halfvec, halfvec),
-+	FUNCTION 3 halfvec_spherical_distance(halfvec, halfvec),
-+	FUNCTION 4 l2_norm(halfvec),
-+	FUNCTION 5 ivfflat_halfvec_support(internal);
-+
-+CREATE OPERATOR CLASS halfvec_cosine_ops
-+	FOR TYPE halfvec USING ivfflat AS
-+	OPERATOR 1 <=> (halfvec, halfvec) FOR ORDER BY float_ops,
-+	FUNCTION 1 halfvec_negative_inner_product(halfvec, halfvec),
-+	FUNCTION 2 l2_norm(halfvec),
-+	FUNCTION 3 halfvec_spherical_distance(halfvec, halfvec),
-+	FUNCTION 4 l2_norm(halfvec),
-+	FUNCTION 5 ivfflat_halfvec_support(internal);
-+
-+CREATE OPERATOR CLASS halfvec_l2_ops
-+	FOR TYPE halfvec USING hnsw AS
-+	OPERATOR 1 <-> (halfvec, halfvec) FOR ORDER BY float_ops,
-+	FUNCTION 1 halfvec_l2_squared_distance(halfvec, halfvec),
-+	FUNCTION 3 hnsw_halfvec_support(internal);
-+
-+CREATE OPERATOR CLASS halfvec_ip_ops
-+	FOR TYPE halfvec USING hnsw AS
-+	OPERATOR 1 <#> (halfvec, halfvec) FOR ORDER BY float_ops,
-+	FUNCTION 1 halfvec_negative_inner_product(halfvec, halfvec),
-+	FUNCTION 3 hnsw_halfvec_support(internal);
-+
-+CREATE OPERATOR CLASS halfvec_cosine_ops
-+	FOR TYPE halfvec USING hnsw AS
-+	OPERATOR 1 <=> (halfvec, halfvec) FOR ORDER BY float_ops,
-+	FUNCTION 1 halfvec_negative_inner_product(halfvec, halfvec),
-+	FUNCTION 2 l2_norm(halfvec),
-+	FUNCTION 3 hnsw_halfvec_support(internal);
-+
-+CREATE OPERATOR CLASS halfvec_l1_ops
-+	FOR TYPE halfvec USING hnsw AS
-+	OPERATOR 1 <+> (halfvec, halfvec) FOR ORDER BY float_ops,
-+	FUNCTION 1 l1_distance(halfvec, halfvec),
-+	FUNCTION 3 hnsw_halfvec_support(internal);
-+
-+-- bit functions
-+
-+CREATE FUNCTION hamming_distance(bit, bit) RETURNS float8
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION jaccard_distance(bit, bit) RETURNS float8
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+-- bit operators
-+
-+CREATE OPERATOR <~> (
-+	LEFTARG = bit, RIGHTARG = bit, PROCEDURE = hamming_distance,
-+	COMMUTATOR = '<~>'
-+);
-+
-+CREATE OPERATOR <%> (
-+	LEFTARG = bit, RIGHTARG = bit, PROCEDURE = jaccard_distance,
-+	COMMUTATOR = '<%>'
-+);
-+
-+-- bit opclasses
-+
-+CREATE OPERATOR CLASS bit_hamming_ops
-+	FOR TYPE bit USING ivfflat AS
-+	OPERATOR 1 <~> (bit, bit) FOR ORDER BY float_ops,
-+	FUNCTION 1 hamming_distance(bit, bit),
-+	FUNCTION 3 hamming_distance(bit, bit),
-+	FUNCTION 5 ivfflat_bit_support(internal);
-+
-+CREATE OPERATOR CLASS bit_hamming_ops
-+	FOR TYPE bit USING hnsw AS
-+	OPERATOR 1 <~> (bit, bit) FOR ORDER BY float_ops,
-+	FUNCTION 1 hamming_distance(bit, bit),
-+	FUNCTION 3 hnsw_bit_support(internal);
-+
-+CREATE OPERATOR CLASS bit_jaccard_ops
-+	FOR TYPE bit USING hnsw AS
-+	OPERATOR 1 <%> (bit, bit) FOR ORDER BY float_ops,
-+	FUNCTION 1 jaccard_distance(bit, bit),
-+	FUNCTION 3 hnsw_bit_support(internal);
-+
-+--- sparsevec type
-+
-+CREATE TYPE sparsevec;
-+
-+CREATE FUNCTION sparsevec_in(cstring, oid, integer) RETURNS sparsevec
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION sparsevec_out(sparsevec) RETURNS cstring
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION sparsevec_typmod_in(cstring[]) RETURNS integer
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION sparsevec_recv(internal, oid, integer) RETURNS sparsevec
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION sparsevec_send(sparsevec) RETURNS bytea
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE TYPE sparsevec (
-+	INPUT     = sparsevec_in,
-+	OUTPUT    = sparsevec_out,
-+	TYPMOD_IN = sparsevec_typmod_in,
-+	RECEIVE   = sparsevec_recv,
-+	SEND      = sparsevec_send,
-+	STORAGE   = external
-+);
-+
-+-- sparsevec functions
-+
-+CREATE FUNCTION l2_distance(sparsevec, sparsevec) RETURNS float8
-+	AS 'MODULE_PATHNAME', 'sparsevec_l2_distance' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION inner_product(sparsevec, sparsevec) RETURNS float8
-+	AS 'MODULE_PATHNAME', 'sparsevec_inner_product' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION cosine_distance(sparsevec, sparsevec) RETURNS float8
-+	AS 'MODULE_PATHNAME', 'sparsevec_cosine_distance' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION l1_distance(sparsevec, sparsevec) RETURNS float8
-+	AS 'MODULE_PATHNAME', 'sparsevec_l1_distance' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION l2_norm(sparsevec) RETURNS float8
-+	AS 'MODULE_PATHNAME', 'sparsevec_l2_norm' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION l2_normalize(sparsevec) RETURNS sparsevec
-+	AS 'MODULE_PATHNAME', 'sparsevec_l2_normalize' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+-- sparsevec private functions
-+
-+CREATE FUNCTION sparsevec_lt(sparsevec, sparsevec) RETURNS bool
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION sparsevec_le(sparsevec, sparsevec) RETURNS bool
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION sparsevec_eq(sparsevec, sparsevec) RETURNS bool
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION sparsevec_ne(sparsevec, sparsevec) RETURNS bool
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION sparsevec_ge(sparsevec, sparsevec) RETURNS bool
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION sparsevec_gt(sparsevec, sparsevec) RETURNS bool
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION sparsevec_cmp(sparsevec, sparsevec) RETURNS int4
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION sparsevec_l2_squared_distance(sparsevec, sparsevec) RETURNS float8
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION sparsevec_negative_inner_product(sparsevec, sparsevec) RETURNS float8
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+-- sparsevec cast functions
-+
-+CREATE FUNCTION sparsevec(sparsevec, integer, boolean) RETURNS sparsevec
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION vector_to_sparsevec(vector, integer, boolean) RETURNS sparsevec
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION sparsevec_to_vector(sparsevec, integer, boolean) RETURNS vector
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION halfvec_to_sparsevec(halfvec, integer, boolean) RETURNS sparsevec
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION sparsevec_to_halfvec(sparsevec, integer, boolean) RETURNS halfvec
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION array_to_sparsevec(integer[], integer, boolean) RETURNS sparsevec
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION array_to_sparsevec(real[], integer, boolean) RETURNS sparsevec
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION array_to_sparsevec(double precision[], integer, boolean) RETURNS sparsevec
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+CREATE FUNCTION array_to_sparsevec(numeric[], integer, boolean) RETURNS sparsevec
-+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-+
-+-- sparsevec casts
-+
-+CREATE CAST (sparsevec AS sparsevec)
-+	WITH FUNCTION sparsevec(sparsevec, integer, boolean) AS IMPLICIT;
-+
-+CREATE CAST (sparsevec AS vector)
-+	WITH FUNCTION sparsevec_to_vector(sparsevec, integer, boolean) AS ASSIGNMENT;
-+
-+CREATE CAST (vector AS sparsevec)
-+	WITH FUNCTION vector_to_sparsevec(vector, integer, boolean) AS IMPLICIT;
-+
-+CREATE CAST (sparsevec AS halfvec)
-+	WITH FUNCTION sparsevec_to_halfvec(sparsevec, integer, boolean) AS ASSIGNMENT;
-+
-+CREATE CAST (halfvec AS sparsevec)
-+	WITH FUNCTION halfvec_to_sparsevec(halfvec, integer, boolean) AS IMPLICIT;
-+
-+CREATE CAST (integer[] AS sparsevec)
-+	WITH FUNCTION array_to_sparsevec(integer[], integer, boolean) AS ASSIGNMENT;
-+
-+CREATE CAST (real[] AS sparsevec)
-+	WITH FUNCTION array_to_sparsevec(real[], integer, boolean) AS ASSIGNMENT;
-+
-+CREATE CAST (double precision[] AS sparsevec)
-+	WITH FUNCTION array_to_sparsevec(double precision[], integer, boolean) AS ASSIGNMENT;
-+
-+CREATE CAST (numeric[] AS sparsevec)
-+	WITH FUNCTION array_to_sparsevec(numeric[], integer, boolean) AS ASSIGNMENT;
-+
-+-- sparsevec operators
-+
-+CREATE OPERATOR <-> (
-+	LEFTARG = sparsevec, RIGHTARG = sparsevec, PROCEDURE = l2_distance,
-+	COMMUTATOR = '<->'
-+);
-+
-+CREATE OPERATOR <#> (
-+	LEFTARG = sparsevec, RIGHTARG = sparsevec, PROCEDURE = sparsevec_negative_inner_product,
-+	COMMUTATOR = '<#>'
-+);
-+
-+CREATE OPERATOR <=> (
-+	LEFTARG = sparsevec, RIGHTARG = sparsevec, PROCEDURE = cosine_distance,
-+	COMMUTATOR = '<=>'
-+);
-+
-+CREATE OPERATOR <+> (
-+	LEFTARG = sparsevec, RIGHTARG = sparsevec, PROCEDURE = l1_distance,
-+	COMMUTATOR = '<+>'
-+);
-+
-+CREATE OPERATOR < (
-+	LEFTARG = sparsevec, RIGHTARG = sparsevec, PROCEDURE = sparsevec_lt,
-+	COMMUTATOR = > , NEGATOR = >= ,
-+	RESTRICT = scalarltsel, JOIN = scalarltjoinsel
-+);
-+
-+CREATE OPERATOR <= (
-+	LEFTARG = sparsevec, RIGHTARG = sparsevec, PROCEDURE = sparsevec_le,
-+	COMMUTATOR = >= , NEGATOR = > ,
-+	RESTRICT = scalarlesel, JOIN = scalarlejoinsel
-+);
-+
-+CREATE OPERATOR = (
-+	LEFTARG = sparsevec, RIGHTARG = sparsevec, PROCEDURE = sparsevec_eq,
-+	COMMUTATOR = = , NEGATOR = <> ,
-+	RESTRICT = eqsel, JOIN = eqjoinsel
-+);
-+
-+CREATE OPERATOR <> (
-+	LEFTARG = sparsevec, RIGHTARG = sparsevec, PROCEDURE = sparsevec_ne,
-+	COMMUTATOR = <> , NEGATOR = = ,
-+	RESTRICT = eqsel, JOIN = eqjoinsel
-+);
-+
-+CREATE OPERATOR >= (
-+	LEFTARG = sparsevec, RIGHTARG = sparsevec, PROCEDURE = sparsevec_ge,
-+	COMMUTATOR = <= , NEGATOR = < ,
-+	RESTRICT = scalargesel, JOIN = scalargejoinsel
-+);
-+
-+CREATE OPERATOR > (
-+	LEFTARG = sparsevec, RIGHTARG = sparsevec, PROCEDURE = sparsevec_gt,
-+	COMMUTATOR = < , NEGATOR = <= ,
-+	RESTRICT = scalargtsel, JOIN = scalargtjoinsel
-+);
-+
-+-- sparsevec opclasses
-+
-+CREATE OPERATOR CLASS sparsevec_ops
-+	DEFAULT FOR TYPE sparsevec USING btree AS
-+	OPERATOR 1 < ,
-+	OPERATOR 2 <= ,
-+	OPERATOR 3 = ,
-+	OPERATOR 4 >= ,
-+	OPERATOR 5 > ,
-+	FUNCTION 1 sparsevec_cmp(sparsevec, sparsevec);
-+
-+CREATE OPERATOR CLASS sparsevec_l2_ops
-+	FOR TYPE sparsevec USING hnsw AS
-+	OPERATOR 1 <-> (sparsevec, sparsevec) FOR ORDER BY float_ops,
-+	FUNCTION 1 sparsevec_l2_squared_distance(sparsevec, sparsevec),
-+	FUNCTION 3 hnsw_sparsevec_support(internal);
-+
-+CREATE OPERATOR CLASS sparsevec_ip_ops
-+	FOR TYPE sparsevec USING hnsw AS
-+	OPERATOR 1 <#> (sparsevec, sparsevec) FOR ORDER BY float_ops,
-+	FUNCTION 1 sparsevec_negative_inner_product(sparsevec, sparsevec),
-+	FUNCTION 3 hnsw_sparsevec_support(internal);
-+
-+CREATE OPERATOR CLASS sparsevec_cosine_ops
-+	FOR TYPE sparsevec USING hnsw AS
-+	OPERATOR 1 <=> (sparsevec, sparsevec) FOR ORDER BY float_ops,
-+	FUNCTION 1 sparsevec_negative_inner_product(sparsevec, sparsevec),
-+	FUNCTION 2 l2_norm(sparsevec),
-+	FUNCTION 3 hnsw_sparsevec_support(internal);
-+
-+CREATE OPERATOR CLASS sparsevec_l1_ops
-+	FOR TYPE sparsevec USING hnsw AS
-+	OPERATOR 1 <+> (sparsevec, sparsevec) FOR ORDER BY float_ops,
-+	FUNCTION 1 l1_distance(sparsevec, sparsevec),
-+	FUNCTION 3 hnsw_sparsevec_support(internal);
 diff --git a/sql/vector.sql b/sql/vector.sql
 index 7fc3671..e286039 100644
 --- a/sql/vector.sql
@@ -1527,7 +518,7 @@ index bfc92a1..19b4ebf 100644
  	/* Never use index without order */
  	if (path->indexorderbys == NIL)
 diff --git a/src/hnsw.h b/src/hnsw.h
-index 841af0f..cbf09c2 100644
+index 841af0f..a4bea8e 100644
 --- a/src/hnsw.h
 +++ b/src/hnsw.h
 @@ -7,13 +7,17 @@
@@ -1543,7 +534,7 @@ index 841af0f..cbf09c2 100644
  #include "utils/sampling.h"
  #include "vector.h"
  
-+#define SQLENS_BUILD_ID "sqlens-v11-bfs-locality-proof-ef100000-20260718-r9"
++#define SQLENS_BUILD_ID "sqlens-v11-bfs-locality-proof-ef100000-20260718-r10"
 +
  #if PG_VERSION_NUM >= 190000
  typedef Pointer Item;
@@ -1659,7 +650,7 @@ index 841af0f..cbf09c2 100644
  
  #define HnswPtrDeclare(type, relptrtype, ptrtype) \
  	relptr_declare(type, relptrtype); \
-@@ -179,10 +262,204 @@ typedef struct HnswSearchCandidate
+@@ -179,10 +262,218 @@ typedef struct HnswSearchCandidate
  {
  	pairingheap_node c_node;
  	pairingheap_node w_node;
@@ -1802,6 +793,15 @@ index 841af0f..cbf09c2 100644
 +	int64		indexPageElementDistinctPages;
 +	int64		indexPagePrefetches;
 +	bool		indexPageDistinctCountsExact;
++	int64		indexPageLoads;
++	int64		indexPageRuns;
++	int64		indexPageDistinctPages;
++	BlockNumber indexPageLastBlock;
++	bool		indexPageDistinctPagesExact;
++	int64		heapTidReturns;
++	int64		heapTidPageRuns;
++	int64		heapTidDistinctPages;
++	bool		heapTidDistinctPagesExact;
 +	int64		blksHitBefore;
 +	int64		blksHitAfter;
 +	int64		blksReadBefore;
@@ -1835,6 +835,10 @@ index 841af0f..cbf09c2 100644
 +	int64		elementDistinctPages;
 +	int64		prefetches;
 +	bool		distinctCountsExact;
++	int64		loads;
++	int64		runs;
++	int64		distinctPages;
++	BlockNumber lastBlock;
 +}			HnswIndexPageProfile;
 +
 +typedef struct HnswIndexPageSet
@@ -1851,6 +855,7 @@ index 841af0f..cbf09c2 100644
 +	BlockNumber lastElementBlock;
 +	HnswIndexPageSet neighborPages;
 +	HnswIndexPageSet elementPages;
++	HnswIndexPageSet pages;
 +} HnswIndexPageProfileState;
 +
 +typedef struct HnswPageAccessItem
@@ -1864,7 +869,7 @@ index 841af0f..cbf09c2 100644
  /* HNSW index options */
  typedef struct HnswOptions
  {
-@@ -378,9 +655,42 @@ typedef struct HnswScanOpaqueData
+@@ -378,9 +669,49 @@ typedef struct HnswScanOpaqueData
  	HnswQuery	q;
  	int			m;
  	int64		tuples;
@@ -1882,6 +887,7 @@ index 841af0f..cbf09c2 100644
  	double		previousDistance;
  	Size		maxMemory;
  	MemoryContext tmpCtx;
++	MemoryContext profileCtx;
 +	HnswPageAccessItem *pageItems;
 +	int			pageItemCount;
 +	int			pageItemIndex;
@@ -1896,6 +902,12 @@ index 841af0f..cbf09c2 100644
 +	int64		guidanceChecks;
 +	int64		guidanceMatches;
 +	int64		guidanceSkips;
++	int64		heapTidReturns;
++	int64		heapTidPageRuns;
++	int64		heapTidDistinctPages;
++	BlockNumber heapTidLastBlock;
++	HnswIndexPageSet heapTidPages;
++	bool		heapTidDistinctPagesExact;
 +	HnswTraversalProfile traversal;
 +	HnswIndexPageProfileState indexPageProfile;
 +	void	   *guidancePlan;
@@ -1907,7 +919,7 @@ index 841af0f..cbf09c2 100644
  
  	/* Support functions */
  	HnswSupport support;
-@@ -423,7 +733,7 @@ bool		HnswCheckNorm(HnswSupport * support, Datum value);
+@@ -423,14 +754,16 @@ bool		HnswCheckNorm(HnswSupport * support, Datum value);
  Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
  void		HnswInitPage(Buffer buf, Page page);
  void		HnswInit(void);
@@ -1915,8 +927,17 @@ index 841af0f..cbf09c2 100644
 +List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, int64 *distanceComputations, HnswTraversalProfile *traversalProfile, HnswScanGuidance *guidance, HnswTraversalGuidanceState *traversalGuidance, HnswIndexPageProfileState *indexPageProfile);
  HnswElement HnswGetEntryPoint(Relation index);
  void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
++void		HnswGetMetaPageInfoTracked(Relation index, int *m, HnswElement * entryPoint, HnswIndexPageProfileState *profile);
  void	   *HnswAlloc(HnswAllocator * allocator, Size size);
-@@ -451,6 +761,7 @@ PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);
+ HnswElement HnswInitElement(char *base, ItemPointer tid, int m, double ml, int maxLevel, HnswAllocator * alloc);
+ HnswElement HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno);
+ void		HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, HnswSupport * support, int m, int efConstruction, bool existing);
+ HnswSearchCandidate *HnswEntryCandidate(char *base, HnswElement entryPoint, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec);
++HnswSearchCandidate *HnswEntryCandidateTracked(char *base, HnswElement entryPoint, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, HnswIndexPageProfileState *profile);
+ void		HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building);
+ void		HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m);
+ void		HnswAddHeapTid(HnswElement element, ItemPointer heaptid);
+@@ -451,6 +784,7 @@ PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);
  /* Index access methods */
  IndexBuildResult *hnswbuild(Relation heap, Relation index, IndexInfo *indexInfo);
  void		hnswbuildempty(Relation index);
@@ -1924,7 +945,7 @@ index 841af0f..cbf09c2 100644
  bool		hnswinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid, Relation heap, IndexUniqueCheck checkUnique
  #if PG_VERSION_NUM >= 140000
  					   ,bool indexUnchanged
-@@ -463,6 +774,23 @@ IndexScanDesc hnswbeginscan(Relation index, int nkeys, int norderbys);
+@@ -463,6 +797,24 @@ IndexScanDesc hnswbeginscan(Relation index, int nkeys, int norderbys);
  void		hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys);
  bool		hnswgettuple(IndexScanDesc scan, ScanDirection dir);
  void		hnswendscan(IndexScanDesc scan);
@@ -1932,6 +953,7 @@ index 841af0f..cbf09c2 100644
 +void		HnswGetLastScanProfile(HnswScanProfile *profile);
 +void		HnswInitIndexPageProfile(HnswIndexPageProfileState *state,
 +								 MemoryContext context);
++void		HnswRecordHeapTid(HnswScanOpaque scan, ItemPointer tid);
 +bool		HnswGuidanceIsActive(void);
 +bool		HnswGuidanceIsActiveForHeap(Oid heapOid);
 +void		HnswGuidanceRegisterExecutorScans(QueryDesc *queryDesc, uint64 frameId);
@@ -3990,7 +3012,7 @@ index 0000000..9913c10
 +												  CStringGetDatum(json.data))));
 +}
 diff --git a/src/hnswscan.c b/src/hnswscan.c
-index 61a8d63..e30cec1 100644
+index 61a8d63..f4d10c0 100644
 --- a/src/hnswscan.c
 +++ b/src/hnswscan.c
 @@ -2,16 +2,19 @@
@@ -4071,10 +3093,22 @@ index 61a8d63..e30cec1 100644
  {
  	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
  	Relation	index = scan->indexRelation;
-@@ -43,14 +94,226 @@ GetScanItems(IndexScanDesc scan, Datum value)
+@@ -34,7 +85,7 @@ GetScanItems(IndexScanDesc scan, Datum value)
+ 	HnswQuery  *q = &so->q;
+ 
+ 	/* Get m and entry point */
+-	HnswGetMetaPageInfo(index, &m, &entryPoint);
++	HnswGetMetaPageInfoTracked(index, &m, &entryPoint, &so->indexPageProfile);
+ 
+ 	q->value = value;
+ 	so->m = m;
+@@ -42,15 +93,228 @@ GetScanItems(IndexScanDesc scan, Datum value)
+ 	if (entryPoint == NULL)
  		return NIL;
  
- 	ep = list_make1(HnswEntryCandidate(base, entryPoint, q, index, support, false));
+-	ep = list_make1(HnswEntryCandidate(base, entryPoint, q, index, support, false));
++	ep = list_make1(HnswEntryCandidateTracked(base, entryPoint, q, index, support,
++											 false, &so->indexPageProfile));
 +	so->distanceComputations++;
  
  	for (int lc = entryPoint->level; lc >= 1; lc--)
@@ -4300,7 +3334,7 @@ index 61a8d63..e30cec1 100644
  }
  
  /*
-@@ -77,11 +340,85 @@ ResumeScanItems(IndexScanDesc scan)
+@@ -77,11 +341,94 @@ ResumeScanItems(IndexScanDesc scan)
  			break;
  
  		sc = HnswGetSearchCandidate(w_node, pairingheap_remove_first(so->discarded));
@@ -4353,6 +3387,15 @@ index 61a8d63..e30cec1 100644
 +	hnsw_last_profile.indexPageElementRuns = 0;
 +	hnsw_last_profile.indexPageElementDistinctPages = 0;
 +	hnsw_last_profile.indexPagePrefetches = 0;
++	hnsw_last_profile.indexPageLoads = 0;
++	hnsw_last_profile.indexPageRuns = 0;
++	hnsw_last_profile.indexPageDistinctPages = 0;
++	hnsw_last_profile.indexPageLastBlock = InvalidBlockNumber;
++	hnsw_last_profile.indexPageDistinctPagesExact = true;
++	hnsw_last_profile.heapTidReturns = 0;
++	hnsw_last_profile.heapTidPageRuns = 0;
++	hnsw_last_profile.heapTidDistinctPages = 0;
++	hnsw_last_profile.heapTidDistinctPagesExact = true;
 +	hnsw_last_profile.indexPageDistinctCountsExact = true;
 +	hnsw_last_profile.blksHitBefore = 0;
 +	hnsw_last_profile.blksHitAfter = 0;
@@ -4387,7 +3430,7 @@ index 61a8d63..e30cec1 100644
  }
  
  /*
-@@ -111,6 +448,245 @@ GetScanValue(IndexScanDesc scan)
+@@ -111,6 +458,245 @@ GetScanValue(IndexScanDesc scan)
  	return value;
  }
  
@@ -4633,7 +3676,7 @@ index 61a8d63..e30cec1 100644
  #if defined(HNSW_MEMORY)
  /*
   * Show memory usage
-@@ -145,8 +721,35 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
+@@ -145,8 +731,44 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
  	 * tuples for iterative search before exceeding work_mem
  	 */
  	so->tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
@@ -4641,7 +3684,10 @@ index 61a8d63..e30cec1 100644
 -									   0, 8 * 1024, 256 * 1024);
 +										   "Hnsw scan temporary context",
 +										   0, 8 * 1024, 256 * 1024);
-+	HnswInitIndexPageProfile(&so->indexPageProfile, so->tmpCtx);
++	so->profileCtx = AllocSetContextCreate(CurrentMemoryContext,
++										   "Hnsw scan profile context",
++										   ALLOCSET_DEFAULT_SIZES);
++	HnswInitIndexPageProfile(&so->indexPageProfile, so->profileCtx);
 +	so->pageItems = NULL;
 +	so->pageItemCount = 0;
 +	so->pageItemIndex = 0;
@@ -4656,6 +3702,12 @@ index 61a8d63..e30cec1 100644
 +	so->guidanceChecks = 0;
 +	so->guidanceMatches = 0;
 +	so->guidanceSkips = 0;
++	so->heapTidReturns = 0;
++	so->heapTidPageRuns = 0;
++	so->heapTidDistinctPages = 0;
++	so->heapTidLastBlock = InvalidBlockNumber;
++	MemSet(&so->heapTidPages, 0, sizeof(so->heapTidPages));
++	so->heapTidDistinctPagesExact = true;
 +	MemSet(&so->traversal, 0, sizeof(HnswTraversalProfile));
 +	so->guidancePlan = NULL;
 +	so->guidance = NULL;
@@ -4671,7 +3723,7 @@ index 61a8d63..e30cec1 100644
  
  	/* Calculate max memory */
  	/* Add 256 extra bytes to fill last block when close */
-@@ -154,6 +757,7 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
+@@ -154,6 +776,7 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
  	so->maxMemory = Min(maxMemory, (double) SIZE_MAX);
  
  	scan->opaque = so;
@@ -4679,7 +3731,7 @@ index 61a8d63..e30cec1 100644
  
  	return scan;
  }
-@@ -171,8 +775,47 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
+@@ -171,8 +794,54 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
  	so->v.tids = NULL;
  	so->discarded = NULL;
  	so->tuples = 0;
@@ -4695,7 +3747,8 @@ index 61a8d63..e30cec1 100644
 +	so->topkTidCount = 0;
  	so->previousDistance = -get_float8_infinity();
  	MemoryContextReset(so->tmpCtx);
-+	HnswInitIndexPageProfile(&so->indexPageProfile, so->tmpCtx);
++	MemoryContextReset(so->profileCtx);
++	HnswInitIndexPageProfile(&so->indexPageProfile, so->profileCtx);
 +	so->pageItems = NULL;
 +	so->pageItemCount = 0;
 +	so->pageItemIndex = 0;
@@ -4710,6 +3763,12 @@ index 61a8d63..e30cec1 100644
 +	so->guidanceChecks = 0;
 +	so->guidanceMatches = 0;
 +	so->guidanceSkips = 0;
++	so->heapTidReturns = 0;
++	so->heapTidPageRuns = 0;
++	so->heapTidDistinctPages = 0;
++	so->heapTidLastBlock = InvalidBlockNumber;
++	MemSet(&so->heapTidPages, 0, sizeof(so->heapTidPages));
++	so->heapTidDistinctPagesExact = true;
 +	MemSet(&so->traversal, 0, sizeof(HnswTraversalProfile));
 +	so->abandonedGuidedTuples = 0;
 +	so->traversalGuidance.phaseContext = NULL;
@@ -4727,7 +3786,7 @@ index 61a8d63..e30cec1 100644
  
  	if (keys && scan->numberOfKeys > 0)
  		memmove(scan->keyData, keys, scan->numberOfKeys * sizeof(ScanKeyData));
-@@ -184,11 +827,27 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
+@@ -184,11 +853,27 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
  /*
   * Fetch the next tuple in the given scan
   */
@@ -4756,7 +3815,7 @@ index 61a8d63..e30cec1 100644
  
  	/*
  	 * Index can be used to scan backward, but Postgres doesn't support
-@@ -196,10 +855,19 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
+@@ -196,10 +881,19 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
  	 */
  	Assert(ScanDirectionIsForward(dir));
  
@@ -4778,7 +3837,7 @@ index 61a8d63..e30cec1 100644
  		/* Count index scan for stats */
  		pgstat_count_index_scan(scan->indexRelation);
  #if PG_VERSION_NUM >= 180000
-@@ -216,16 +884,13 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
+@@ -216,16 +910,13 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
  		if (!IsMVCCSnapshot(scan->xs_snapshot))
  			elog(ERROR, "non-MVCC snapshots are not supported with hnsw");
  
@@ -4796,7 +3855,7 @@ index 61a8d63..e30cec1 100644
  
  		/* Release shared lock */
  		UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
-@@ -239,92 +904,73 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
+@@ -239,92 +930,74 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
  
  	for (;;)
  	{
@@ -4919,6 +3978,7 @@ index 61a8d63..e30cec1 100644
 +		if (so->topkTidCount < HNSW_PROFILE_MAX_TIDS)
 +			so->topkTids[so->topkTidCount++] = heaptid;
 +		so->returnedTuples++;
++		HnswRecordHeapTid(so, &heaptid);
 +
 +		scan->xs_heaptid = heaptid;
  		scan->xs_recheck = false;
@@ -4932,7 +3992,7 @@ index 61a8d63..e30cec1 100644
  	return false;
  }
  
-@@ -336,6 +982,144 @@ hnswendscan(IndexScanDesc scan)
+@@ -336,7 +1009,157 @@ hnswendscan(IndexScanDesc scan)
  {
  	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
  
@@ -5034,6 +4094,17 @@ index 61a8d63..e30cec1 100644
 +		hnsw_last_profile.indexPageElementRuns += indexPageProfile.elementRuns;
 +		hnsw_last_profile.indexPageElementDistinctPages += indexPageProfile.elementDistinctPages;
 +		hnsw_last_profile.indexPagePrefetches += indexPageProfile.prefetches;
++		hnsw_last_profile.indexPageLoads += indexPageProfile.loads;
++		hnsw_last_profile.indexPageRuns += indexPageProfile.runs;
++		hnsw_last_profile.indexPageDistinctPages += indexPageProfile.distinctPages;
++		hnsw_last_profile.indexPageLastBlock = indexPageProfile.lastBlock;
++		if (!indexPageProfile.distinctCountsExact)
++			hnsw_last_profile.indexPageDistinctPagesExact = false;
++		hnsw_last_profile.heapTidReturns += so->heapTidReturns;
++		hnsw_last_profile.heapTidPageRuns += so->heapTidPageRuns;
++		hnsw_last_profile.heapTidDistinctPages += so->heapTidDistinctPages;
++		hnsw_last_profile.heapTidDistinctPagesExact =
++			hnsw_last_profile.heapTidDistinctPagesExact && so->heapTidDistinctPagesExact;
 +		if (!indexPageProfile.distinctCountsExact)
 +			hnsw_last_profile.indexPageDistinctCountsExact = false;
 +		hnsw_last_profile.blksHitBefore = so->blksHitBefore;
@@ -5075,10 +4146,12 @@ index 61a8d63..e30cec1 100644
 +	else
 +		hnsw_last_profile.plannerProofsTruncated = true;
  	MemoryContextDelete(so->tmpCtx);
++	MemoryContextDelete(so->profileCtx);
  
  	pfree(so);
+ 	scan->opaque = NULL;
 diff --git a/src/hnswutils.c b/src/hnswutils.c
-index f4e4d82..30f0f84 100644
+index f4e4d82..e5f1802 100644
 --- a/src/hnswutils.c
 +++ b/src/hnswutils.c
 @@ -8,6 +8,7 @@
@@ -5089,7 +4162,7 @@ index f4e4d82..30f0f84 100644
  #include "nodes/pg_list.h"
  #include "port/atomics.h"
  #include "sparsevec.h"
-@@ -21,6 +22,166 @@
+@@ -21,6 +22,205 @@
  #include "varatt.h"
  #endif
  
@@ -5145,6 +4218,9 @@ index f4e4d82..30f0f84 100644
 +	return 0;
 +}
 +
++static bool HnswIndexPageSetAdd(HnswIndexPageProfileState *state,
++								HnswIndexPageSet *set, BlockNumber block);
++
 +void
 +HnswInitIndexPageProfile(HnswIndexPageProfileState *state,
 +						 MemoryContext context)
@@ -5153,7 +4229,30 @@ index f4e4d82..30f0f84 100644
 +	state->context = context;
 +	state->lastNeighborBlock = InvalidBlockNumber;
 +	state->lastElementBlock = InvalidBlockNumber;
++	state->profile.lastBlock = InvalidBlockNumber;
 +	state->profile.distinctCountsExact = true;
++}
++
++void
++HnswRecordHeapTid(HnswScanOpaque scan, ItemPointer tid)
++{
++	HnswIndexPageProfileState state;
++	BlockNumber block;
++
++	if (scan == NULL || tid == NULL || !ItemPointerIsValid(tid))
++		return;
++	block = ItemPointerGetBlockNumber(tid);
++	MemSet(&state, 0, sizeof(state));
++	state.context = scan->profileCtx;
++	state.profile.distinctCountsExact = true;
++	scan->heapTidReturns++;
++	if (block != scan->heapTidLastBlock)
++		scan->heapTidPageRuns++;
++	scan->heapTidLastBlock = block;
++	if (HnswIndexPageSetAdd(&state, &scan->heapTidPages, block))
++		scan->heapTidDistinctPages++;
++	if (!state.profile.distinctCountsExact)
++		scan->heapTidDistinctPagesExact = false;
 +}
 +
 +static bool
@@ -5201,6 +4300,19 @@ index f4e4d82..30f0f84 100644
 +	state->lastNeighborBlock = block;
 +	if (HnswIndexPageSetAdd(state, &state->neighborPages, block))
 +		state->profile.neighborDistinctPages++;
++}
++
++static void
++HnswRecordIndexPage(HnswIndexPageProfileState *state, BlockNumber block)
++{
++	if (state == NULL || !BlockNumberIsValid(block))
++		return;
++	state->profile.loads++;
++	if (block != state->profile.lastBlock)
++		state->profile.runs++;
++	state->profile.lastBlock = block;
++	if (HnswIndexPageSetAdd(state, &state->pages, block))
++		state->profile.distinctPages++;
 +}
 +
 +static void
@@ -5256,7 +4368,54 @@ index f4e4d82..30f0f84 100644
  #if PG_VERSION_NUM < 170000
  static inline uint64
  murmurhash64(uint64 data)
-@@ -597,6 +758,7 @@ HnswInitSearchCandidate(char *base, HnswElement element, double distance)
+@@ -297,12 +497,20 @@ HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno)
+  */
+ void
+ HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
++{
++	HnswGetMetaPageInfoTracked(index, m, entryPoint, NULL);
++}
++
++void
++HnswGetMetaPageInfoTracked(Relation index, int *m, HnswElement * entryPoint,
++						   HnswIndexPageProfileState *profile)
+ {
+ 	Buffer		buf;
+ 	Page		page;
+ 	HnswMetaPage metap;
+ 
+ 	buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
++	HnswRecordIndexPage(profile, HNSW_METAPAGE_BLKNO);
+ 	LockBuffer(buf, BUFFER_LOCK_SHARE);
+ 	page = BufferGetPage(buf);
+ 	metap = HnswPageGetMeta(page);
+@@ -531,7 +739,7 @@ HnswGetDistance(Datum a, Datum b, HnswSupport * support)
+  * Load an element and optionally get its distance from q
+  */
+ static void
+-HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element)
++HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element, HnswIndexPageProfileState *profile)
+ {
+ 	Buffer		buf;
+ 	Page		page;
+@@ -539,6 +747,7 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
+ 
+ 	/* Read vector */
+ 	buf = ReadBuffer(index, blkno);
++	HnswRecordIndexPage(profile, blkno);
+ 	LockBuffer(buf, BUFFER_LOCK_SHARE);
+ 	page = BufferGetPage(buf);
+ 
+@@ -573,7 +782,7 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
+ void
+ HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance)
+ {
+-	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element);
++	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element, NULL);
+ }
+ 
+ /*
+@@ -597,6 +806,7 @@ HnswInitSearchCandidate(char *base, HnswElement element, double distance)
  
  	HnswPtrStore(base, sc->element, element);
  	sc->distance = distance;
@@ -5264,7 +4423,27 @@ index f4e4d82..30f0f84 100644
  	return sc;
  }
  
-@@ -617,18 +779,37 @@ HnswEntryCandidate(char *base, HnswElement entryPoint, HnswQuery * q, Relation i
+@@ -605,6 +815,12 @@ HnswInitSearchCandidate(char *base, HnswElement element, double distance)
+  */
+ HnswSearchCandidate *
+ HnswEntryCandidate(char *base, HnswElement entryPoint, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec)
++{
++	return HnswEntryCandidateTracked(base, entryPoint, q, index, support, loadVec, NULL);
++}
++
++HnswSearchCandidate *
++HnswEntryCandidateTracked(char *base, HnswElement entryPoint, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, HnswIndexPageProfileState *profile)
+ {
+ 	bool		inMemory = index == NULL;
+ 	double		distance;
+@@ -612,23 +828,43 @@ HnswEntryCandidate(char *base, HnswElement entryPoint, HnswQuery * q, Relation i
+ 	if (inMemory)
+ 		distance = GetElementDistance(base, entryPoint, q, support);
+ 	else
+-		HnswLoadElement(entryPoint, &distance, q, index, support, loadVec, NULL);
++		HnswLoadElementImpl(entryPoint->blkno, entryPoint->offno, &distance, q,
++							index, support, loadVec, NULL, &entryPoint, profile);
+ 
  	return HnswInitSearchCandidate(base, entryPoint, distance);
  }
  
@@ -5304,7 +4483,7 @@ index f4e4d82..30f0f84 100644
  	return 0;
  }
  
-@@ -653,15 +834,76 @@ CompareNearestDiscardedCandidates(const pairingheap_node *a, const pairingheap_n
+@@ -653,15 +889,76 @@ CompareNearestDiscardedCandidates(const pairingheap_node *a, const pairingheap_n
  static int
  CompareFurthestCandidates(const pairingheap_node *a, const pairingheap_node *b, void *arg)
  {
@@ -5383,25 +4562,55 @@ index f4e4d82..30f0f84 100644
  /*
   * Init visited
   */
-@@ -788,7 +1030,7 @@ HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation i
+@@ -753,8 +1050,8 @@ HnswLoadUnvisitedFromMemory(char *base, HnswElement element, HnswUnvisited * unv
+ /*
+  * Load neighbor index TIDs
+  */
+-bool
+-HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc)
++static bool
++HnswLoadNeighborTidsTracked(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc, HnswIndexPageProfileState *profile)
+ {
+ 	Buffer		buf;
+ 	Page		page;
+@@ -762,6 +1059,7 @@ HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation i
+ 	int			start;
+ 
+ 	buf = ReadBuffer(index, element->neighborPage);
++	HnswRecordIndexPage(profile, element->neighborPage);
+ 	LockBuffer(buf, BUFFER_LOCK_SHARE);
+ 	page = BufferGetPage(buf);
+ 
+@@ -785,18 +1083,24 @@ HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation i
+ 	return true;
+ }
+ 
++bool
++HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc)
++{
++	return HnswLoadNeighborTidsTracked(element, indextids, index, m, lm, lc, NULL);
++}
++
  /*
   * Load unvisited neighbors from disk
   */
 -static void
+-HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, int m, int lm, int lc)
 +static bool
- HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, int m, int lm, int lc)
++HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, int m, int lm, int lc, HnswIndexPageProfileState *profile)
  {
  	ItemPointerData indextids[HNSW_MAX_M * 2];
-@@ -796,7 +1038,7 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
+ 
  	*unvisitedLength = 0;
  
- 	if (!HnswLoadNeighborTids(element, indextids, index, m, lm, lc))
+-	if (!HnswLoadNeighborTids(element, indextids, index, m, lm, lc))
 -		return;
++	if (!HnswLoadNeighborTidsTracked(element, indextids, index, m, lm, lc, profile))
 +		return false;
  
  	for (int i = 0; i < lm; i++)
  	{
-@@ -811,26 +1053,496 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
+@@ -811,26 +1115,497 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
  		if (!found)
  			unvisited[(*unvisitedLength)++].indextid = *indextid;
  	}
@@ -5465,6 +4674,7 @@ index f4e4d82..30f0f84 100644
 +	}
 +
 +	buf = ReadBuffer(search->index, blkno);
++	HnswRecordIndexPage(search->indexPageProfile, blkno);
 +	LockBuffer(buf, BUFFER_LOCK_SHARE);
 +	page = BufferGetPage(buf);
 +	if (PageGetSpecialSize(page) != MAXALIGN(sizeof(HnswPageOpaqueData)) ||
@@ -5629,7 +4839,7 @@ index f4e4d82..30f0f84 100644
 +								element->neighborPage);
 +	if (!HnswLoadUnvisitedFromDisk(element, search->unvisited, &unvisitedLength,
 +									 search->visited, search->index,
-+									 search->m, search->lm, 0))
++									 search->m, search->lm, 0, search->indexPageProfile))
 +	{
 +		search->state->invalidNeighbor = true;
 +		return false;
@@ -5902,7 +5112,7 @@ index f4e4d82..30f0f84 100644
  
  	if (v == NULL)
  	{
-@@ -858,6 +1570,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+@@ -858,6 +1633,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
  	{
  		HnswSearchCandidate *sc = (HnswSearchCandidate *) lfirst(lc2);
  		bool		found;
@@ -5910,7 +5120,7 @@ index f4e4d82..30f0f84 100644
  
  		if (initVisited)
  		{
-@@ -869,36 +1582,107 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+@@ -869,36 +1645,107 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
  		}
  
  		pairingheap_add(C, &sc->c_node);
@@ -6005,7 +5215,7 @@ index f4e4d82..30f0f84 100644
 +			if (!inserting)
 +					HnswRecordIndexNeighborPage(indexPageProfile,
 +						cElement->neighborPage);
-+			(void) HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc);
++			(void) HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc, indexPageProfile);
 +			if (!inserting)
 +					HnswPrefetchUnvisitedIndexPages(index, unvisited,
 +						unvisitedLength, indexPageProfile);
@@ -6024,15 +5234,15 @@ index f4e4d82..30f0f84 100644
  
  		for (int i = 0; i < unvisitedLength; i++)
  		{
-@@ -906,13 +1690,18 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+@@ -906,13 +1753,18 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
  			HnswSearchCandidate *e;
  			double		eDistance;
  			bool		alwaysAdd = wlen < ef;
 +			bool		matchesGuidance = true;
-+
-+			CHECK_FOR_INTERRUPTS();
  
 -			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
++			CHECK_FOR_INTERRUPTS();
++
 +			f = pairingheap_is_empty(W) ? NULL : HnswGetSearchCandidate(w_node, pairingheap_first(W));
  
  			if (inMemory)
@@ -6044,12 +5254,12 @@ index f4e4d82..30f0f84 100644
  			}
  			else
  			{
-@@ -922,19 +1711,55 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+@@ -922,19 +1774,55 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
  
  				/* Avoid any allocations if not adding */
  				eElement = NULL;
 -				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement);
-+				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, (alwaysAdd || discarded != NULL || f == NULL) ? NULL : &f->distance, &eElement);
++				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, (alwaysAdd || discarded != NULL || f == NULL) ? NULL : &f->distance, &eElement, indexPageProfile);
 +				if (distanceComputations != NULL)
 +					(*distanceComputations)++;
  
@@ -6104,7 +5314,7 @@ index f4e4d82..30f0f84 100644
  				}
  
  				continue;
-@@ -946,8 +1771,21 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+@@ -946,8 +1834,21 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
  
  			/* Create a new candidate */
  			e = HnswInitSearchCandidate(base, eElement, eDistance);
@@ -6126,7 +5336,7 @@ index f4e4d82..30f0f84 100644
  
  			/*
  			 * Do not count elements being deleted towards ef when vacuuming.
-@@ -963,12 +1801,54 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+@@ -963,12 +1864,54 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
  				{
  					HnswSearchCandidate *d = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
  
@@ -6182,7 +5392,7 @@ index f4e4d82..30f0f84 100644
  
  	/* Add each element of W to w */
  	while (!pairingheap_is_empty(W))
-@@ -981,14 +1861,69 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+@@ -981,14 +1924,69 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
  	return w;
  }
  
@@ -6253,7 +5463,7 @@ index f4e4d82..30f0f84 100644
  
  	if (hca->distance < hcb->distance)
  		return 1;
-@@ -996,6 +1931,14 @@ CompareCandidateDistances(const ListCell *a, const ListCell *b)
+@@ -996,6 +1994,14 @@ CompareCandidateDistances(const ListCell *a, const ListCell *b)
  	if (hca->distance > hcb->distance)
  		return -1;
  
@@ -6268,7 +5478,7 @@ index f4e4d82..30f0f84 100644
  	if (HnswPtrPointer(hca->element) < HnswPtrPointer(hcb->element))
  		return 1;
  
-@@ -1068,12 +2011,7 @@ SelectNeighbors(char *base, List *c, int lm, HnswSupport * support, bool *closer
+@@ -1068,12 +2074,7 @@ SelectNeighbors(char *base, List *c, int lm, HnswSupport * support, bool *closer
  	List	   *added = NIL;
  	bool		removedAny = false;
  
@@ -6282,7 +5492,7 @@ index f4e4d82..30f0f84 100644
  	if (sortCandidates)
  	{
  		if (base == NULL)
-@@ -1082,6 +2020,11 @@ SelectNeighbors(char *base, List *c, int lm, HnswSupport * support, bool *closer
+@@ -1082,6 +2083,11 @@ SelectNeighbors(char *base, List *c, int lm, HnswSupport * support, bool *closer
  			list_sort(w, CompareCandidateDistancesOffset);
  	}
  
@@ -6294,7 +5504,7 @@ index f4e4d82..30f0f84 100644
  	while (list_length(w) > 0 && list_length(r) < lm)
  	{
  		/* Assumes w is already ordered desc */
-@@ -1300,7 +2243,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
+@@ -1300,7 +2306,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
  	/* 1st phase: greedy search to insert level */
  	for (int lc = entryLevel; lc >= level + 1; lc--)
  	{
@@ -6303,7 +5513,7 @@ index f4e4d82..30f0f84 100644
  		ep = w;
  	}
  
-@@ -1319,7 +2262,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
+@@ -1319,7 +2325,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
  		List	   *lw = NIL;
  		ListCell   *lc2;
  
@@ -6312,7 +5522,7 @@ index f4e4d82..30f0f84 100644
  
  		/* Convert search candidates to candidates */
  		foreach(lc2, w)
-@@ -1338,12 +2281,8 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
+@@ -1338,12 +2344,8 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
  		if (!inMemory)
  			lw = RemoveElements(base, lw, skipElement);
  
@@ -6328,7 +5538,7 @@ index f4e4d82..30f0f84 100644
  		AddConnections(base, element, neighbors, lc);
  
 diff --git a/src/vector.c b/src/vector.c
-index b8c2953..8f13ce9 100644
+index b8c2953..c518a6c 100644
 --- a/src/vector.c
 +++ b/src/vector.c
 @@ -2,26 +2,564 @@
@@ -6896,7 +6106,7 @@ index b8c2953..8f13ce9 100644
  #if PG_VERSION_NUM >= 160000
  #include "varatt.h"
  #endif
-@@ -56,6 +594,5044 @@ _PG_init(void)
+@@ -56,6 +594,5067 @@ _PG_init(void)
  	HalfvecInit();
  	HnswInit();
  	IvfflatInit();
@@ -7071,7 +6281,7 @@ index b8c2953..8f13ce9 100644
 +{
 +	appendStringInfo(output,
 +					"{\"valid\":%s,"
-+					"\"profile_semantics_version\":6,"
++					"\"profile_semantics_version\":7,"
 +					"\"total_scan_ms\":%.6f,"
 +					"\"hnsw_search_ms\":%.6f,"
 +					"\"heap_fetch_ms\":%.6f,"
@@ -7121,7 +6331,7 @@ index b8c2953..8f13ce9 100644
 +					"\"index_page_distinct_counts_exact\":%s,"
 +					"\"index_page_distinct_page_limit\":%d,"
 +					"\"index_page_distinct_scope\":\"sum_of_scan_local_unique_pages\","
-+					"\"index_page_profile_scope\":\"search_neighbor_and_candidate_element_pages\","
++					"\"index_page_profile_scope\":\"search_readbuffer_sequence_all_metapage_entry_neighbor_candidate_element\","
 +					"\"index_page_neighbor_distinct_pages\":" INT64_FORMAT ","
 +					"\"index_page_element_loads\":" INT64_FORMAT ","
 +					"\"index_page_element_runs\":" INT64_FORMAT ","
@@ -7135,6 +6345,8 @@ index b8c2953..8f13ce9 100644
 +					"\"idx_blks_read\":" INT64_FORMAT ","
 +					"\"heap_blks_hit\":" INT64_FORMAT ","
 +					"\"heap_blks_read\":" INT64_FORMAT ","
++					"\"heap_blks_scope\":\"executor_buffer_delta_residual_after_index_delta\","
++					"\"heap_blks_are_exact_heap_io\":false,"
 +					"\"topk_count\":%d,"
 +					"\"topk_ids\":[",
 +					profile->valid ? "true" : "false",
@@ -7212,7 +6424,17 @@ index b8c2953..8f13ce9 100644
 +	}
 +
 +	appendStringInfo(output,
-+					"],\"heap_validation_guidance_checks\":" INT64_FORMAT
++					"],\"index_page_loads\":" INT64_FORMAT
++					",\"index_page_runs\":" INT64_FORMAT
++					",\"index_page_distinct_pages\":" INT64_FORMAT
++					",\"index_page_last_block\":%u"
++					",\"index_page_distinct_pages_exact\":%s"
++					",\"heap_tid_returns\":" INT64_FORMAT
++					",\"heap_tid_page_runs\":" INT64_FORMAT
++					",\"heap_tid_distinct_pages\":" INT64_FORMAT
++					",\"heap_tid_distinct_pages_exact\":%s"
++					",\"heap_tid_sequence_scope\":\"sum_of_scan_local_actual_xs_heaptid_return_sequences\""
++					",\"heap_validation_guidance_checks\":" INT64_FORMAT
 +					",\"heap_validation_guidance_matches\":" INT64_FORMAT
 +					",\"heap_validation_guidance_skips\":" INT64_FORMAT
 +					",\"pre_distance_membership_checks\":" INT64_FORMAT
@@ -7258,6 +6480,17 @@ index b8c2953..8f13ce9 100644
 +					",\"planner_proof_count\":%d"
 +					",\"planner_proofs_truncated\":%s"
 +					",\"planner_proofs\":[",
++					profile->indexPageLoads,
++					profile->indexPageRuns,
++					profile->indexPageDistinctPagesExact ?
++						profile->indexPageDistinctPages : -1,
++					profile->indexPageLastBlock,
++					profile->indexPageDistinctPagesExact ? "true" : "false",
++					profile->heapTidReturns,
++					profile->heapTidPageRuns,
++					profile->heapTidDistinctPagesExact ?
++						profile->heapTidDistinctPages : -1,
++					profile->heapTidDistinctPagesExact ? "true" : "false",
 +					profile->guidanceChecks,
 +					profile->guidanceMatches,
 +					profile->guidanceSkips,
@@ -12024,6 +11257,52 @@ index 0000000..e69e865
 +  END
 +  $$;
 +
+diff --git a/test/expected/hnsw_profile.out b/test/expected/hnsw_profile.out
+new file mode 100644
+index 0000000..3abe3e0
+--- /dev/null
++++ b/test/expected/hnsw_profile.out
+@@ -0,0 +1,40 @@
++SET enable_seqscan = off;
++SET hnsw.ef_search = 8;
++CREATE TABLE hnsw_profile_t (id int, val vector(2));
++INSERT INTO hnsw_profile_t
++SELECT i, format('[%s,%s]', i, i + 1)::vector
++FROM generate_series(0, 7) AS g(i);
++CREATE INDEX hnsw_profile_t_idx ON hnsw_profile_t USING hnsw (val vector_l2_ops);
++SELECT id FROM hnsw_profile_t ORDER BY val <-> '[0,1]'::vector LIMIT 4;
++ id 
++----
++  0
++  1
++  2
++  3
++(4 rows)
++
++WITH p AS (
++	SELECT vector_hnsw_last_scan_profile()::jsonb AS j
++)
++SELECT
++	(j->>'profile_semantics_version')::int = 7 AS semantics_v7,
++	j ? 'index_page_loads' AND j ? 'index_page_runs' AND
++	j ? 'index_page_distinct_pages' AND j ? 'index_page_last_block' AS index_fields,
++	(j->>'index_page_loads')::bigint >= 0 AND
++	(j->>'index_page_runs')::bigint >= 0 AND
++	(j->>'index_page_distinct_pages')::bigint >= 0 AS index_nonnegative,
++	(j->>'index_page_runs')::bigint <= (j->>'index_page_loads')::bigint AS index_runs_bounded,
++	j ? 'heap_tid_returns' AND j ? 'heap_tid_page_runs' AND
++	j ? 'heap_tid_distinct_pages' AS heap_fields,
++	(j->>'heap_tid_returns')::bigint = 4 AND
++	(j->>'heap_tid_page_runs')::bigint = 1 AND
++	(j->>'heap_tid_distinct_pages')::bigint = 1 AS predictable_heap_runs,
++	(j->>'heap_blks_are_exact_heap_io')::boolean = false AS heap_io_not_claimed_exact
++FROM p;
++ semantics_v7 | index_fields | index_nonnegative | index_runs_bounded | heap_fields | predictable_heap_runs | heap_io_not_claimed_exact 
++--------------+--------------+-------------------+--------------------+-------------+-----------------------+---------------------------
++ t            | t            | t                 | t                  | t           | t                     | t
++(1 row)
++
++DROP TABLE hnsw_profile_t;
 diff --git a/test/expected/hnsw_vector.out b/test/expected/hnsw_vector.out
 index cb4d8b9..1625a73 100644
 --- a/test/expected/hnsw_vector.out
@@ -12147,6 +11426,43 @@ index 0000000..1999f0c
 +}
 +
 +permutation "prepare_table" "take_old_snapshot" "hot_update" "build_source" "build_clone" "plan_with_old_snapshot" "finish_old_snapshot" "plan_with_fresh_snapshot"
+diff --git a/test/sql/hnsw_profile.sql b/test/sql/hnsw_profile.sql
+new file mode 100644
+index 0000000..2a4450a
+--- /dev/null
++++ b/test/sql/hnsw_profile.sql
+@@ -0,0 +1,31 @@
++SET enable_seqscan = off;
++SET hnsw.ef_search = 8;
++
++CREATE TABLE hnsw_profile_t (id int, val vector(2));
++INSERT INTO hnsw_profile_t
++SELECT i, format('[%s,%s]', i, i + 1)::vector
++FROM generate_series(0, 7) AS g(i);
++CREATE INDEX hnsw_profile_t_idx ON hnsw_profile_t USING hnsw (val vector_l2_ops);
++
++SELECT id FROM hnsw_profile_t ORDER BY val <-> '[0,1]'::vector LIMIT 4;
++
++WITH p AS (
++	SELECT vector_hnsw_last_scan_profile()::jsonb AS j
++)
++SELECT
++	(j->>'profile_semantics_version')::int = 7 AS semantics_v7,
++	j ? 'index_page_loads' AND j ? 'index_page_runs' AND
++	j ? 'index_page_distinct_pages' AND j ? 'index_page_last_block' AS index_fields,
++	(j->>'index_page_loads')::bigint >= 0 AND
++	(j->>'index_page_runs')::bigint >= 0 AND
++	(j->>'index_page_distinct_pages')::bigint >= 0 AS index_nonnegative,
++	(j->>'index_page_runs')::bigint <= (j->>'index_page_loads')::bigint AS index_runs_bounded,
++	j ? 'heap_tid_returns' AND j ? 'heap_tid_page_runs' AND
++	j ? 'heap_tid_distinct_pages' AS heap_fields,
++	(j->>'heap_tid_returns')::bigint = 4 AND
++	(j->>'heap_tid_page_runs')::bigint = 1 AND
++	(j->>'heap_tid_distinct_pages')::bigint = 1 AS predictable_heap_runs,
++	(j->>'heap_blks_are_exact_heap_io')::boolean = false AS heap_io_not_claimed_exact
++FROM p;
++
++DROP TABLE hnsw_profile_t;
 diff --git a/test/sql/hnsw_vector.sql b/test/sql/hnsw_vector.sql
 index a928ba4..b31b622 100644
 --- a/test/sql/hnsw_vector.sql

@@ -59,12 +59,13 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
     @staticmethod
     def _sqlens_profile() -> dict[str, object]:
         profile = {
-            "profile_semantics_version": 6,
+            "profile_semantics_version": 7,
             "graph_elements_visited": 11,
             "raw_index_tids_returned": 7,
             "hnsw_am_callback_ms": 1.25,
             "executor_residual_ms": 0.75,
         }
+        profile.update({field: 0 for field in benchmark.SQLENS_PROFILE_FIELDS if field not in profile})
         profile.update({field: 0 for field in benchmark.SQLENS_TRAVERSAL_PROFILE_FIELDS})
         profile.update(
             {
@@ -127,7 +128,7 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
         build_id, profile = benchmark.require_sqlens_provenance(cursor)
 
         self.assertEqual(build_id, "sqlens-v11-amazon-build")
-        self.assertEqual(profile["profile_semantics_version"], 6)
+        self.assertEqual(profile["profile_semantics_version"], 7)
         self.assertEqual(
             [call.args[0] for call in cursor.execute.call_args_list],
             [

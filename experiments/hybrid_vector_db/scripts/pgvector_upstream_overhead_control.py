@@ -46,7 +46,7 @@ OFF_REPRESENTATIVE_MAX_SCAN = 100_000
 OFF_REPRESENTATIVE_SCAN_MEM = 1.0
 OFFICIAL_UPSTREAM_VECTOR_SO_SHA256 = "812292e3e7553c3dbe6a4187b528430a7f9c25693f4876b8d22f88829592a778"
 DEFAULT_SQLENS_BUILD_PREFIX = "sqlens-v11-"
-DEFAULT_SQLENS_PROFILE_SEMANTICS = 4.0
+DEFAULT_SQLENS_PROFILE_SEMANTICS = 7.0
 FORMAL_TARGET_RECALLS = (0.90, 0.95, 0.99)
 FORMAL_FAMILIES = ("off", "strict_order")
 STOCK_HNSW_GUCS = frozenset(
@@ -62,6 +62,17 @@ SQLENS_PROFILE_FIELDS = (
     "raw_index_tids_returned",
     "hnsw_am_callback_ms",
     "executor_residual_ms",
+    "index_page_loads",
+    "index_page_runs",
+    "index_page_distinct_pages",
+    "index_page_distinct_pages_exact",
+    "index_page_profile_scope",
+    "heap_tid_returns",
+    "heap_tid_page_runs",
+    "heap_tid_distinct_pages",
+    "heap_tid_distinct_pages_exact",
+    "heap_tid_sequence_scope",
+    "heap_blks_are_exact_heap_io",
 )
 SQLENS_OFF_GUCS = (
     "hnsw.filter_strategy",

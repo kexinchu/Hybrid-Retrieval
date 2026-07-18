@@ -1,0 +1,31 @@
+SET enable_seqscan = off;
+SET hnsw.ef_search = 8;
+
+CREATE TABLE hnsw_profile_t (id int, val vector(2));
+INSERT INTO hnsw_profile_t
+SELECT i, format('[%s,%s]', i, i + 1)::vector
+FROM generate_series(0, 7) AS g(i);
+CREATE INDEX hnsw_profile_t_idx ON hnsw_profile_t USING hnsw (val vector_l2_ops);
+
+SELECT id FROM hnsw_profile_t ORDER BY val <-> '[0,1]'::vector LIMIT 4;
+
+WITH p AS (
+	SELECT vector_hnsw_last_scan_profile()::jsonb AS j
+)
+SELECT
+	(j->>'profile_semantics_version')::int = 7 AS semantics_v7,
+	j ? 'index_page_loads' AND j ? 'index_page_runs' AND
+	j ? 'index_page_distinct_pages' AND j ? 'index_page_last_block' AS index_fields,
+	(j->>'index_page_loads')::bigint >= 0 AND
+	(j->>'index_page_runs')::bigint >= 0 AND
+	(j->>'index_page_distinct_pages')::bigint >= 0 AS index_nonnegative,
+	(j->>'index_page_runs')::bigint <= (j->>'index_page_loads')::bigint AS index_runs_bounded,
+	j ? 'heap_tid_returns' AND j ? 'heap_tid_page_runs' AND
+	j ? 'heap_tid_distinct_pages' AS heap_fields,
+	(j->>'heap_tid_returns')::bigint = 4 AND
+	(j->>'heap_tid_page_runs')::bigint = 1 AND
+	(j->>'heap_tid_distinct_pages')::bigint = 1 AS predictable_heap_runs,
+	(j->>'heap_blks_are_exact_heap_io')::boolean = false AS heap_io_not_claimed_exact
+FROM p;
+
+DROP TABLE hnsw_profile_t;

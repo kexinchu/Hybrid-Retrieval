@@ -85,7 +85,7 @@ RunScanItems(IndexScanDesc scan, Datum value)
 	HnswQuery  *q = &so->q;
 
 	/* Get m and entry point */
-	HnswGetMetaPageInfo(index, &m, &entryPoint);
+	HnswGetMetaPageInfoTracked(index, &m, &entryPoint, &so->indexPageProfile);
 
 	q->value = value;
 	so->m = m;
@@ -93,7 +93,8 @@ RunScanItems(IndexScanDesc scan, Datum value)
 	if (entryPoint == NULL)
 		return NIL;
 
-	ep = list_make1(HnswEntryCandidate(base, entryPoint, q, index, support, false));
+	ep = list_make1(HnswEntryCandidateTracked(base, entryPoint, q, index, support,
+											 false, &so->indexPageProfile));
 	so->distanceComputations++;
 
 	for (int lc = entryPoint->level; lc >= 1; lc--)
@@ -388,6 +389,15 @@ HnswResetScanProfile(void)
 	hnsw_last_profile.indexPageElementRuns = 0;
 	hnsw_last_profile.indexPageElementDistinctPages = 0;
 	hnsw_last_profile.indexPagePrefetches = 0;
+	hnsw_last_profile.indexPageLoads = 0;
+	hnsw_last_profile.indexPageRuns = 0;
+	hnsw_last_profile.indexPageDistinctPages = 0;
+	hnsw_last_profile.indexPageLastBlock = InvalidBlockNumber;
+	hnsw_last_profile.indexPageDistinctPagesExact = true;
+	hnsw_last_profile.heapTidReturns = 0;
+	hnsw_last_profile.heapTidPageRuns = 0;
+	hnsw_last_profile.heapTidDistinctPages = 0;
+	hnsw_last_profile.heapTidDistinctPagesExact = true;
 	hnsw_last_profile.indexPageDistinctCountsExact = true;
 	hnsw_last_profile.blksHitBefore = 0;
 	hnsw_last_profile.blksHitAfter = 0;
@@ -723,7 +733,10 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 	so->tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
 										   "Hnsw scan temporary context",
 										   0, 8 * 1024, 256 * 1024);
-	HnswInitIndexPageProfile(&so->indexPageProfile, so->tmpCtx);
+	so->profileCtx = AllocSetContextCreate(CurrentMemoryContext,
+										   "Hnsw scan profile context",
+										   ALLOCSET_DEFAULT_SIZES);
+	HnswInitIndexPageProfile(&so->indexPageProfile, so->profileCtx);
 	so->pageItems = NULL;
 	so->pageItemCount = 0;
 	so->pageItemIndex = 0;
@@ -738,6 +751,12 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 	so->guidanceChecks = 0;
 	so->guidanceMatches = 0;
 	so->guidanceSkips = 0;
+	so->heapTidReturns = 0;
+	so->heapTidPageRuns = 0;
+	so->heapTidDistinctPages = 0;
+	so->heapTidLastBlock = InvalidBlockNumber;
+	MemSet(&so->heapTidPages, 0, sizeof(so->heapTidPages));
+	so->heapTidDistinctPagesExact = true;
 	MemSet(&so->traversal, 0, sizeof(HnswTraversalProfile));
 	so->guidancePlan = NULL;
 	so->guidance = NULL;
@@ -787,7 +806,8 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	so->topkTidCount = 0;
 	so->previousDistance = -get_float8_infinity();
 	MemoryContextReset(so->tmpCtx);
-	HnswInitIndexPageProfile(&so->indexPageProfile, so->tmpCtx);
+	MemoryContextReset(so->profileCtx);
+	HnswInitIndexPageProfile(&so->indexPageProfile, so->profileCtx);
 	so->pageItems = NULL;
 	so->pageItemCount = 0;
 	so->pageItemIndex = 0;
@@ -802,6 +822,12 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	so->guidanceChecks = 0;
 	so->guidanceMatches = 0;
 	so->guidanceSkips = 0;
+	so->heapTidReturns = 0;
+	so->heapTidPageRuns = 0;
+	so->heapTidDistinctPages = 0;
+	so->heapTidLastBlock = InvalidBlockNumber;
+	MemSet(&so->heapTidPages, 0, sizeof(so->heapTidPages));
+	so->heapTidDistinctPagesExact = true;
 	MemSet(&so->traversal, 0, sizeof(HnswTraversalProfile));
 	so->abandonedGuidedTuples = 0;
 	so->traversalGuidance.phaseContext = NULL;
@@ -961,6 +987,7 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		if (so->topkTidCount < HNSW_PROFILE_MAX_TIDS)
 			so->topkTids[so->topkTidCount++] = heaptid;
 		so->returnedTuples++;
+		HnswRecordHeapTid(so, &heaptid);
 
 		scan->xs_heaptid = heaptid;
 		scan->xs_recheck = false;
@@ -1080,6 +1107,17 @@ hnswendscan(IndexScanDesc scan)
 		hnsw_last_profile.indexPageElementRuns += indexPageProfile.elementRuns;
 		hnsw_last_profile.indexPageElementDistinctPages += indexPageProfile.elementDistinctPages;
 		hnsw_last_profile.indexPagePrefetches += indexPageProfile.prefetches;
+		hnsw_last_profile.indexPageLoads += indexPageProfile.loads;
+		hnsw_last_profile.indexPageRuns += indexPageProfile.runs;
+		hnsw_last_profile.indexPageDistinctPages += indexPageProfile.distinctPages;
+		hnsw_last_profile.indexPageLastBlock = indexPageProfile.lastBlock;
+		if (!indexPageProfile.distinctCountsExact)
+			hnsw_last_profile.indexPageDistinctPagesExact = false;
+		hnsw_last_profile.heapTidReturns += so->heapTidReturns;
+		hnsw_last_profile.heapTidPageRuns += so->heapTidPageRuns;
+		hnsw_last_profile.heapTidDistinctPages += so->heapTidDistinctPages;
+		hnsw_last_profile.heapTidDistinctPagesExact =
+			hnsw_last_profile.heapTidDistinctPagesExact && so->heapTidDistinctPagesExact;
 		if (!indexPageProfile.distinctCountsExact)
 			hnsw_last_profile.indexPageDistinctCountsExact = false;
 		hnsw_last_profile.blksHitBefore = so->blksHitBefore;
@@ -1121,6 +1159,7 @@ hnswendscan(IndexScanDesc scan)
 	else
 		hnsw_last_profile.plannerProofsTruncated = true;
 	MemoryContextDelete(so->tmpCtx);
+	MemoryContextDelete(so->profileCtx);
 
 	pfree(so);
 	scan->opaque = NULL;

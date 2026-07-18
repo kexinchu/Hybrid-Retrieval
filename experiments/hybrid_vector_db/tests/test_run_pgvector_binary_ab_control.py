@@ -289,7 +289,7 @@ class RunPgvectorBinaryAbControlTests(unittest.TestCase):
                         "compiler_flags": "-O3",
                         "source_repo": str(root),
                         "required_sqlens_build_prefix": "sqlens-v11-",
-                        "minimum_sqlens_profile_semantics": 4.0,
+                        "minimum_sqlens_profile_semantics": 7.0,
                     },
                 },
                 "formal_family": "off",
@@ -397,7 +397,7 @@ class RunPgvectorBinaryAbControlTests(unittest.TestCase):
                         "vector_compiler_flags": "-O3",
                         "vector_source_repo": str(root),
                         "required_sqlens_build_prefix": "sqlens-v11-",
-                        "minimum_sqlens_profile_semantics": 4.0,
+                        "minimum_sqlens_profile_semantics": 7.0,
                     },
                     "config_ladder": {
                         "source": "deterministic_default",
