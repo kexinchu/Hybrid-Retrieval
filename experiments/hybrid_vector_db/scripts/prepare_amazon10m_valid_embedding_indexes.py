@@ -997,6 +997,18 @@ def run(
             if args.stage in {"all", "clone", "proof", "verify"}:
                 if source is None or clone is None:
                     raise PreparationError("proof stage requires both validated indexes")
+                # Clone construction uses SET LOCAL inside its transaction. The
+                # canonical graph fingerprint materializes both 10M-node graphs,
+                # so bind the same memory budget at session scope after commit.
+                cur.execute(
+                    "SELECT set_config('maintenance_work_mem', %s, false)",
+                    (args.maintenance_work_mem,),
+                )
+                preparation["graph_proof_memory_contract"] = {
+                    "maintenance_work_mem": args.maintenance_work_mem,
+                    "scope": "session",
+                    "set_after_clone_commit": True,
+                }
                 proof = require_d2_graph_proof(
                     cur,
                     qualified_name(args.source_index),

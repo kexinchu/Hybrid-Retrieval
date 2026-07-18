@@ -684,6 +684,13 @@ class ProvenanceAndProofTests(unittest.TestCase):
         proof_gate.assert_called_once_with(
             cursor, prepare.DEFAULT_SOURCE_INDEX, prepare.DEFAULT_CLONE_INDEX
         )
+        self.assertIn(
+            (
+                "SELECT set_config('maintenance_work_mem', %s, false)",
+                ("64GB",),
+            ),
+            cursor.statements,
+        )
         writer.assert_called_once()
         self.assertEqual(writer.call_args.args[0], parsed.proof_output)
         self.assertTrue(payload["artifact_valid"])
@@ -695,6 +702,14 @@ class ProvenanceAndProofTests(unittest.TestCase):
         self.assertEqual(
             payload["preparation"]["column_hygiene"]["row_counts"]["total_rows"],
             prepare.EXPECTED_ROWS,
+        )
+        self.assertEqual(
+            payload["preparation"]["graph_proof_memory_contract"],
+            {
+                "maintenance_work_mem": "64GB",
+                "scope": "session",
+                "set_after_clone_commit": True,
+            },
         )
         self.assertTrue(cursor.closed)
 
@@ -749,6 +764,13 @@ class ProvenanceAndProofTests(unittest.TestCase):
         ):
             payload = prepare.run(parsed, connect=connector)
         proof_gate.assert_called_once()
+        self.assertIn(
+            (
+                "SELECT set_config('maintenance_work_mem', %s, false)",
+                ("64GB",),
+            ),
+            cursor.statements,
+        )
         writer.assert_not_called()
         self.assertTrue(payload["artifact_valid"])
 
