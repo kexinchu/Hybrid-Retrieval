@@ -73,6 +73,19 @@ def controller_args(temporary: str) -> object:
 
 
 class RunPgvectorBinaryAbControlTests(unittest.TestCase):
+    def test_controller_forwards_each_relation_prewarm_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            args = controller_args(temporary)
+            args.prewarm_relations = ["public.items", "public.items_hnsw_idx"]
+
+            argv = controller.build_runner_argv(args, "official")
+
+            pairs = list(zip(argv, argv[1:]))
+            self.assertIn(("--prewarm-relation", "public.items"), pairs)
+            self.assertIn(("--prewarm-relation", "public.items_hnsw_idx"), pairs)
+            payload = controller.dry_run_payload(args)
+            self.assertEqual(payload["prewarm_relations"], args.prewarm_relations)
+
     def test_dry_run_reports_the_requested_official_binary_digest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             args = controller_args(temporary)
@@ -198,6 +211,16 @@ class RunPgvectorBinaryAbControlTests(unittest.TestCase):
                     "final_repeat_partition": "contiguous equal halves",
                     "balanced_config_order": "seeded cyclic rotation per query/repeat block",
                     "warmup_spec_sha256": "6" * 64,
+                    "prewarm_relations": [],
+                    "prewarm_mode": "read",
+                    "prewarm_spec_sha256": controller.sha256_json(
+                        {
+                            "relations": [],
+                            "mode": "read",
+                            "fork": "main",
+                            "scope": "synchronous_os_cache_before_each_runner_invocation",
+                        }
+                    ),
                 },
                 "warmup_invocations": [
                     {

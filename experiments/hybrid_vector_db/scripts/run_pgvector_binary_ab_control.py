@@ -640,6 +640,19 @@ def _validate_controller_bound_arm(
     for key, expected in expected_schedule.items():
         if schedule.get(key) != expected:
             raise FinalizationError(f"arm {arm} schedule field {key} is not controller-bound")
+    prewarm_relations = list(controller_spec.get("prewarm_relations", []))
+    expected_prewarm_spec = {
+        "relations": prewarm_relations,
+        "mode": "read",
+        "fork": "main",
+        "scope": "synchronous_os_cache_before_each_runner_invocation",
+    }
+    if (
+        schedule.get("prewarm_relations") != prewarm_relations
+        or schedule.get("prewarm_mode") != "read"
+        or schedule.get("prewarm_spec_sha256") != sha256_json(expected_prewarm_spec)
+    ):
+        raise FinalizationError(f"arm {arm} relation-prewarm contract is not controller-bound")
 
     config_ladder = manifest.get("config_ladder")
     expected_config_source = (
@@ -843,6 +856,47 @@ def finalize_ab_artifacts(
             item.get("warmup_spec_sha256") != expected_warmup_hash for item in warmups
         ):
             raise FinalizationError(f"arm {arm} deterministic warmup evidence is incomplete")
+        prewarm_relations = list(controller_spec.get("prewarm_relations", []))
+        if prewarm_relations:
+            prewarms = list(manifest.get("prewarm_invocations", []))
+            observed_prewarms = {
+                (
+                    str(item.get("execution_stage")),
+                    None
+                    if item.get("final_block") is None
+                    else int(item.get("final_block")),
+                )
+                for item in prewarms
+            }
+            expected_prewarm_hash = manifest.get("schedule_contract", {}).get(
+                "prewarm_spec_sha256"
+            )
+            if (
+                not required_warmups.issubset(observed_prewarms)
+                or any(
+                    item.get("prewarm_spec_sha256") != expected_prewarm_hash
+                    or item.get("relations") != prewarm_relations
+                    or item.get("mode") != "read"
+                    or item.get("complete") is not True
+                    or len(item.get("records", [])) != len(prewarm_relations)
+                    or any(
+                        record.get("relation") != relation
+                        or not isinstance(record.get("oid"), int)
+                        or not isinstance(record.get("relfilenode"), int)
+                        or not isinstance(record.get("relation_bytes"), int)
+                        or not isinstance(record.get("block_size"), int)
+                        or record.get("warmed_blocks")
+                        != record.get("expected_blocks")
+                        for relation, record in zip(
+                            prewarm_relations, item.get("records", [])
+                        )
+                    )
+                    for item in prewarms
+                )
+            ):
+                raise FinalizationError(
+                    f"arm {arm} synchronous relation-prewarm evidence is incomplete"
+                )
     max_ef_search = int(controller_spec.get("max_ef_search", 1000))
     expected_official_digest = str(
         controller_spec.get("binary_sources", {})
@@ -1292,6 +1346,8 @@ def shared_runner_args(args: argparse.Namespace, *, resume: bool | None = None) 
     ]
     if args.config_ladder:
         argv.extend(["--config-ladder", str(args.config_ladder)])
+    for relation in args.prewarm_relations:
+        argv.extend(["--prewarm-relation", relation])
     if args.upstream_evaluation_patch:
         argv.extend(
             ["--upstream-evaluation-patch", str(args.upstream_evaluation_patch)]
@@ -1768,6 +1824,7 @@ def run_controller(args: argparse.Namespace) -> dict[str, Any]:
         "schedule_seed": args.schedule_seed,
         "calibration_order": calibration_order,
         "final_schedule": schedule,
+        "prewarm_relations": list(args.prewarm_relations),
     }
     controller_spec["input_source_hashes"] = _controller_spec_source_hashes(controller_spec)
     controller_spec_hash = hashlib.sha256(
@@ -2037,6 +2094,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--verification-repeats", type=positive_int, default=2)
     parser.add_argument("--final-repeats", type=positive_int, default=6)
     parser.add_argument("--warmup-queries", type=positive_int, default=5)
+    parser.add_argument(
+        "--prewarm-relation",
+        dest="prewarm_relations",
+        action="append",
+        type=validate_identifier,
+        default=[],
+    )
     parser.add_argument("--bootstrap-samples", type=positive_int, default=10_000)
     parser.add_argument("--bootstrap-seed", type=int, default=20260718)
     parser.add_argument("--schedule-seed", type=int, default=20260718)
@@ -2075,6 +2139,7 @@ def dry_run_payload(args: argparse.Namespace) -> dict[str, Any]:
         "official_requested_vector_so_sha256": args.official_vector_so_sha256,
         "max_ef_search": args.max_ef_search,
         "candidate_validity_predicate": args.candidate_validity_predicate,
+        "prewarm_relations": list(args.prewarm_relations),
         "upstream_evaluation_patch": (
             str(args.upstream_evaluation_patch)
             if args.upstream_evaluation_patch

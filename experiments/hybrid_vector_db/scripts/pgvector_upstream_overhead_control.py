@@ -2255,6 +2255,66 @@ def warmup_spec(
     return spec | {"warmup_spec_sha256": sha256_json(spec)}
 
 
+def relation_prewarm_spec(args: argparse.Namespace) -> dict[str, Any]:
+    spec = {
+        "relations": list(getattr(args, "prewarm_relations", []) or []),
+        "mode": "read",
+        "fork": "main",
+        "scope": "synchronous_os_cache_before_each_runner_invocation",
+    }
+    return spec | {"prewarm_spec_sha256": sha256_json(spec)}
+
+
+def prewarm_relations(cur: Any, args: argparse.Namespace) -> dict[str, Any]:
+    spec = relation_prewarm_spec(args)
+    records: list[dict[str, Any]] = []
+    for relation in spec["relations"]:
+        cur.execute(
+            "SELECT c.oid::bigint, c.relfilenode::bigint, pg_relation_size(c.oid), "
+            "current_setting('block_size')::bigint "
+            "FROM pg_class c WHERE c.oid = %s::regclass",
+            (relation,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise ProvenanceGateError(f"prewarm relation does not exist: {relation}")
+        oid, relfilenode, relation_bytes, block_size = map(int, row)
+        expected_blocks = (
+            (relation_bytes + block_size - 1) // block_size if relation_bytes else 0
+        )
+        started = time.perf_counter()
+        cur.execute(
+            "SELECT pg_prewarm(%s::regclass, 'read', 'main')::bigint",
+            (relation,),
+        )
+        warmed = cur.fetchone()
+        warmed_blocks = int(warmed[0]) if warmed else -1
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if warmed_blocks != expected_blocks:
+            raise ProvenanceGateError(
+                f"pg_prewarm block count mismatch for {relation}: "
+                f"expected {expected_blocks}, got {warmed_blocks}"
+            )
+        records.append(
+            {
+                "relation": relation,
+                "oid": oid,
+                "relfilenode": relfilenode,
+                "relation_bytes": relation_bytes,
+                "block_size": block_size,
+                "expected_blocks": expected_blocks,
+                "warmed_blocks": warmed_blocks,
+                "elapsed_ms": elapsed_ms,
+            }
+        )
+    return {
+        **spec,
+        "records": records,
+        "complete": len(records) == len(spec["relations"]),
+        "completed_at_utc": utc_now(),
+    }
+
+
 def deterministic_warmup(
     cur: Any,
     args: argparse.Namespace,
@@ -2876,6 +2936,9 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         "final_repeat_partition": "contiguous equal halves",
         "balanced_config_order": "seeded cyclic rotation per query/repeat block",
         "warmup_spec_sha256": warmup_spec(args, filters, configs[0])["warmup_spec_sha256"],
+        "prewarm_spec_sha256": relation_prewarm_spec(args)["prewarm_spec_sha256"],
+        "prewarm_relations": list(getattr(args, "prewarm_relations", []) or []),
+        "prewarm_mode": "read",
     }
     base_run_spec = {
         "args": normalized_args(args),
@@ -3063,6 +3126,7 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             }
             if set(vectors) != set(query_ids.values()):
                 raise RuntimeError("database query-vector mapping is incomplete")
+            prewarm_audit = prewarm_relations(cur, args)
             explain_audit: dict[str, Any] = {}
             for filter_spec in filters:
                 sql = build_hybrid_sql(
@@ -3079,6 +3143,13 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             )
             post_warmup_gucs = enforce_hnsw_guc_allowlist(cur)
             manifest["explain_hnsw_gate"] = explain_audit
+            manifest.setdefault("prewarm_invocations", []).append(
+                {
+                    "execution_stage": args.execution_stage,
+                    "final_block": args.final_block,
+                    **prewarm_audit,
+                }
+            )
             manifest.setdefault("warmup_invocations", []).append(
                 {
                     "execution_stage": args.execution_stage,
@@ -3562,6 +3633,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--verification-repeats", type=positive_int, default=2)
     parser.add_argument("--final-repeats", type=positive_int, default=6)
     parser.add_argument("--warmup-queries", type=positive_int, default=5)
+    parser.add_argument(
+        "--prewarm-relation",
+        dest="prewarm_relations",
+        action="append",
+        type=validate_identifier,
+        default=[],
+        help="Relation synchronously read with pg_prewarm before each invocation; repeatable.",
+    )
     parser.add_argument("--bootstrap-samples", type=positive_int, default=10_000)
     parser.add_argument("--bootstrap-seed", type=int, default=20260718)
     parser.add_argument("--schedule-seed", type=int, default=20260718)
@@ -3618,6 +3697,7 @@ def dry_run_payload(args: argparse.Namespace) -> dict[str, Any]:
         "calibration_final_separated": True,
         "final_blocks": 2,
         "warmup_queries_per_filter_per_invocation": args.warmup_queries,
+        "relation_prewarm": relation_prewarm_spec(args),
         "resume": args.resume,
         "config_ladder": str(args.config_ladder) if args.config_ladder else "deterministic_default",
         "declared_max_ef_search": args.max_ef_search,

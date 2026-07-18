@@ -43,6 +43,37 @@ def completed_summary(config, recall, latency):
 
 
 class PgvectorUpstreamOverheadControlTests(unittest.TestCase):
+    def test_relation_prewarm_is_synchronous_complete_and_hashed(self):
+        args = SimpleNamespace(
+            prewarm_relations=["public.items", "public.items_hnsw_idx"]
+        )
+        cur = Cursor(
+            [
+                (11, 21, 16_384, 8_192),
+                (2,),
+                (12, 22, 24_576, 8_192),
+                (3,),
+            ]
+        )
+
+        evidence = runner.prewarm_relations(cur, args)
+
+        self.assertTrue(evidence["complete"])
+        self.assertEqual(evidence["mode"], "read")
+        self.assertEqual(evidence["fork"], "main")
+        self.assertEqual([row["warmed_blocks"] for row in evidence["records"]], [2, 3])
+        self.assertRegex(evidence["prewarm_spec_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            sum("pg_prewarm" in statement for statement in cur.statements), 2
+        )
+
+    def test_relation_prewarm_rejects_partial_block_coverage(self):
+        args = SimpleNamespace(prewarm_relations=["public.items"])
+        cur = Cursor([(11, 21, 16_384, 8_192), (1,)])
+
+        with self.assertRaisesRegex(RuntimeError, "block count mismatch"):
+            runner.prewarm_relations(cur, args)
+
     def test_default_ladder_uses_only_the_official_upstream_ef_range(self):
         raw = runner.default_config_ladder()
         effective, proof = runner.effective_config_grid(raw)
