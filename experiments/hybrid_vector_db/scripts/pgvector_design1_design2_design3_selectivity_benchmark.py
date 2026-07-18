@@ -120,6 +120,10 @@ D2_STABLE_COMPARISON_FIELDS = (
     "right_physical_digest",
 )
 D2_RELATION_IDENTITY_FIELDS = ("name", "oid", "relfilenode", "heap_oid")
+D2_BFS_LOCALITY_COMPARISON_FIELDS = (
+    "left_bfs_locality",
+    "right_bfs_locality",
+)
 
 
 class SqlensProvenanceGateError(RuntimeError):
@@ -680,15 +684,147 @@ def stable_d2_graph_proof(proof: dict[str, object]) -> dict[str, object]:
         raise D2GraphProofGateError(
             f"D2 graph proof is missing stable comparison fields: {missing_comparison}"
         )
+    stable_comparison = {
+        field: comparison[field] for field in D2_STABLE_COMPARISON_FIELDS
+    }
+    locality_fields_present = [
+        field for field in D2_BFS_LOCALITY_COMPARISON_FIELDS if field in comparison
+    ]
+    if locality_fields_present and len(locality_fields_present) != len(
+        D2_BFS_LOCALITY_COMPARISON_FIELDS
+    ):
+        raise D2GraphProofGateError(
+            "D2 graph proof has only one side of the BFS locality comparison"
+        )
+    for field in D2_BFS_LOCALITY_COMPARISON_FIELDS:
+        locality = comparison.get(field)
+        if locality is not None:
+            validate_d2_bfs_locality(locality, field)
+            stable_comparison[field] = locality
     return {
         "proof_contract": "sqlens_same_heap_same_logical_graph_physical_layout_v2",
         "source_index": proof.get("source_index"),
         "clone_index": proof.get("clone_index"),
         "relations": stable_relations,
-        "comparison": {
-            field: comparison[field] for field in D2_STABLE_COMPARISON_FIELDS
-        },
+        "comparison": stable_comparison,
     }
+
+
+def validate_d2_bfs_locality(value: object, field: str) -> None:
+    """Validate the C proof's complete counters and bounded rank evidence."""
+    if not isinstance(value, dict):
+        raise D2GraphProofGateError(f"D2 {field} locality is not a JSON object")
+    required = (
+        "format",
+        "rank_base",
+        "graph_nodes",
+        "reachable_nodes",
+        "fallback_nodes",
+        "sequence_nodes",
+        "adjacent_pairs",
+        "same_block_pairs",
+        "next_block_pairs",
+        "same_or_next_page_pairs",
+        "nondecreasing_pairs",
+        "backward_pairs",
+        "total_abs_block_delta",
+        "max_abs_block_delta",
+        "page_runs",
+        "same_block_ratio",
+        "same_or_next_page_ratio",
+        "nondecreasing_ratio",
+        "full_statistics",
+        "sample_limit",
+        "sample_count",
+        "sample_truncated",
+        "sample_strategy",
+        "rank_samples",
+    )
+    missing = [name for name in required if name not in value]
+    if missing:
+        raise D2GraphProofGateError(
+            f"D2 {field} locality is missing fields: {missing}"
+        )
+    if value["format"] != "sqlens-hnsw-bfs-locality-v1":
+        raise D2GraphProofGateError(f"D2 {field} locality has an unsupported format")
+    if value["rank_base"] != 0 or value["full_statistics"] is not True:
+        raise D2GraphProofGateError(
+            f"D2 {field} locality must use zero-based complete statistics"
+        )
+
+    def nonnegative_int(name: str) -> int:
+        item = value[name]
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise D2GraphProofGateError(f"D2 {field} locality has invalid {name}")
+        return item
+
+    graph_nodes = nonnegative_int("graph_nodes")
+    reachable_nodes = nonnegative_int("reachable_nodes")
+    fallback_nodes = nonnegative_int("fallback_nodes")
+    sequence_nodes = nonnegative_int("sequence_nodes")
+    adjacent_pairs = nonnegative_int("adjacent_pairs")
+    same_block_pairs = nonnegative_int("same_block_pairs")
+    next_block_pairs = nonnegative_int("next_block_pairs")
+    same_or_next_pairs = nonnegative_int("same_or_next_page_pairs")
+    nondecreasing_pairs = nonnegative_int("nondecreasing_pairs")
+    backward_pairs = nonnegative_int("backward_pairs")
+    nonnegative_int("total_abs_block_delta")
+    nonnegative_int("max_abs_block_delta")
+    page_runs = nonnegative_int("page_runs")
+    sample_limit = nonnegative_int("sample_limit")
+    sample_count = nonnegative_int("sample_count")
+    if graph_nodes != sequence_nodes or reachable_nodes + fallback_nodes != sequence_nodes:
+        raise D2GraphProofGateError(f"D2 {field} locality sequence coverage is incomplete")
+    if adjacent_pairs != max(sequence_nodes - 1, 0):
+        raise D2GraphProofGateError(f"D2 {field} locality adjacent-pair count is invalid")
+    if same_block_pairs + next_block_pairs != same_or_next_pairs:
+        raise D2GraphProofGateError(f"D2 {field} locality same/next counters disagree")
+    if same_or_next_pairs > adjacent_pairs:
+        raise D2GraphProofGateError(f"D2 {field} locality has too many same/next pairs")
+    if nondecreasing_pairs + backward_pairs != adjacent_pairs:
+        raise D2GraphProofGateError(f"D2 {field} locality monotonicity counters disagree")
+    if page_runs < (0 if sequence_nodes == 0 else 1) or page_runs > sequence_nodes:
+        raise D2GraphProofGateError(f"D2 {field} locality page-run count is invalid")
+    if sample_limit != 256 or sample_count > sample_limit or sample_count > sequence_nodes:
+        raise D2GraphProofGateError(f"D2 {field} locality sample bound is invalid")
+    if value["sample_truncated"] is not (sample_count < sequence_nodes):
+        raise D2GraphProofGateError(f"D2 {field} locality sample truncation is invalid")
+    if value["sample_strategy"] != "evenly_spaced_inclusive":
+        raise D2GraphProofGateError(f"D2 {field} locality sample strategy is invalid")
+    samples = value["rank_samples"]
+    if not isinstance(samples, list) or len(samples) != sample_count:
+        raise D2GraphProofGateError(f"D2 {field} locality rank samples are incomplete")
+    previous_rank = -1
+    for sample in samples:
+        if not isinstance(sample, dict):
+            raise D2GraphProofGateError(f"D2 {field} locality has an invalid rank sample")
+        rank = sample.get("rank")
+        if (
+            isinstance(rank, bool)
+            or not isinstance(rank, int)
+            or rank <= previous_rank
+            or rank < 0
+            or rank >= sequence_nodes
+            or not isinstance(sample.get("block"), int)
+            or not isinstance(sample.get("offset"), int)
+        ):
+            raise D2GraphProofGateError(f"D2 {field} locality has invalid rank samples")
+        previous_rank = rank
+    if sample_count and (samples[0]["rank"] != 0 or samples[-1]["rank"] != sequence_nodes - 1):
+        raise D2GraphProofGateError(f"D2 {field} locality samples do not cover sequence ends")
+    for ratio_name in (
+        "same_block_ratio",
+        "same_or_next_page_ratio",
+        "nondecreasing_ratio",
+    ):
+        ratio = value[ratio_name]
+        if (
+            isinstance(ratio, bool)
+            or not isinstance(ratio, (int, float))
+            or not math.isfinite(ratio)
+            or not 0 <= ratio <= 1
+        ):
+            raise D2GraphProofGateError(f"D2 {field} locality has invalid {ratio_name}")
 
 
 def d2_stable_fingerprint(proof: dict[str, object]) -> str:

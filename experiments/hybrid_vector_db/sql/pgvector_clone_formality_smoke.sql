@@ -76,6 +76,8 @@ DECLARE
   source_proof jsonb;
   clone_proof jsonb;
   comparison jsonb;
+  locality jsonb;
+  sample jsonb;
 BEGIN
   source_proof := vector_hnsw_graph_fingerprint('source_hnsw'::regclass);
   clone_proof := vector_hnsw_graph_fingerprint('clone_hnsw'::regclass);
@@ -89,6 +91,38 @@ BEGIN
      OR NOT (comparison->>'tuple_coverage_equal')::boolean THEN
     RAISE EXCEPTION 'clone proof digests are incomplete or unequal: %, %, %',
       source_proof, clone_proof, comparison;
+  END IF;
+
+  FOREACH locality IN ARRAY ARRAY[
+    source_proof->'bfs_locality', clone_proof->'bfs_locality',
+    comparison->'left_bfs_locality', comparison->'right_bfs_locality'
+  ] LOOP
+    IF locality->>'format' IS DISTINCT FROM 'sqlens-hnsw-bfs-locality-v1'
+       OR NOT (locality->>'full_statistics')::boolean
+       OR (locality->>'rank_base')::integer <> 0
+       OR (locality->>'sample_limit')::integer <> 256
+       OR locality->>'sample_strategy' IS DISTINCT FROM 'evenly_spaced_inclusive'
+       OR (locality->>'graph_nodes')::bigint <> (locality->>'sequence_nodes')::bigint
+       OR (locality->>'adjacent_pairs')::bigint <> GREATEST((locality->>'sequence_nodes')::bigint - 1, 0)
+       OR (locality->>'sample_count')::integer <> jsonb_array_length(locality->'rank_samples')
+       OR ((locality->>'sample_truncated')::boolean IS DISTINCT FROM
+           ((locality->>'sample_count')::bigint < (locality->>'sequence_nodes')::bigint)) THEN
+      RAISE EXCEPTION 'invalid BFS locality proof contract: %', locality;
+    END IF;
+    IF (locality->>'sequence_nodes')::bigint > 0 THEN
+      sample := locality->'rank_samples'->0;
+      IF (sample->>'rank')::bigint <> 0 THEN
+        RAISE EXCEPTION 'BFS rank sample does not start at rank zero: %', locality;
+      END IF;
+      sample := locality->'rank_samples'->-1;
+      IF (sample->>'rank')::bigint <> (locality->>'sequence_nodes')::bigint - 1 THEN
+        RAISE EXCEPTION 'BFS rank sample does not cover the final rank: %', locality;
+      END IF;
+    END IF;
+  END LOOP;
+  IF comparison->'left_bfs_locality' IS DISTINCT FROM source_proof->'bfs_locality'
+     OR comparison->'right_bfs_locality' IS DISTINCT FROM clone_proof->'bfs_locality' THEN
+    RAISE EXCEPTION 'source/clone BFS locality comparison is not symmetric: %', comparison;
   END IF;
 END
 $proof$;

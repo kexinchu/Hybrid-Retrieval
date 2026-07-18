@@ -37,6 +37,8 @@
 #include "varatt.h"
 #endif
 
+#define HNSW_BFS_LOCALITY_SAMPLE_LIMIT 256
+
 typedef struct HnswCloneTidKey
 {
 	BlockNumber blkno;
@@ -68,6 +70,32 @@ typedef enum HnswDiskGraphPurpose
 	HNSW_DISK_GRAPH_CLONE,
 	HNSW_DISK_GRAPH_FINGERPRINT
 } HnswDiskGraphPurpose;
+
+typedef struct HnswBfsLocalitySample
+{
+	int64		rank;
+	BlockNumber block;
+	OffsetNumber offno;
+} HnswBfsLocalitySample;
+
+typedef struct HnswBfsLocality
+{
+	int64		graphNodes;
+	int64		reachableNodes;
+	int64		fallbackNodes;
+	int64		sequenceNodes;
+	int64		adjacentPairs;
+	int64		sameBlockPairs;
+	int64		nextBlockPairs;
+	int64		sameOrNextPagePairs;
+	int64		nondecreasingPairs;
+	int64		backwardPairs;
+	uint64		totalAbsBlockDelta;
+	uint64		maxAbsBlockDelta;
+	int64		pageRuns;
+	int		sampleCount;
+	HnswBfsLocalitySample samples[HNSW_BFS_LOCALITY_SAMPLE_LIMIT];
+} HnswBfsLocality;
 
 typedef struct HnswDiskGraph
 {
@@ -108,6 +136,7 @@ typedef struct HnswGraphFingerprint
 	uint8		tupleCoverageDigest[PG_SHA256_DIGEST_LENGTH];
 	uint8		logicalDigest[PG_SHA256_DIGEST_LENGTH];
 	uint8		physicalDigest[PG_SHA256_DIGEST_LENGTH];
+	HnswBfsLocality bfsLocality;
 	int64		tombstones;
 } HnswGraphFingerprint;
 
@@ -807,6 +836,177 @@ HnswLoadDiskGraph(HnswDiskGraph *disk)
 	MemoryContextSwitchTo(oldContext);
 }
 
+typedef struct HnswBfsVisitedEntry
+{
+	HnswCloneTidKey key;
+} HnswBfsVisitedEntry;
+
+static bool
+HnswBfsMarkVisited(HTAB *visited, HnswElement element)
+{
+	ItemPointerData tid;
+	HnswCloneTidKey key;
+	bool		found;
+
+	ItemPointerSet(&tid, element->blkno, element->offno);
+	key = HnswCloneTidKeyFromPointer(&tid);
+	hash_search(visited, &key, HASH_ENTER, &found);
+	return !found;
+}
+
+/*
+ * Reproduce hnsw.build_page_order = bfs over the loaded graph.  The sequence
+ * is zero-based, follows entry-point neighbors from high to low layer, and
+ * appends the physical element-list order only for disconnected nodes.  The
+ * full sequence is measured; only the rank-to-(block,offset) evidence is
+ * bounded to keep proof JSON auditable at large graph sizes.  A same-page
+ * pair has block delta 0, a next-page pair has forward block delta +1, and a
+ * page run is a maximal run of equal physical index blocks.
+ */
+static void
+HnswBuildBfsLocality(HnswDiskGraph *disk, HnswBfsLocality *result)
+{
+	MemoryContext scratchContext;
+	MemoryContext oldContext;
+	HASHCTL		ctl;
+	HTAB		*visited;
+	HnswElement *queue;
+	HnswElementPtr iter;
+	HnswElement entryPoint;
+	int64		queueHead = 0;
+	int64		queueCount = 0;
+	int64		sampleTarget = 0;
+	int		sampleIndex = 0;
+	char	   *base = NULL;
+
+	MemSet(result, 0, sizeof(*result));
+	result->graphNodes = disk->nodes;
+	if (disk->nodes == 0)
+	{
+		result->sequenceNodes = 0;
+		return;
+	}
+	if ((uint64) disk->nodes > MaxAllocSize / sizeof(HnswElement))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("HNSW graph is too large for BFS locality proof")));
+
+	HnswDiskGraphReserveMemory(disk,
+							(Size) disk->nodes * sizeof(HnswElement));
+	queue = palloc((Size) disk->nodes * sizeof(HnswElement));
+	HnswDiskGraphCheckMemory(disk);
+
+	oldContext = MemoryContextSwitchTo(disk->context);
+	scratchContext = AllocSetContextCreate(disk->context,
+										  "HNSW BFS locality proof",
+										  ALLOCSET_DEFAULT_SIZES);
+		MemoryContextSwitchTo(scratchContext);
+	MemSet(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(HnswCloneTidKey);
+	ctl.entrysize = sizeof(HnswBfsVisitedEntry);
+	ctl.hcxt = scratchContext;
+	visited = hash_create("HNSW BFS locality visited", 1024, &ctl,
+						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	entryPoint = HnswPtrAccess(base, disk->graph->entryPoint);
+	if (entryPoint != NULL && HnswBfsMarkVisited(visited, entryPoint))
+		queue[queueCount++] = entryPoint;
+	while (queueHead < queueCount)
+	{
+		HnswElement element = queue[queueHead++];
+
+		for (int lc = element->level; lc >= 0; lc--)
+		{
+			HnswNeighborArray *neighbors = HnswGetNeighbors(base, element, lc);
+
+			for (int i = 0; i < neighbors->length; i++)
+			{
+				HnswElement neighbor = HnswPtrAccess(base,
+													 neighbors->items[i].element);
+
+				if (neighbor != NULL && HnswBfsMarkVisited(visited, neighbor))
+					queue[queueCount++] = neighbor;
+			}
+		}
+	}
+	result->reachableNodes = queueCount;
+
+	/* Match the builder's deterministic disconnected-node completion rule. */
+	iter = disk->graph->head;
+	while (!HnswPtrIsNull(base, iter))
+	{
+		HnswElement element = HnswPtrAccess(base, iter);
+
+		if (HnswBfsMarkVisited(visited, element))
+			queue[queueCount++] = element;
+		iter = element->next;
+	}
+	result->fallbackNodes = queueCount - result->reachableNodes;
+	result->sequenceNodes = queueCount;
+	if (queueCount != disk->nodes)
+		HnswCloneCorruption(disk->index,
+						"the BFS locality sequence does not cover every graph node");
+
+	result->sampleCount = Min(queueCount,
+							  (int64) HNSW_BFS_LOCALITY_SAMPLE_LIMIT);
+	for (int64 rank = 0; rank < queueCount; rank++)
+	{
+		HnswElement element = queue[rank];
+		BlockNumber previousBlock;
+		uint64		blockDelta;
+
+		if (result->sampleCount == 1)
+			sampleTarget = 0;
+		else if (result->sampleCount > 1)
+			sampleTarget = ((int64) sampleIndex * (queueCount - 1)) /
+				(result->sampleCount - 1);
+		if (result->sampleCount > 0 && rank == sampleTarget)
+		{
+			result->samples[sampleIndex].rank = rank;
+			result->samples[sampleIndex].block = element->blkno;
+			result->samples[sampleIndex].offno = element->offno;
+			sampleIndex++;
+		}
+		if (rank == 0)
+		{
+			result->pageRuns = 1;
+			continue;
+		}
+
+		previousBlock = queue[rank - 1]->blkno;
+		result->adjacentPairs++;
+		if (element->blkno == previousBlock)
+			result->sameBlockPairs++;
+		if (element->blkno > previousBlock &&
+			(element->blkno - previousBlock) == 1)
+			result->nextBlockPairs++;
+		if (element->blkno == previousBlock ||
+			(element->blkno > previousBlock &&
+			 (element->blkno - previousBlock) == 1))
+			result->sameOrNextPagePairs++;
+		if (element->blkno >= previousBlock)
+			result->nondecreasingPairs++;
+		else
+			result->backwardPairs++;
+		blockDelta = element->blkno >= previousBlock ?
+			(uint64) (element->blkno - previousBlock) :
+			(uint64) (previousBlock - element->blkno);
+		result->totalAbsBlockDelta += blockDelta;
+		result->maxAbsBlockDelta = Max(result->maxAbsBlockDelta, blockDelta);
+		if (element->blkno != previousBlock)
+			result->pageRuns++;
+	}
+
+	if (sampleIndex != result->sampleCount)
+		HnswCloneCorruption(disk->index,
+						"the BFS locality rank sample is incomplete");
+	HnswDiskGraphCheckMemory(disk);
+	hash_destroy(visited);
+	MemoryContextSwitchTo(oldContext);
+	MemoryContextDelete(scratchContext);
+	pfree(queue);
+}
+
 static bool
 HnswCloneIndexDefinitionsEqual(Relation source, Relation destination)
 {
@@ -1338,6 +1538,7 @@ HnswFingerprintRelation(Relation index, HnswGraphFingerprint *result)
 	HnswBuildDefinitionDigest(&disk, result);
 	HnswBuildLogicalDigest(&disk, result);
 	HnswBuildTupleCoverageDigest(&disk, result);
+	HnswBuildBfsLocality(&disk, &result->bfsLocality);
 	HnswDiskGraphCheckMemory(&disk);
 
 	MemoryContextSwitchTo(oldContext);
@@ -1350,6 +1551,65 @@ HnswDigestToHex(const uint8 digest[PG_SHA256_DIGEST_LENGTH],
 {
 	hex_encode((const char *) digest, PG_SHA256_DIGEST_LENGTH, output);
 	output[PG_SHA256_DIGEST_STRING_LENGTH - 1] = '\0';
+}
+
+static void
+HnswAppendBfsLocalityJson(StringInfo json, const char *field,
+						  const HnswBfsLocality *locality)
+{
+	double		adjacentDenominator = locality->adjacentPairs > 0 ?
+			(double) locality->adjacentPairs : 1.0;
+
+	appendStringInfo(json,
+					 "\"%s\":{"
+					 "\"format\":\"sqlens-hnsw-bfs-locality-v1\","
+					 "\"rank_base\":0,"
+					 "\"graph_nodes\":" INT64_FORMAT ","
+					 "\"reachable_nodes\":" INT64_FORMAT ","
+					 "\"fallback_nodes\":" INT64_FORMAT ","
+					 "\"sequence_nodes\":" INT64_FORMAT ","
+					 "\"adjacent_pairs\":" INT64_FORMAT ","
+					 "\"same_block_pairs\":" INT64_FORMAT ","
+					 "\"next_block_pairs\":" INT64_FORMAT ","
+					 "\"same_or_next_page_pairs\":" INT64_FORMAT ","
+					 "\"nondecreasing_pairs\":" INT64_FORMAT ","
+					 "\"backward_pairs\":" INT64_FORMAT ","
+					 "\"total_abs_block_delta\":" UINT64_FORMAT ","
+					 "\"max_abs_block_delta\":" UINT64_FORMAT ","
+					 "\"page_runs\":" INT64_FORMAT ","
+					 "\"same_block_ratio\":%.17g,"
+					 "\"same_or_next_page_ratio\":%.17g,"
+					 "\"nondecreasing_ratio\":%.17g,"
+					 "\"full_statistics\":true,"
+					 "\"sample_limit\":%d,"
+					 "\"sample_count\":%d,"
+					 "\"sample_truncated\":%s,"
+					 "\"sample_strategy\":\"evenly_spaced_inclusive\","
+					 "\"rank_samples\":[",
+					 field, locality->graphNodes, locality->reachableNodes,
+					 locality->fallbackNodes, locality->sequenceNodes,
+					 locality->adjacentPairs, locality->sameBlockPairs,
+					 locality->nextBlockPairs, locality->sameOrNextPagePairs,
+					 locality->nondecreasingPairs, locality->backwardPairs,
+					 locality->totalAbsBlockDelta, locality->maxAbsBlockDelta,
+					 locality->pageRuns,
+					 (double) locality->sameBlockPairs / adjacentDenominator,
+					 (double) locality->sameOrNextPagePairs / adjacentDenominator,
+					 (double) locality->nondecreasingPairs / adjacentDenominator,
+					 HNSW_BFS_LOCALITY_SAMPLE_LIMIT, locality->sampleCount,
+					 locality->sampleCount < locality->sequenceNodes ? "true" : "false");
+	for (int i = 0; i < locality->sampleCount; i++)
+	{
+		if (i > 0)
+			appendStringInfoChar(json, ',');
+		appendStringInfo(json,
+						 "{\"rank\":" INT64_FORMAT ",\"block\":%u,"
+						 "\"offset\":%u}",
+						 locality->samples[i].rank,
+						 (uint32) locality->samples[i].block,
+						 (uint32) locality->samples[i].offno);
+	}
+	appendStringInfoString(json, "]}");
 }
 
 static Jsonb *
@@ -1379,16 +1639,18 @@ HnswFingerprintToJsonb(const HnswGraphFingerprint *fingerprint)
 						 "\"heap_tids\":" INT64_FORMAT ","
 						 "\"tombstones\":" INT64_FORMAT ","
 					 "\"entry_identity\":%s,"
-					 "\"entry_level\":%d,\"max_level\":%d,"
-					 "\"version\":%u,\"dimensions\":%u,"
-					 "\"m\":%u,\"ef_construction\":%u}",
+						 "\"entry_level\":%d,\"max_level\":%d,"
+						 "\"version\":%u,\"dimensions\":%u,"
+						 "\"m\":%u,\"ef_construction\":%u,",
 						 definition, coverage, logical, physical,
 						 fingerprint->nodes, fingerprint->heapTids,
 						 fingerprint->tombstones,
 					 fingerprint->hasEntry ? psprintf("\"sha256:%s\"", entry) : "null",
-					 fingerprint->entryLevel, fingerprint->maxLevel,
-					 fingerprint->version, fingerprint->dimensions,
-					 fingerprint->m, fingerprint->efConstruction);
+						 fingerprint->entryLevel, fingerprint->maxLevel,
+						 fingerprint->version, fingerprint->dimensions,
+						 fingerprint->m, fingerprint->efConstruction);
+	HnswAppendBfsLocalityJson(&json, "bfs_locality", &fingerprint->bfsLocality);
+	appendStringInfoChar(&json, '}');
 	return DatumGetJsonbP(DirectFunctionCall1(jsonb_in,
 										 CStringGetDatum(json.data)));
 }
@@ -1503,11 +1765,11 @@ vector_hnsw_graph_compare(PG_FUNCTION_ARGS)
 						 "\"right_definition_digest\":\"sha256:%s\","
 						 "\"left_tuple_coverage_digest\":\"sha256:%s\","
 						 "\"right_tuple_coverage_digest\":\"sha256:%s\","
-					 "\"left_logical_digest\":\"sha256:%s\","
-					 "\"right_logical_digest\":\"sha256:%s\","
-					 "\"left_physical_digest\":\"sha256:%s\","
-					 "\"right_physical_digest\":\"sha256:%s\"}",
-					 sameHeap ? "true" : "false",
+						 "\"left_logical_digest\":\"sha256:%s\","
+						 "\"right_logical_digest\":\"sha256:%s\","
+						 "\"left_physical_digest\":\"sha256:%s\","
+						 "\"right_physical_digest\":\"sha256:%s\",",
+						 sameHeap ? "true" : "false",
 					 logicalEqual ? "true" : "false",
 						 physicalEqual ? "true" : "false",
 						 entryEqual ? "true" : "false",
@@ -1516,6 +1778,12 @@ vector_hnsw_graph_compare(PG_FUNCTION_ARGS)
 						 leftDefinition, rightDefinition,
 						 leftCoverage, rightCoverage,
 						 leftLogical, rightLogical, leftPhysical, rightPhysical);
+	HnswAppendBfsLocalityJson(&json, "left_bfs_locality",
+						  &leftFingerprint.bfsLocality);
+	appendStringInfoChar(&json, ',');
+	HnswAppendBfsLocalityJson(&json, "right_bfs_locality",
+						  &rightFingerprint.bfsLocality);
+	appendStringInfoChar(&json, '}');
 
 	relation_close(right, NoLock);
 	relation_close(left, NoLock);
