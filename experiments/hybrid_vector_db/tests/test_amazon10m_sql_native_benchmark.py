@@ -442,6 +442,10 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         guided_calls = [call.args[0] for call in cursor.execute.call_args_list]
         self.assertIn("SET hnsw.filter_strategy = off", stock_calls)
         self.assertIn("SET hnsw.filter_strategy = safe_guided", guided_calls)
+        self.assertIn("SET hnsw.page_access = off", stock_calls)
+        self.assertIn("SET hnsw.index_page_access = off", stock_calls)
+        self.assertIn("SET hnsw.page_access = off", guided_calls)
+        self.assertIn("SET hnsw.index_page_access = off", guided_calls)
         self.assertEqual(
             benchmark.build_hybrid_sql("t", "rating = 5"),
             benchmark.build_hybrid_sql("t", "rating = 5"),
@@ -870,6 +874,8 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
             "app_as_of": "1000",
             "preferred_index": "public.vector_hnsw_idx",
             "filter_strategy": "off",
+            "page_access": "off",
+            "index_page_access": "off",
         }
         with (
             mock.patch.object(benchmark, "set_mode"),
@@ -990,6 +996,7 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
             "logical_equal": True,
             "entry_equal": True,
             "tuple_coverage_equal": True,
+            "definition_equal": True,
             "physical_equal": False,
         }
         validated = benchmark.validate_graph_compare(
@@ -1001,6 +1008,7 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
             "logical_equal",
             "entry_equal",
             "tuple_coverage_equal",
+            "definition_equal",
         ):
             with self.subTest(field=field):
                 with self.assertRaisesRegex(RuntimeError, "same-heap/same-logical-graph"):
@@ -1035,13 +1043,15 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
                 competing, "public.clone_hnsw", require_hnsw=True
             )
 
-    def test_runtime_context_fails_closed_on_principal_or_as_of_mismatch(self):
+    def test_runtime_context_fails_closed_on_principal_as_of_or_prefetch_mismatch(self):
         cursor = mock.MagicMock()
         cursor.fetchone.return_value = (
             "principal",
             "123",
             "public.source_hnsw",
             "safe_guided",
+            "off",
+            "off",
         )
         context = benchmark.runtime_sql_context(cursor, "principal", 123)
         self.assertEqual(context["app_as_of"], "123")
@@ -1050,16 +1060,30 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
             "123",
             "public.source_hnsw",
             "safe_guided",
+            "off",
+            "off",
         )
-        with self.assertRaisesRegex(RuntimeError, "principal/snapshot gate"):
+        with self.assertRaisesRegex(RuntimeError, "principal/snapshot/prefetch gate"):
             benchmark.runtime_sql_context(cursor, "principal", 123)
         cursor.fetchone.return_value = (
             "principal",
             "124",
             "public.source_hnsw",
             "safe_guided",
+            "off",
+            "off",
         )
-        with self.assertRaisesRegex(RuntimeError, "principal/snapshot gate"):
+        with self.assertRaisesRegex(RuntimeError, "principal/snapshot/prefetch gate"):
+            benchmark.runtime_sql_context(cursor, "principal", 123)
+        cursor.fetchone.return_value = (
+            "principal",
+            "123",
+            "public.source_hnsw",
+            "safe_guided",
+            "off",
+            "on",
+        )
+        with self.assertRaisesRegex(RuntimeError, "principal/snapshot/prefetch gate"):
             benchmark.runtime_sql_context(cursor, "principal", 123)
 
     def test_d3_summary_requires_probe_materialize_admission_and_active(self):
@@ -1220,6 +1244,7 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
                 "logical_equal": True,
                 "entry_equal": True,
                 "tuple_coverage_equal": True,
+                "definition_equal": True,
                 "physical_equal": False,
             },
         }

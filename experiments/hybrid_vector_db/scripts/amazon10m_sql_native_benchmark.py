@@ -1010,11 +1010,13 @@ def artifact_validation_errors(
         or str(row.get("snapshot_as_of", "")) != str(row.get("as_of", ""))
         or row.get("preferred_index_current_setting")
         != row.get("selected_vector_index")
+        or row.get("page_access_current_setting") != "off"
+        or row.get("index_page_access_current_setting") != "off"
     ]
     principals = {str(row.get("principal")) for row in rows if row.get("principal")}
     if context_mismatches or len(principals) > 1:
         errors.append(
-            "principal/snapshot/preferred-index runtime context mismatch: "
+            "principal/snapshot/preferred-index/prefetch runtime context mismatch: "
             + ",".join(context_mismatches[:10])
         )
     invalid_plans = [
@@ -1027,6 +1029,8 @@ def artifact_validation_errors(
             != plan.get("explain_gate", {}).get("expected_index_qualified")
             or plan.get("preferred_index_current_setting")
             != plan.get("selected_vector_index")
+            or plan.get("page_access_current_setting") != "off"
+            or plan.get("index_page_access_current_setting") != "off"
             or plan.get("explain_order") != "after_all_timed_requests_in_block"
         )
     ]
@@ -1045,7 +1049,13 @@ def database_contract_errors(database: dict[str, Any]) -> list[str]:
         or not isinstance(comparison, dict)
         or any(
             comparison.get(field) is not True
-            for field in ("same_heap", "logical_equal", "entry_equal", "tuple_coverage_equal")
+            for field in (
+                "same_heap",
+                "logical_equal",
+                "entry_equal",
+                "tuple_coverage_equal",
+                "definition_equal",
+            )
         )
         or comparison.get("physical_equal") is not False
     ):
@@ -1233,6 +1243,10 @@ def set_mode(
     cur.execute(f"SET hnsw.scan_mem_multiplier = {float(config.scan_mem_multiplier)}")
     cur.execute(f"SET hnsw.iterative_scan = {config.iterative_scan}")
     cur.execute(f"SET hnsw.guided_collect_target = {int(config.guided_collect_target)}")
+    # D2 is the physical BFS clone only. Keep heap/index prefetch out of this
+    # factorial comparison and prove the settings again immediately per query.
+    cur.execute("SET hnsw.page_access = off")
+    cur.execute("SET hnsw.index_page_access = off")
     settings = d3_settings or {
         "probe_requests": DEFAULT_D3_PROBE_REQUESTS,
         "min_benefit_per_byte": DEFAULT_D3_MIN_BENEFIT_PER_BYTE,
@@ -1666,7 +1680,13 @@ def validate_graph_compare(
         normalized = json.loads(proof) if isinstance(proof, str) else dict(proof)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise RuntimeError("same-graph BFS proof is not a JSON object") from exc
-    required_true = ("same_heap", "logical_equal", "entry_equal", "tuple_coverage_equal")
+    required_true = (
+        "same_heap",
+        "logical_equal",
+        "entry_equal",
+        "tuple_coverage_equal",
+        "definition_equal",
+    )
     valid = (
         source_index != clone_index
         and all(normalized.get(field) is True for field in required_true)
@@ -1693,6 +1713,7 @@ def validate_graph_compare(
             "logical_equal": True,
             "entry_equal": True,
             "tuple_coverage_equal": True,
+            "definition_equal": True,
             "physical_equal": False,
         },
         "comparison": normalized,
@@ -1714,7 +1735,9 @@ def runtime_sql_context(cur: Any, principal: str, as_of: int) -> dict[str, Any]:
     cur.execute(
         "SELECT current_user::text, current_setting('app.as_of', true), "
         "current_setting('hnsw.preferred_index', true), "
-        "current_setting('hnsw.filter_strategy', true)"
+        "current_setting('hnsw.filter_strategy', true), "
+        "current_setting('hnsw.page_access', true), "
+        "current_setting('hnsw.index_page_access', true)"
     )
     row = cur.fetchone()
     context = {
@@ -1722,10 +1745,17 @@ def runtime_sql_context(cur: Any, principal: str, as_of: int) -> dict[str, Any]:
         "app_as_of": str(row[1]) if row and row[1] is not None else "",
         "preferred_index": str(row[2]) if row and row[2] is not None else "",
         "filter_strategy": str(row[3]) if row and row[3] is not None else "",
+        "page_access": str(row[4]) if row and row[4] is not None else "",
+        "index_page_access": str(row[5]) if row and row[5] is not None else "",
     }
-    if context["current_user"] != principal or context["app_as_of"] != str(int(as_of)):
+    if (
+        context["current_user"] != principal
+        or context["app_as_of"] != str(int(as_of))
+        or context["page_access"] != "off"
+        or context["index_page_access"] != "off"
+    ):
         raise RuntimeError(
-            "principal/snapshot gate failed: "
+            "principal/snapshot/prefetch gate failed: "
             f"expected=({principal!r},{int(as_of)!r}) observed={context!r}"
         )
     return context
@@ -3051,6 +3081,10 @@ def run_measurements(
                     "filter_strategy_current_setting": context.get(
                         "filter_strategy", ""
                     ),
+                    "page_access_current_setting": context.get("page_access", ""),
+                    "index_page_access_current_setting": context.get(
+                        "index_page_access", ""
+                    ),
                     "guidance_kind": MODE_SPECS[mode].guidance_kind or "none",
                     "guidance_semantics": MODE_SPECS[mode].guidance_semantics,
                     "hard_traversal_used": hard_traversal_used,
@@ -3169,6 +3203,10 @@ def run_measurements(
                             "preferred_index_current_setting": context["preferred_index"],
                             "filter_strategy": MODE_SPECS[mode].filter_strategy,
                             "filter_strategy_current_setting": context["filter_strategy"],
+                            "page_access_current_setting": context["page_access"],
+                            "index_page_access_current_setting": context[
+                                "index_page_access"
+                            ],
                             "guidance_semantics": MODE_SPECS[mode].guidance_semantics,
                             "hard_traversal_used": False,
                             "explain_order": "after_all_timed_requests_in_block",
