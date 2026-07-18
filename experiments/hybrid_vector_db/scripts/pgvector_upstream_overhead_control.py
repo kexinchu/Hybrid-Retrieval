@@ -878,10 +878,29 @@ def server_vector_binary_provenance(
     )
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
         raise ProvenanceGateError(f"invalid Docker image ID {image_id!r}")
+    host_config_raw = _checked_command(
+        ["docker", "inspect", "--format={{json .HostConfig}}", container],
+        command_runner,
+    )
+    try:
+        host_config = json.loads(host_config_raw)
+    except json.JSONDecodeError as exc:
+        raise ProvenanceGateError("invalid Docker HostConfig JSON") from exc
+    if not isinstance(host_config, dict):
+        raise ProvenanceGateError("Docker HostConfig must be a JSON object")
+    resource_limits = {
+        "cpuset_cpus": str(host_config.get("CpusetCpus", "")),
+        "cpu_period": int(host_config.get("CpuPeriod", 0) or 0),
+        "cpu_quota": int(host_config.get("CpuQuota", 0) or 0),
+        "nano_cpus": int(host_config.get("NanoCpus", 0) or 0),
+        "memory_bytes": int(host_config.get("Memory", 0) or 0),
+        "memory_swap_bytes": int(host_config.get("MemorySwap", 0) or 0),
+    }
     return {
         "server_container": container,
         "server_image": image,
         "server_image_id": image_id,
+        "server_resource_limits": resource_limits,
         "pg_config_pkglibdir": pkglibdir,
         "vector_so_path": binary_path,
         "vector_so_sha256": actual,

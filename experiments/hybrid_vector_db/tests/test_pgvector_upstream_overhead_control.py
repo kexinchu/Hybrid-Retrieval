@@ -431,6 +431,20 @@ class PgvectorUpstreamOverheadControlTests(unittest.TestCase):
                     stdout=f"sha256:{'c' * 64}\n",
                     stderr="",
                 ),
+                SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps(
+                        {
+                            "CpusetCpus": "48-63",
+                            "CpuPeriod": 100000,
+                            "CpuQuota": 0,
+                            "NanoCpus": 0,
+                            "Memory": 68719476736,
+                            "MemorySwap": 68719476736,
+                        }
+                    ),
+                    stderr="",
+                ),
             ]
         )
 
@@ -439,6 +453,10 @@ class PgvectorUpstreamOverheadControlTests(unittest.TestCase):
         self.assertEqual(provenance["vector_so_sha256"], digest)
         self.assertEqual(provenance["server_image"], "pgvector-upstream:0.8.2")
         self.assertEqual(provenance["server_image_id"], f"sha256:{'c' * 64}")
+        self.assertEqual(provenance["server_resource_limits"]["cpuset_cpus"], "48-63")
+        self.assertEqual(
+            provenance["server_resource_limits"]["memory_bytes"], 68719476736
+        )
         self.assertEqual(
             command.call_args_list[2].args[0],
             [
