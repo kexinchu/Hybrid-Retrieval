@@ -6,11 +6,13 @@
 #include "access/skey.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/xact.h"
 #include "bitutils.h"
 #include "bitvec.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
+#include "commands/trigger.h"
 #include "common/shortest_dec.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
@@ -94,6 +96,9 @@ typedef struct HnswMetadataCacheEntry
 	double		bloomBuildMs;
 	int64		memoryBytes;
 	uint64		lastUsed;
+	bool		epochTracked;
+	int64		buildEpoch;
+	Oid			buildRelFileNode;
 } HnswMetadataCacheEntry;
 
 typedef struct HnswGuidanceDescriptorKey
@@ -112,6 +117,8 @@ typedef struct HnswGuidanceDescriptorEntry
 	int64		exactMemoryBytes;
 	double		exactBuildMs;
 	uint64		exactHits;
+	int64		exactEpoch;
+	Oid			exactRelFileNode;
 } HnswGuidanceDescriptorEntry;
 
 typedef struct HnswMetadataFilterProfile
@@ -174,6 +181,9 @@ typedef struct HnswActiveGuidance
 	int64		composedExactRows;
 	int64		composedExactMemoryBytes;
 	double		composedExactBuildMs;
+	bool		epochTracked;
+	int64		relationEpoch;
+	Oid			relationRelFileNode;
 } HnswActiveGuidance;
 
 static HnswMaterializeProfile hnsw_materialize_last_profile;
@@ -183,6 +193,8 @@ static HnswMetadataFilterProfile hnsw_metadata_filter_last_profile;
 static HnswActiveGuidance hnsw_active_guidance;
 static int	hnsw_metadata_cache_max_mb = 64;
 static bool hnsw_guidance_compose_exact_or = false;
+static bool hnsw_guidance_require_epoch = true;
+static bool hnsw_fragment_store_ready = false;
 static uint64 hnsw_metadata_cache_clock = 0;
 static int64 hnsw_metadata_cache_evictions = 0;
 
@@ -235,7 +247,13 @@ _PG_init(void)
 							 "Builds a composed exact TID set for OR guidance predicates",
 							 "When off, OR predicates are evaluated from cached atom fragments only.",
 							 &hnsw_guidance_compose_exact_or,
-							 false, PGC_USERSET, 0, NULL, NULL, NULL);
+								 false, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("hnsw.guidance_require_epoch",
+								 "Requires relation-epoch tracking before guidance can hard-prune HNSW candidates",
+								 "Disable only for read-only compatibility experiments; tracked epochs are required for update-safe pruning.",
+								 &hnsw_guidance_require_epoch,
+								 true, PGC_USERSET, 0, NULL, NULL, NULL);
 }
 
 static void
@@ -385,6 +403,8 @@ HnswGuidanceFreeDescriptorEntry(HnswGuidanceDescriptorEntry *entry)
 	entry->exactMemoryBytes = 0;
 	entry->exactBuildMs = 0;
 	entry->exactHits = 0;
+	entry->exactEpoch = 0;
+	entry->exactRelFileNode = InvalidOid;
 }
 
 static void
@@ -545,6 +565,9 @@ HnswMetadataFreeCacheEntry(HnswMetadataCacheEntry *entry)
 	entry->bloomBuildMs = 0;
 	entry->memoryBytes = 0;
 	entry->lastUsed = 0;
+	entry->epochTracked = false;
+	entry->buildEpoch = 0;
+	entry->buildRelFileNode = InvalidOid;
 }
 
 static void
@@ -802,6 +825,9 @@ HnswMetadataEnsureFragmentStore(void)
 {
 	int			spiStatus;
 
+	if (hnsw_fragment_store_ready)
+		return;
+
 	spiStatus = SPI_connect();
 	if (spiStatus != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed: %d", spiStatus);
@@ -822,16 +848,232 @@ HnswMetadataEnsureFragmentStore(void)
 	if (spiStatus != SPI_OK_UTILITY)
 		elog(ERROR, "SPI_execute failed: %d", spiStatus);
 
+	spiStatus = SPI_execute(
+		"CREATE TABLE IF NOT EXISTS public.pgvector_hnsw_fragment_epoch ("
+		"heap_oid oid PRIMARY KEY,"
+		"epoch bigint NOT NULL DEFAULT 0,"
+		"updated_at timestamptz NOT NULL DEFAULT now()"
+		")",
+		false, 0);
+	if (spiStatus != SPI_OK_UTILITY)
+		elog(ERROR, "SPI_execute failed: %d", spiStatus);
+
+	spiStatus = SPI_execute(
+		"ALTER TABLE public.pgvector_hnsw_fragment_store "
+		"ADD COLUMN IF NOT EXISTS build_epoch bigint NOT NULL DEFAULT 0, "
+		"ADD COLUMN IF NOT EXISTS relfilenode oid NOT NULL DEFAULT 0",
+		false, 0);
+	if (spiStatus != SPI_OK_UTILITY)
+		elog(ERROR, "SPI_execute failed: %d", spiStatus);
+
 	SPI_finish();
+	hnsw_fragment_store_ready = true;
 }
 
 static bool
-HnswMetadataLoadFragmentStore(Oid heapOid, const char *filterName, HnswGuidanceKind kind, HnswMetadataCacheEntry *cache)
+HnswMetadataGetRelationVersion(Oid heapOid, int64 *epoch, Oid *relFileNode)
 {
 	int			spiStatus;
-	Oid			argTypes[3] = {OIDOID, TEXTOID, TEXTOID};
-	Datum		values[3];
-	char		nulls[3] = {' ', ' ', ' '};
+	Oid			argTypes[1] = {OIDOID};
+	Datum		values[1] = {ObjectIdGetDatum(heapOid)};
+	char		nulls[1] = {' '};
+	bool		isnull;
+	bool		relFileNodeIsNull;
+	bool		tracked = false;
+
+	*epoch = 0;
+	*relFileNode = InvalidOid;
+	HnswMetadataEnsureFragmentStore();
+
+	spiStatus = SPI_connect();
+	if (spiStatus != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed: %d", spiStatus);
+
+	spiStatus = SPI_execute_with_args(
+			"SELECT e.epoch, pg_catalog.pg_relation_filenode($1) "
+			"FROM (SELECT 1) AS singleton "
+			"LEFT JOIN public.pgvector_hnsw_fragment_epoch AS e ON e.heap_oid = $1",
+			1, argTypes, values, nulls, true, 1);
+	if (spiStatus != SPI_OK_SELECT)
+		elog(ERROR, "SPI_execute_with_args failed: %d", spiStatus);
+
+	if (SPI_processed == 1)
+	{
+		Datum		epochDatum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+		Datum		relFileNodeDatum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &relFileNodeIsNull);
+
+		if (!isnull)
+		{
+			*epoch = DatumGetInt64(epochDatum);
+				tracked = true;
+			}
+		if (!relFileNodeIsNull)
+			*relFileNode = DatumGetObjectId(relFileNodeDatum);
+	}
+
+	SPI_finish();
+	if (!OidIsValid(*relFileNode))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("relation %u does not have physical storage", heapOid)));
+	return tracked;
+}
+
+PG_FUNCTION_INFO_V1(vector_hnsw_fragment_epoch_bump_trigger);
+Datum
+vector_hnsw_fragment_epoch_bump_trigger(PG_FUNCTION_ARGS)
+{
+	TriggerData *triggerData;
+	Oid			heapOid;
+	Oid			argTypes[1] = {OIDOID};
+	Datum		values[1];
+	char		nulls[1] = {' '};
+	int			spiStatus;
+
+	if (!CALLED_AS_TRIGGER(fcinfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+				 errmsg("vector_hnsw_fragment_epoch_bump_trigger must be called as a trigger")));
+
+	triggerData = (TriggerData *) fcinfo->context;
+	heapOid = RelationGetRelid(triggerData->tg_relation);
+	values[0] = ObjectIdGetDatum(heapOid);
+
+	spiStatus = SPI_connect();
+	if (spiStatus != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed: %d", spiStatus);
+	spiStatus = SPI_execute_with_args(
+		"INSERT INTO public.pgvector_hnsw_fragment_epoch (heap_oid, epoch) VALUES ($1, 1) "
+		"ON CONFLICT (heap_oid) DO UPDATE SET epoch = "
+		"public.pgvector_hnsw_fragment_epoch.epoch + 1, updated_at = now()",
+		1, argTypes, values, nulls, false, 0);
+	if (spiStatus != SPI_OK_INSERT && spiStatus != SPI_OK_UPDATE)
+		elog(ERROR, "SPI_execute_with_args failed: %d", spiStatus);
+	SPI_finish();
+
+	PG_RETURN_POINTER(NULL);
+}
+
+PG_FUNCTION_INFO_V1(vector_hnsw_fragment_tracking_enable);
+Datum
+vector_hnsw_fragment_tracking_enable(PG_FUNCTION_ARGS)
+{
+	Oid			heapOid = PG_GETARG_OID(0);
+	Oid			argTypes[1] = {OIDOID};
+	Datum		values[1] = {ObjectIdGetDatum(heapOid)};
+	char		nulls[1] = {' '};
+	int			spiStatus;
+	bool		hasTrigger = false;
+	char	   *relName;
+	char	   *namespaceName;
+	char	   *qualifiedName;
+	StringInfoData sql;
+	int64		epoch;
+	bool		isnull;
+
+	relName = get_rel_name(heapOid);
+	if (relName == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("relation with OID %u does not exist", heapOid)));
+	namespaceName = get_namespace_name(get_rel_namespace(heapOid));
+	qualifiedName = quote_qualified_identifier(namespaceName, relName);
+	HnswMetadataEnsureFragmentStore();
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "LOCK TABLE %s IN SHARE ROW EXCLUSIVE MODE", qualifiedName);
+	spiStatus = SPI_connect();
+	if (spiStatus != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed: %d", spiStatus);
+	spiStatus = SPI_execute(sql.data, false, 0);
+	if (spiStatus != SPI_OK_UTILITY)
+		elog(ERROR, "SPI_execute failed: %d", spiStatus);
+	SPI_finish();
+	pfree(sql.data);
+
+	spiStatus = SPI_connect();
+	if (spiStatus != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed: %d", spiStatus);
+	spiStatus = SPI_execute_with_args(
+			"INSERT INTO public.pgvector_hnsw_fragment_epoch (heap_oid, epoch) VALUES ($1, 0) "
+			"ON CONFLICT (heap_oid) DO UPDATE SET heap_oid = EXCLUDED.heap_oid "
+			"RETURNING epoch",
+			1, argTypes, values, nulls, false, 0);
+	if ((spiStatus != SPI_OK_INSERT_RETURNING && spiStatus != SPI_OK_UPDATE_RETURNING) || SPI_processed != 1)
+		elog(ERROR, "SPI_execute_with_args failed: %d", spiStatus);
+	epoch = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+	if (isnull)
+		elog(ERROR, "fragment epoch is null for relation %u", heapOid);
+
+	spiStatus = SPI_execute_with_args(
+		"SELECT 1 FROM pg_catalog.pg_trigger "
+		"WHERE tgrelid = $1 AND tgname = 'pgvector_hnsw_fragment_epoch' AND NOT tgisinternal",
+		1, argTypes, values, nulls, true, 1);
+	if (spiStatus != SPI_OK_SELECT)
+		elog(ERROR, "SPI_execute_with_args failed: %d", spiStatus);
+	hasTrigger = SPI_processed == 1;
+	SPI_finish();
+
+	if (!hasTrigger)
+	{
+		initStringInfo(&sql);
+		appendStringInfo(&sql,
+						 "CREATE TRIGGER pgvector_hnsw_fragment_epoch "
+						 "AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON %s "
+						 "FOR EACH STATEMENT EXECUTE FUNCTION public.vector_hnsw_fragment_epoch_bump_trigger()",
+						 qualifiedName);
+		spiStatus = SPI_connect();
+		if (spiStatus != SPI_OK_CONNECT)
+			elog(ERROR, "SPI_connect failed: %d", spiStatus);
+		spiStatus = SPI_execute(sql.data, false, 0);
+		if (spiStatus != SPI_OK_UTILITY)
+			elog(ERROR, "SPI_execute failed: %d", spiStatus);
+		SPI_finish();
+		pfree(sql.data);
+	}
+
+	CommandCounterIncrement();
+	pfree(qualifiedName);
+	PG_RETURN_INT64(epoch);
+}
+
+static void
+HnswMetadataCurrentCacheVersion(Oid heapOid, bool *tracked, int64 *epoch, Oid *relFileNode)
+{
+	*tracked = HnswMetadataGetRelationVersion(heapOid, epoch, relFileNode);
+	if (hnsw_guidance_require_epoch && !*tracked)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("fragment epoch tracking is not enabled for relation %u", heapOid),
+				 errhint("Call vector_hnsw_fragment_tracking_enable(%u::regclass) before activating guidance.", heapOid)));
+}
+
+static bool
+HnswMetadataCacheVersionMatches(HnswMetadataCacheEntry *cache, bool tracked, int64 epoch, Oid relFileNode)
+{
+	if (cache->buildRelFileNode != relFileNode)
+		return false;
+	if (tracked)
+		return cache->epochTracked && cache->buildEpoch == epoch;
+	return !cache->epochTracked;
+}
+
+static void
+HnswMetadataStampCacheVersion(HnswMetadataCacheEntry *cache, bool tracked, int64 epoch, Oid relFileNode)
+{
+	cache->epochTracked = tracked;
+	cache->buildEpoch = epoch;
+	cache->buildRelFileNode = relFileNode;
+}
+
+static bool
+HnswMetadataLoadFragmentStore(Oid heapOid, const char *filterName, HnswGuidanceKind kind,
+								  HnswMetadataCacheEntry *cache, bool tracked, int64 epoch, Oid relFileNode)
+{
+	int			spiStatus;
+	Oid			argTypes[5] = {OIDOID, TEXTOID, TEXTOID, INT8OID, OIDOID};
+	Datum		values[5];
+	char		nulls[5] = {' ', ' ', ' ', ' ', ' '};
 	bool		isnull;
 	bool		loaded = false;
 	const char *kindName = HnswGuidanceKindName(kind);
@@ -841,6 +1083,8 @@ HnswMetadataLoadFragmentStore(Oid heapOid, const char *filterName, HnswGuidanceK
 	values[0] = ObjectIdGetDatum(heapOid);
 	values[1] = CStringGetTextDatum(filterName);
 	values[2] = CStringGetTextDatum(kindName);
+	values[3] = Int64GetDatum(epoch);
+	values[4] = ObjectIdGetDatum(relFileNode);
 
 	spiStatus = SPI_connect();
 	if (spiStatus != SPI_OK_CONNECT)
@@ -849,8 +1093,9 @@ HnswMetadataLoadFragmentStore(Oid heapOid, const char *filterName, HnswGuidanceK
 	spiStatus = SPI_execute_with_args(
 		"SELECT rows, pages, bloom_bit_count, payload "
 		"FROM public.pgvector_hnsw_fragment_store "
-		"WHERE heap_oid = $1 AND filter_name = $2 AND kind = $3",
-		3, argTypes, values, nulls, true, 1);
+		"WHERE heap_oid = $1 AND filter_name = $2 AND kind = $3 "
+		"AND build_epoch = $4 AND relfilenode = $5",
+		5, argTypes, values, nulls, true, 1);
 	if (spiStatus != SPI_OK_SELECT)
 		elog(ERROR, "SPI_execute_with_args failed: %d", spiStatus);
 
@@ -900,7 +1145,10 @@ HnswMetadataLoadFragmentStore(Oid heapOid, const char *filterName, HnswGuidanceK
 
 	SPI_finish();
 	if (loaded)
+	{
+		HnswMetadataStampCacheVersion(cache, tracked, epoch, relFileNode);
 		HnswMetadataTouchCache(cache);
+	}
 	return loaded;
 }
 
@@ -908,9 +1156,9 @@ static void
 HnswMetadataSaveFragmentStore(Oid heapOid, const char *filterName, HnswGuidanceKind kind, HnswMetadataCacheEntry *cache)
 {
 	int			spiStatus;
-	Oid			argTypes[7] = {OIDOID, TEXTOID, TEXTOID, INT8OID, INT8OID, INT8OID, BYTEAOID};
-	Datum		values[7];
-	char		nulls[7] = {' ', ' ', ' ', ' ', ' ', ' ', ' '};
+	Oid			argTypes[9] = {OIDOID, TEXTOID, TEXTOID, INT8OID, INT8OID, INT8OID, BYTEAOID, INT8OID, OIDOID};
+	Datum		values[9];
+	char		nulls[9] = {' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' '};
 	const char *kindName = HnswGuidanceKindName(kind);
 	uint8	   *bits = NULL;
 	Size		bytes = 0;
@@ -950,6 +1198,8 @@ HnswMetadataSaveFragmentStore(Oid heapOid, const char *filterName, HnswGuidanceK
 	values[4] = Int64GetDatum(pages);
 	values[5] = Int64GetDatum(bloomBitCount);
 	values[6] = PointerGetDatum(payload);
+	values[7] = Int64GetDatum(cache->buildEpoch);
+	values[8] = ObjectIdGetDatum(cache->buildRelFileNode);
 
 	spiStatus = SPI_connect();
 	if (spiStatus != SPI_OK_CONNECT)
@@ -957,15 +1207,17 @@ HnswMetadataSaveFragmentStore(Oid heapOid, const char *filterName, HnswGuidanceK
 
 	spiStatus = SPI_execute_with_args(
 		"INSERT INTO public.pgvector_hnsw_fragment_store "
-		"(heap_oid, filter_name, kind, rows, pages, bloom_bit_count, payload) "
-		"VALUES ($1, $2, $3, $4, $5, $6, $7) "
+		"(heap_oid, filter_name, kind, rows, pages, bloom_bit_count, payload, build_epoch, relfilenode) "
+		"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) "
 		"ON CONFLICT (heap_oid, filter_name, kind) DO UPDATE SET "
 		"rows = EXCLUDED.rows,"
 		"pages = EXCLUDED.pages,"
 		"bloom_bit_count = EXCLUDED.bloom_bit_count,"
 		"payload = EXCLUDED.payload,"
+		"build_epoch = EXCLUDED.build_epoch,"
+		"relfilenode = EXCLUDED.relfilenode,"
 		"built_at = now()",
-		7, argTypes, values, nulls, false, 0);
+		9, argTypes, values, nulls, false, 0);
 	if (spiStatus != SPI_OK_INSERT && spiStatus != SPI_OK_UPDATE && spiStatus != SPI_OK_INSERT_RETURNING)
 	{
 		/* INSERT ... ON CONFLICT reports SPI_OK_INSERT on supported versions. */
@@ -1269,17 +1521,25 @@ static HnswMetadataCacheEntry *
 GetHnswMetadataCache(Oid heapOid, const char *filterName, bool buildIfMissing, bool *cacheHit, bool *storeHit)
 {
 	bool		found;
+	bool		tracked;
+	int64		epoch;
+	Oid			relFileNode;
 	HnswMetadataCacheEntry *cache;
 
 	if (storeHit != NULL)
 		*storeHit = false;
+	HnswMetadataCurrentCacheVersion(heapOid, &tracked, &epoch, &relFileNode);
 	cache = FindHnswMetadataCache(heapOid, filterName, &found);
 	if (found && cache->tidHash != NULL)
 	{
-		HnswMetadataTouchCache(cache);
-		if (cacheHit != NULL)
-			*cacheHit = true;
-		return cache;
+		if (HnswMetadataCacheVersionMatches(cache, tracked, epoch, relFileNode))
+		{
+			HnswMetadataTouchCache(cache);
+			if (cacheHit != NULL)
+				*cacheHit = true;
+			return cache;
+		}
+		HnswMetadataFreeCacheEntry(cache);
 	}
 
 	if (!buildIfMissing)
@@ -1290,6 +1550,7 @@ GetHnswMetadataCache(Oid heapOid, const char *filterName, bool buildIfMissing, b
 	if (cacheHit != NULL)
 		*cacheHit = false;
 	cache = BuildHnswMetadataCache(heapOid, filterName);
+	HnswMetadataStampCacheVersion(cache, tracked, epoch, relFileNode);
 	HnswMetadataTouchCache(cache);
 	HnswMetadataEvictIfNeeded(cache);
 	return cache;
@@ -1299,17 +1560,25 @@ static HnswMetadataCacheEntry *
 GetHnswMetadataPageCache(Oid heapOid, const char *filterName, bool buildIfMissing, bool *cacheHit, bool *storeHit)
 {
 	bool		found;
+	bool		tracked;
+	int64		epoch;
+	Oid			relFileNode;
 	HnswMetadataCacheEntry *cache;
 
 	if (storeHit != NULL)
 		*storeHit = false;
+	HnswMetadataCurrentCacheVersion(heapOid, &tracked, &epoch, &relFileNode);
 	cache = FindHnswMetadataCache(heapOid, filterName, &found);
 	if (found && cache->pageBits != NULL)
 	{
-		HnswMetadataTouchCache(cache);
-		if (cacheHit != NULL)
-			*cacheHit = true;
-		return cache;
+		if (HnswMetadataCacheVersionMatches(cache, tracked, epoch, relFileNode))
+		{
+			HnswMetadataTouchCache(cache);
+			if (cacheHit != NULL)
+				*cacheHit = true;
+			return cache;
+		}
+		HnswMetadataFreeCacheEntry(cache);
 	}
 
 	if (!buildIfMissing)
@@ -1319,7 +1588,8 @@ GetHnswMetadataPageCache(Oid heapOid, const char *filterName, bool buildIfMissin
 
 	if (cacheHit != NULL)
 		*cacheHit = false;
-	if (HnswMetadataLoadFragmentStore(heapOid, filterName, HNSW_GUIDANCE_KIND_PAGE, cache))
+	if (HnswMetadataLoadFragmentStore(heapOid, filterName, HNSW_GUIDANCE_KIND_PAGE,
+									   cache, tracked, epoch, relFileNode))
 	{
 		if (storeHit != NULL)
 			*storeHit = true;
@@ -1328,6 +1598,7 @@ GetHnswMetadataPageCache(Oid heapOid, const char *filterName, bool buildIfMissin
 	}
 
 	cache = BuildHnswMetadataPageCache(heapOid, filterName);
+	HnswMetadataStampCacheVersion(cache, tracked, epoch, relFileNode);
 	HnswMetadataTouchCache(cache);
 	HnswMetadataSaveFragmentStore(heapOid, filterName, HNSW_GUIDANCE_KIND_PAGE, cache);
 	HnswMetadataEvictIfNeeded(cache);
@@ -1338,17 +1609,25 @@ static HnswMetadataCacheEntry *
 GetHnswMetadataBloomCache(Oid heapOid, const char *filterName, bool buildIfMissing, bool *cacheHit, bool *storeHit)
 {
 	bool		found;
+	bool		tracked;
+	int64		epoch;
+	Oid			relFileNode;
 	HnswMetadataCacheEntry *cache;
 
 	if (storeHit != NULL)
 		*storeHit = false;
+	HnswMetadataCurrentCacheVersion(heapOid, &tracked, &epoch, &relFileNode);
 	cache = FindHnswMetadataCache(heapOid, filterName, &found);
 	if (found && cache->bloomBits != NULL)
 	{
-		HnswMetadataTouchCache(cache);
-		if (cacheHit != NULL)
-			*cacheHit = true;
-		return cache;
+		if (HnswMetadataCacheVersionMatches(cache, tracked, epoch, relFileNode))
+		{
+			HnswMetadataTouchCache(cache);
+			if (cacheHit != NULL)
+				*cacheHit = true;
+			return cache;
+		}
+		HnswMetadataFreeCacheEntry(cache);
 	}
 
 	if (!buildIfMissing)
@@ -1358,7 +1637,8 @@ GetHnswMetadataBloomCache(Oid heapOid, const char *filterName, bool buildIfMissi
 
 	if (cacheHit != NULL)
 		*cacheHit = false;
-	if (HnswMetadataLoadFragmentStore(heapOid, filterName, HNSW_GUIDANCE_KIND_BLOOM, cache))
+	if (HnswMetadataLoadFragmentStore(heapOid, filterName, HNSW_GUIDANCE_KIND_BLOOM,
+									   cache, tracked, epoch, relFileNode))
 	{
 		if (storeHit != NULL)
 			*storeHit = true;
@@ -1367,6 +1647,7 @@ GetHnswMetadataBloomCache(Oid heapOid, const char *filterName, bool buildIfMissi
 	}
 
 	cache = BuildHnswMetadataBloomCache(heapOid, filterName);
+	HnswMetadataStampCacheVersion(cache, tracked, epoch, relFileNode);
 	HnswMetadataTouchCache(cache);
 	HnswMetadataSaveFragmentStore(heapOid, filterName, HNSW_GUIDANCE_KIND_BLOOM, cache);
 	HnswMetadataEvictIfNeeded(cache);
@@ -1509,6 +1790,11 @@ HnswGuidanceBuildComposedExactOr(HnswActiveGuidance *guidance, HnswGuidanceDescr
 	if (!HnswGuidanceCanComposeExactOr(guidance))
 		return;
 
+	if (descriptor->exactTidHash != NULL &&
+		(descriptor->exactEpoch != guidance->relationEpoch ||
+		 descriptor->exactRelFileNode != guidance->relationRelFileNode))
+		HnswGuidanceFreeDescriptorEntry(descriptor);
+
 	if (descriptor->exactTidHash != NULL)
 	{
 		descriptor->exactHits++;
@@ -1552,6 +1838,8 @@ HnswGuidanceBuildComposedExactOr(HnswActiveGuidance *guidance, HnswGuidanceDescr
 	descriptor->exactBuildMs = INSTR_TIME_GET_MILLISEC(elapsed);
 	descriptor->exactMemoryBytes = descriptor->exactRows * (int64) sizeof(HnswMetadataTidEntry);
 	descriptor->exactHits = 0;
+	descriptor->exactEpoch = guidance->relationEpoch;
+	descriptor->exactRelFileNode = guidance->relationRelFileNode;
 	HnswGuidanceUseComposedExact(guidance, descriptor, false);
 
 	/* Touch metadata caches after the potentially long merge to keep LRU roughly query-local. */
@@ -1566,6 +1854,38 @@ bool
 HnswGuidanceIsActive(void)
 {
 	return hnsw_active_guidance.active;
+}
+
+bool
+HnswGuidanceIsActiveForHeap(Oid heapOid)
+{
+	return hnsw_active_guidance.active &&
+		OidIsValid(heapOid) &&
+			hnsw_active_guidance.heapOid == heapOid;
+}
+
+bool
+HnswGuidancePrepareForScan(Oid heapOid)
+{
+	bool		tracked;
+	int64		epoch;
+	Oid			relFileNode;
+
+	if (!HnswGuidanceIsActiveForHeap(heapOid))
+		return false;
+
+	tracked = HnswMetadataGetRelationVersion(heapOid, &epoch, &relFileNode);
+	if ((hnsw_guidance_require_epoch && !tracked) ||
+		tracked != hnsw_active_guidance.epochTracked ||
+		(tracked && epoch != hnsw_active_guidance.relationEpoch) ||
+		relFileNode != hnsw_active_guidance.relationRelFileNode)
+	{
+		/* A stale guide must never remove candidates from a newer table version. */
+		HnswGuidanceDeactivate();
+		return false;
+	}
+
+	return true;
 }
 
 bool
@@ -1644,6 +1964,12 @@ vector_hnsw_guidance_activate(PG_FUNCTION_ARGS)
 	HnswGuidanceDescriptorKey descriptorKey;
 	HnswGuidanceDescriptorEntry *descriptor;
 	bool		descriptorFound;
+	bool		epochTracked;
+	bool		finalEpochTracked;
+	int64		relationEpoch;
+	int64		finalRelationEpoch;
+	Oid			relationRelFileNode;
+	Oid			finalRelationRelFileNode;
 
 	deconstruct_array(filterArray, TEXTOID, -1, false, 'i', &filterDatums, &filterNulls, &filterCount);
 	if (filterCount < 1)
@@ -1662,7 +1988,9 @@ vector_hnsw_guidance_activate(PG_FUNCTION_ARGS)
 					 errmsg("guidance atom names cannot be null")));
 		rawName = text_to_cstring(DatumGetTextPP(filterDatums[i]));
 		appendStringInfo(&signature, "|%s", rawName);
-	}
+		}
+
+	HnswMetadataCurrentCacheVersion(heapOid, &epochTracked, &relationEpoch, &relationRelFileNode);
 
 	InitHnswGuidanceDescriptors();
 	MemSet(&descriptorKey, 0, sizeof(descriptorKey));
@@ -1687,6 +2015,9 @@ vector_hnsw_guidance_activate(PG_FUNCTION_ARGS)
 	nextGuidance.composedGuideHit = descriptorFound;
 	nextGuidance.composedGuideHits = descriptorFound ? 1 : 0;
 	nextGuidance.composedGuideMisses = descriptorFound ? 0 : 1;
+	nextGuidance.epochTracked = epochTracked;
+	nextGuidance.relationEpoch = relationEpoch;
+	nextGuidance.relationRelFileNode = relationRelFileNode;
 
 	for (int i = 0; i < filterCount; i++)
 	{
@@ -1784,6 +2115,17 @@ vector_hnsw_guidance_activate(PG_FUNCTION_ARGS)
 
 	if (hnsw_guidance_compose_exact_or)
 		HnswGuidanceBuildComposedExactOr(&nextGuidance, descriptor);
+
+	HnswMetadataCurrentCacheVersion(heapOid, &finalEpochTracked, &finalRelationEpoch,
+									&finalRelationRelFileNode);
+	if (finalEpochTracked != nextGuidance.epochTracked ||
+		(finalEpochTracked && finalRelationEpoch != nextGuidance.relationEpoch) ||
+		finalRelationRelFileNode != nextGuidance.relationRelFileNode)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("relation changed while HNSW guidance was being activated"),
+				 errhint("Retry vector_hnsw_guidance_activate().")));
+
 	nextGuidance.active = true;
 	hnsw_active_guidance = nextGuidance;
 	PG_RETURN_INT32(nextGuidance.atoms);
@@ -1799,8 +2141,11 @@ vector_hnsw_guidance_profile(PG_FUNCTION_ARGS)
 	appendStringInfo(&output,
 					 "{\"active\":%s,"
 					 "\"kind\":\"%s\","
-					 "\"heap_oid\":%u,"
-					 "\"atoms\":%d,"
+						 "\"heap_oid\":%u,"
+						 "\"epoch_tracked\":%s,"
+						 "\"relation_epoch\":" INT64_FORMAT ","
+						 "\"relation_relfilenode\":%u,"
+						 "\"atoms\":%d,"
 					 "\"groups\":%d,"
 					 "\"negated_atoms\":%d,"
 					 "\"last_cache_build_ms\":%.6f,"
@@ -1820,9 +2165,12 @@ vector_hnsw_guidance_profile(PG_FUNCTION_ARGS)
 						 "\"composed_exact_memory_bytes\":" INT64_FORMAT ","
 						 "\"composed_exact_build_ms\":%.6f}",
 					 hnsw_active_guidance.active ? "true" : "false",
-					 HnswGuidanceKindName(hnsw_active_guidance.kind),
-					 hnsw_active_guidance.heapOid,
-					 hnsw_active_guidance.atoms,
+						 HnswGuidanceKindName(hnsw_active_guidance.kind),
+						 hnsw_active_guidance.heapOid,
+						 hnsw_active_guidance.epochTracked ? "true" : "false",
+						 hnsw_active_guidance.relationEpoch,
+						 hnsw_active_guidance.relationRelFileNode,
+						 hnsw_active_guidance.atoms,
 					 hnsw_active_guidance.groups,
 					 hnsw_active_guidance.negatedAtoms,
 					 hnsw_active_guidance.lastBuildMs,

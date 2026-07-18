@@ -168,9 +168,9 @@ SHOW hnsw.ef_search;
 (1 row)
 
 SET hnsw.ef_search = 0;
-ERROR:  0 is outside the valid range for parameter "hnsw.ef_search" (1 .. 1000)
-SET hnsw.ef_search = 1001;
-ERROR:  1001 is outside the valid range for parameter "hnsw.ef_search" (1 .. 1000)
+ERROR:  0 is outside the valid range for parameter "hnsw.ef_search" (1 .. 10000)
+SET hnsw.ef_search = 10001;
+ERROR:  10001 is outside the valid range for parameter "hnsw.ef_search" (1 .. 10000)
 SHOW hnsw.iterative_scan;
  hnsw.iterative_scan 
 ---------------------

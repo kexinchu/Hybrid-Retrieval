@@ -114,6 +114,12 @@ CREATE FUNCTION vector_hnsw_guidance_activate(regclass, text[], text) RETURNS in
 CREATE FUNCTION vector_hnsw_guidance_reset() RETURNS void
 	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL SAFE;
 
+CREATE FUNCTION vector_hnsw_fragment_epoch_bump_trigger() RETURNS trigger
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION vector_hnsw_fragment_tracking_enable(regclass) RETURNS int8
+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
+
 CREATE FUNCTION vector_hnsw_guidance_profile() RETURNS text
 	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL SAFE;
 

@@ -25,6 +25,16 @@
  */
 static HnswScanProfile hnsw_last_profile;
 
+static Oid
+HnswScanHeapOid(IndexScanDesc scan)
+{
+	if (scan->heapRelation != NULL)
+		return RelationGetRelid(scan->heapRelation);
+	if (scan->indexRelation != NULL && scan->indexRelation->rd_index != NULL)
+		return scan->indexRelation->rd_index->indrelid;
+	return InvalidOid;
+}
+
 static int
 ComparePageAccessItems(const void *a, const void *b)
 {
@@ -363,7 +373,7 @@ HnswFillPageAccessBuffer(IndexScanDesc scan, int pageAccessMode)
 		rawPulls++;
 
 		item->guidanceChecked = false;
-		if (HnswGuidanceIsActive())
+		if (HnswGuidanceIsActiveForHeap(HnswScanHeapOid(scan)))
 		{
 			item->guidanceChecked = true;
 			so->guidanceChecks++;
@@ -591,6 +601,9 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 	{
 		Datum		value;
 
+		/* Disable stale hard-pruning state before graph traversal starts. */
+		(void) HnswGuidancePrepareForScan(HnswScanHeapOid(scan));
+
 		/* Count index scan for stats */
 		pgstat_count_index_scan(scan->indexRelation);
 #if PG_VERSION_NUM >= 180000
@@ -664,7 +677,7 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		else if (!HnswGetNextHeapTid(scan, &heaptid, NULL))
 			break;
 
-		if (HnswGuidanceIsActive() && !guidanceChecked)
+		if (HnswGuidanceIsActiveForHeap(HnswScanHeapOid(scan)) && !guidanceChecked)
 		{
 			so->guidanceChecks++;
 			if (!HnswGuidanceAllowsTid(&heaptid))

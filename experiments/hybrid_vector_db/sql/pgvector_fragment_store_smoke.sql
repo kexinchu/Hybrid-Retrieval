@@ -17,6 +17,7 @@ FROM generate_series(1, 5000) i;
 CREATE INDEX fragment_store_smoke_embedding_idx ON fragment_store_smoke USING hnsw (embedding vector_l2_ops);
 
 DROP TABLE IF EXISTS public.pgvector_hnsw_fragment_store;
+SELECT vector_hnsw_fragment_tracking_enable('fragment_store_smoke'::regclass);
 
 SELECT vector_hnsw_guidance_activate(
   'fragment_store_smoke_embedding_idx'::regclass,

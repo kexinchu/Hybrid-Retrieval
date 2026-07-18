@@ -27,9 +27,9 @@ static BlockNumber hnsw_index_page_last_neighbor_block = InvalidBlockNumber;
 static BlockNumber hnsw_index_page_last_element_block = InvalidBlockNumber;
 
 static bool
-HnswElementMatchesGuidance(HnswElement element)
+HnswElementMatchesGuidance(HnswElement element, Oid heapOid)
 {
-	if (!HnswGuidanceIsActive())
+	if (!HnswGuidanceIsActiveForHeap(heapOid))
 		return true;
 
 	for (int i = 0; i < element->heaptidsLength; i++)
@@ -980,8 +980,9 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	HnswUnvisited *unvisited = palloc(lm * sizeof(HnswUnvisited));
 	int			unvisitedLength;
 	bool		inMemory = index == NULL;
-	bool		useAcorn1 = !inserting && lc == 0 && hnsw_filter_strategy == HNSW_FILTER_STRATEGY_ACORN1 && HnswGuidanceIsActive();
-	bool		useGuidedCollect = !inserting && lc == 0 && hnsw_filter_strategy == HNSW_FILTER_STRATEGY_GUIDED_COLLECT && HnswGuidanceIsActive();
+	Oid			heapOid = !inMemory && index->rd_index != NULL ? index->rd_index->indrelid : InvalidOid;
+	bool		useAcorn1 = !inserting && lc == 0 && hnsw_filter_strategy == HNSW_FILTER_STRATEGY_ACORN1 && HnswGuidanceIsActiveForHeap(heapOid);
+	bool		useGuidedCollect = !inserting && lc == 0 && hnsw_filter_strategy == HNSW_FILTER_STRATEGY_GUIDED_COLLECT && HnswGuidanceIsActiveForHeap(heapOid);
 	int			guidedTarget = hnsw_guided_collect_target;
 
 	if (useGuidedCollect)
@@ -1030,7 +1031,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 		pairingheap_add(C, &sc->c_node);
 		if (useAcorn1 || useGuidedCollect)
-			matchesGuidance = HnswElementMatchesGuidance(HnswPtrAccess(base, sc->element));
+				matchesGuidance = HnswElementMatchesGuidance(HnswPtrAccess(base, sc->element), heapOid);
 		sc->matchesGuidance = matchesGuidance;
 		if (!useAcorn1 || matchesGuidance)
 			pairingheap_add(W, &sc->w_node);
@@ -1116,7 +1117,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			}
 
 			if (useAcorn1 || useGuidedCollect)
-				matchesGuidance = HnswElementMatchesGuidance(eElement);
+					matchesGuidance = HnswElementMatchesGuidance(eElement, heapOid);
 
 			if (useAcorn1 && !matchesGuidance)
 			{

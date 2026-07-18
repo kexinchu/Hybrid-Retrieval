@@ -587,6 +587,8 @@ void		HnswGetLastScanProfile(HnswScanProfile *profile);
 void		HnswResetIndexPageProfile(void);
 void		HnswGetIndexPageProfile(HnswIndexPageProfile *profile);
 bool		HnswGuidanceIsActive(void);
+bool		HnswGuidanceIsActiveForHeap(Oid heapOid);
+bool		HnswGuidancePrepareForScan(Oid heapOid);
 bool		HnswGuidanceAllowsTid(ItemPointer tid);
 
 static inline HnswNeighborArray *

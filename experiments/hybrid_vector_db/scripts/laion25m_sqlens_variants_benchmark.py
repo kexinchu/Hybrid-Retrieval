@@ -49,6 +49,10 @@ def ensure_functions(cur: psycopg.Cursor) -> None:
         "RETURNS int4 AS 'vector' LANGUAGE C VOLATILE PARALLEL UNSAFE",
         "CREATE OR REPLACE FUNCTION vector_hnsw_guidance_reset() "
         "RETURNS void AS 'vector' LANGUAGE C VOLATILE PARALLEL SAFE",
+        "CREATE OR REPLACE FUNCTION vector_hnsw_fragment_epoch_bump_trigger() "
+        "RETURNS trigger AS 'vector' LANGUAGE C",
+        "CREATE OR REPLACE FUNCTION vector_hnsw_fragment_tracking_enable(regclass) "
+        "RETURNS int8 AS 'vector' LANGUAGE C VOLATILE PARALLEL UNSAFE",
         "CREATE OR REPLACE FUNCTION vector_hnsw_guidance_profile() "
         "RETURNS text AS 'vector' LANGUAGE C VOLATILE PARALLEL SAFE",
         "CREATE OR REPLACE FUNCTION vector_hnsw_last_scan_profile() "
@@ -68,6 +72,11 @@ def ensure_functions(cur: psycopg.Cursor) -> None:
                 raise
             cur.connection.rollback()
     cur.execute("SELECT vector_hnsw_metadata_cache_profile()")
+
+
+def ensure_tracking(cur: psycopg.Cursor, *tables: str) -> None:
+    for table in dict.fromkeys(tables):
+        cur.execute("SELECT vector_hnsw_fragment_tracking_enable(%s::regclass)", (table,))
 
 
 def pin_backend(cur: psycopg.Cursor, cpu_list: str) -> None:
@@ -489,6 +498,7 @@ def main() -> None:
     with psycopg.connect(cfg.conninfo, autocommit=True) as conn:
         cur = conn.cursor()
         ensure_functions(cur)
+        ensure_tracking(cur, args.table, args.bfs_table)
         pin_backend(cur, args.backend_cpu_list)
         if "d1_d2_d3" in args.methods:
             prewarm_d3(cur, args, selected)

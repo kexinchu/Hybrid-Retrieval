@@ -17,6 +17,7 @@ SELECT ARRAY[(i % 7)::float, (i % 11)::float, (i % 13)::float]::vector,
 FROM generate_series(1, 200) i;
 
 CREATE INDEX guidance_smoke_embedding_idx ON guidance_smoke USING hnsw (embedding vector_l2_ops);
+SELECT vector_hnsw_fragment_tracking_enable('guidance_smoke'::regclass);
 
 SELECT vector_hnsw_guidance_reset();
 SELECT vector_hnsw_guidance_activate(
@@ -57,6 +58,7 @@ FROM generate_series(1, 3000) i;
 
 CREATE INDEX guidance_scan_smoke_embedding_idx ON guidance_scan_smoke USING hnsw (embedding vector_l2_ops);
 ANALYZE guidance_scan_smoke;
+SELECT vector_hnsw_fragment_tracking_enable('guidance_scan_smoke'::regclass);
 
 SET enable_seqscan = off;
 SET hnsw.iterative_scan = strict_order;
