@@ -28,10 +28,11 @@ from typing import Any, Iterable, Mapping, Protocol, Sequence
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_FILTERS = ROOT / "experiments/hybrid_vector_db/configs/amazon10m_selectivity14_filters.csv"
-DEFAULT_TRUTH = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_formal.csv"
-DEFAULT_TRUTH_MANIFEST = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_formal_manifest.json"
+DEFAULT_TRUTH = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_valid_embeddings_formal.csv"
+DEFAULT_TRUTH_MANIFEST = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_valid_embeddings_formal_manifest.json"
 DEFAULT_TABLE = "amazon_grocery_reviews_10m_pgvector"
-DEFAULT_INDEX = f"{DEFAULT_TABLE}_embedding_hnsw_idx"
+DEFAULT_INDEX = "amazon10m_embedding_valid_hnsw_source_idx"
+DEFAULT_CANDIDATE_VALIDITY_PREDICATE = "embedding_valid"
 MODES = ("stock", "adaptive", "eager_prebuilt")
 FORMAL_REQUESTS = 10_000
 FORMAL_WINDOW = 100
@@ -722,13 +723,14 @@ def activate(session: Session, index: str, atoms: Sequence[str], kind: str) -> t
 
 
 def run_search(
-    session: Session, table: str, predicate: str, query_id: int, k: int
+    session: Session, table: str, predicate: str, candidate_validity_predicate: str,
+    query_id: int, k: int
 ) -> tuple[list[int], dict[str, Any], str, float]:
     session.execute("SELECT vector_hnsw_reset_scan_profile()")
     started = time.perf_counter()
     try:
         session.execute(
-            f"SELECT id FROM {table} WHERE ({predicate}) AND id <> %s "
+            f"SELECT id FROM {table} WHERE ({predicate}) AND ({candidate_validity_predicate}) AND id <> %s "
             f"ORDER BY embedding <-> (SELECT embedding FROM {table} WHERE id = %s) LIMIT {int(k)}",
             (query_id, query_id),
         )
@@ -779,7 +781,8 @@ def run_request(session: Session, args: argparse.Namespace, mode: str, request: 
         if mode == "adaptive":
             reason = f"extension_adaptive_{guidance.get('adaptive_state', 'unknown')}"
     ids, scan, error, query_ms = run_search(
-        session, args.table, filter_spec.predicate, request.query_id, args.k
+        session, args.table, filter_spec.predicate, args.candidate_validity_predicate,
+        request.query_id, args.k
     )
     cache_after = json_profile(session, "SELECT vector_hnsw_metadata_cache_profile()")
     guidance_after = (
@@ -934,13 +937,15 @@ def eager_prebuild(session: Session, args: argparse.Namespace, filters: Sequence
 def database_provenance(session: Session, table: str, index: str) -> dict[str, Any]:
     session.execute(
         "SELECT current_setting('server_version'), %s::regclass::oid::bigint, pg_relation_filenode(%s::regclass)::bigint, "
-        "%s::regclass::oid::bigint, pg_relation_filenode(%s::regclass)::bigint, pg_get_indexdef(%s::regclass)",
-        (table, table, index, index, index),
+        "%s::regclass::oid::bigint, pg_relation_filenode(%s::regclass)::bigint, pg_get_indexdef(%s::regclass), "
+        "(SELECT pg_get_expr(i.indpred, i.indrelid) FROM pg_index AS i WHERE i.indexrelid = %s::regclass)",
+        (table, table, index, index, index, index),
     )
-    server, table_oid, table_node, index_oid, index_node, indexdef = session.row()
+    server, table_oid, table_node, index_oid, index_node, indexdef, index_predicate = session.row()
     extension = json_profile(session, "SELECT json_build_object('vector_extension', coalesce((SELECT extversion FROM pg_extension WHERE extname = 'vector'), 'missing'))::text")
     value = {"server_version": server, "table": table, "table_oid": int(table_oid), "table_relfilenode": int(table_node),
-             "index": index, "index_oid": int(index_oid), "index_relfilenode": int(index_node), "indexdef": indexdef, **extension}
+             "index": index, "index_oid": int(index_oid), "index_relfilenode": int(index_node),
+             "indexdef": indexdef, "index_predicate": index_predicate, **extension}
     value["database_build_id"] = canonical_sha256(value)
     return value
 
@@ -1013,9 +1018,26 @@ def source_provenance(args: argparse.Namespace) -> dict[str, Any]:
         raise BenchmarkContractError(
             f"truth manifest name must match its truth CSV: expected {expected_manifest_name}"
         )
+    try:
+        manifest = json.loads(truth_manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BenchmarkContractError(f"cannot read exact GT manifest: {exc}") from exc
+    truth_sha256 = sha256_file(args.truth)
+    manifest_truth = ((manifest.get("outputs") or {}).get("truth_csv") or {})
+    manifest_predicate = ((manifest.get("validity_contract") or {}).get("candidate_validity_predicate"))
+    if manifest.get("artifact_valid") is not True:
+        raise BenchmarkContractError("exact GT manifest is not valid")
+    if manifest_truth.get("sha256") != truth_sha256:
+        raise BenchmarkContractError("exact GT manifest does not bind the selected truth CSV")
+    if manifest_predicate != args.candidate_validity_predicate:
+        raise BenchmarkContractError(
+            "exact GT candidate universe does not match --candidate-validity-predicate"
+        )
     return {"script_sha256": sha256_file(Path(__file__)), "filters_sha256": sha256_file(args.filters_csv),
-            "truth_sha256": sha256_file(args.truth), "truth_manifest_sha256": sha256_file(truth_manifest),
-            "truth_manifest_name": truth_manifest.name}
+            "truth_sha256": truth_sha256, "truth_manifest_sha256": sha256_file(truth_manifest),
+            "truth_manifest_name": truth_manifest.name,
+            "candidate_validity_predicate": args.candidate_validity_predicate,
+            "truth_manifest_artifact_valid": True}
 
 
 def write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
@@ -1040,6 +1062,7 @@ def make_run_spec(args: argparse.Namespace, source: Mapping[str, Any], database:
             "trace_contract": "10,000-request trace over q200 fixed truth query vectors; vectors are reused",
             "q200_fixed_exact_truth": True, "effective_unique_queries": FORMAL_Q200,
             "unique_query_vectors": FORMAL_Q200, "database_cracking": False,
+            "candidate_validity_predicate": args.candidate_validity_predicate,
             "modes": list(MODES),
             "single_client_sequential": True, "measurement_schedule": PAIRING_SCHEDULE,
             "mode_backend_topology": "three_independent_persistent_postgresql_backends",
@@ -1079,6 +1102,13 @@ def execute_experiment(args: argparse.Namespace) -> int:
     try:
         backends = open_mode_backends(psycopg, pg_config_from_env().conninfo, table=args.table, index=args.index)
         database = dict(backends["stock"].database)
+        normalized_index_predicate = "".join(str(database.get("index_predicate") or "").split()).strip("()")
+        normalized_candidate_predicate = "".join(args.candidate_validity_predicate.split()).strip("()")
+        if normalized_index_predicate != normalized_candidate_predicate:
+            raise BenchmarkContractError(
+                "target HNSW partial-index predicate does not match the exact GT candidate universe: "
+                f"index={database.get('index_predicate')!r} expected={args.candidate_validity_predicate!r}"
+            )
         backend_sessions = {
             mode: {"backend_pid": backends[mode].backend_pid, "database_build_id": backends[mode].database["database_build_id"]}
             for mode in MODES
@@ -1207,6 +1237,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--truth-manifest", type=Path, default=DEFAULT_TRUTH_MANIFEST)
     parser.add_argument("--table", default=DEFAULT_TABLE)
     parser.add_argument("--index", default=DEFAULT_INDEX)
+    parser.add_argument("--candidate-validity-predicate", default=DEFAULT_CANDIDATE_VALIDITY_PREDICATE)
     parser.add_argument("--out", type=Path, default=ROOT / "results/hybrid_vector_db/amazon10m_d3_adaptation_lifecycle.csv")
     parser.add_argument("--execute", action="store_true", help="run the database experiment; dry-run is the default")
     parser.add_argument("--dry-run", action="store_true", help="print the formal contract without reading inputs or connecting")
@@ -1246,6 +1277,7 @@ def dry_run_payload(args: argparse.Namespace) -> dict[str, Any]:
             "formal": args.requests == FORMAL_REQUESTS and args.window_size == FORMAL_WINDOW,
             "debug_override_labeled_non_formal": args.requests != FORMAL_REQUESTS or args.window_size != FORMAL_WINDOW,
             "fixed_exact_gt_q200": True, "unique_query_vectors": FORMAL_Q200,
+            "candidate_validity_predicate": args.candidate_validity_predicate,
             "trace_contract": "10,000-request trace over q200 fixed truth query vectors; vectors are reused",
             "database_cracking": False, "single_client_sequential": True,
             "workload_manifest_name": FORMAL_WORKLOAD_MANIFEST_NAME,

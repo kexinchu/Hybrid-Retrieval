@@ -307,6 +307,14 @@ class Amazon10MD3AdaptationLifecycleTests(unittest.TestCase):
         self.assertIn("10,000-request trace", spec["trace_contract"])
         self.assertIn("vectors are reused", spec["trace_contract"])
         self.assertNotIn("q10000", json.dumps(spec))
+        self.assertEqual(spec["candidate_validity_predicate"], "embedding_valid")
+
+    def test_formal_defaults_bind_valid_embedding_truth_and_partial_index(self) -> None:
+        args = runner.create_argument_parser().parse_args([])
+        self.assertIn("valid_embeddings", args.truth.name)
+        self.assertIn("valid_embeddings", args.truth_manifest.name)
+        self.assertEqual(args.candidate_validity_predicate, "embedding_valid")
+        self.assertEqual(args.index, "amazon10m_embedding_valid_hnsw_source_idx")
 
     def test_invalidation_catches_missing_rows_recall_planner_and_build_mismatch(self) -> None:
         trace = [runner.Request(0, "steady_hot", 0, "f", 0, 0, None)]
