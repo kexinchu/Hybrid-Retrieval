@@ -393,6 +393,30 @@ class Amazon10MSqlNativeExactTruthTests(unittest.TestCase):
             truth.valid_epoch_trigger((valid[0], valid[1], "public.noop()", *valid[3:]))
         )
 
+    def test_rls_metadata_and_controlled_probe_contracts_are_distinct(self) -> None:
+        metadata = {
+            "current_user": "principal",
+            "is_superuser": False,
+            "bypass_rls": False,
+            "owns_facts": False,
+            "reader_membership": True,
+            "rls_enabled": True,
+            "policy_hash": "a" * 64,
+        }
+        self.assertTrue(
+            truth.validate_rls_security_metadata(metadata, "principal")[
+                "metadata_valid"
+            ]
+        )
+        with self.assertRaisesRegex(RuntimeError, "RLS security proof"):
+            truth.validate_rls_security_proof(metadata, "principal")
+        full = {
+            **metadata,
+            "positive_probe_visible": True,
+            "negative_probe_hidden": True,
+        }
+        self.assertTrue(truth.validate_rls_security_proof(full, "principal")["valid"])
+
     def test_manifest_builder_binds_data_version_proof(self) -> None:
         relations = {
             "public.amazon_review_facts": {"policies": [], "data_epoch": 7}

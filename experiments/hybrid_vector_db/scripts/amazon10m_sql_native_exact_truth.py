@@ -1237,10 +1237,10 @@ def session_context(cur: Any) -> dict[str, str]:
 
 
 def assert_principal_and_rls(cur: Any, principal: str) -> None:
-    validate_rls_security_proof(collect_rls_security_metadata(cur), principal)
+    validate_rls_security_metadata(collect_rls_security_metadata(cur), principal)
 
 
-def validate_rls_security_proof(
+def validate_rls_security_metadata(
     proof: dict[str, Any], principal: str
 ) -> dict[str, Any]:
     valid = (
@@ -1252,7 +1252,21 @@ def validate_rls_security_proof(
         and proof.get("rls_enabled") is True
         and isinstance(proof.get("policy_hash"), str)
         and len(str(proof.get("policy_hash"))) == 64
-        and proof.get("positive_probe_visible") is True
+    )
+    if not valid:
+        raise RuntimeError(
+            "RLS security proof session metadata failed: "
+            + json.dumps(proof, sort_keys=True, default=str)
+        )
+    return {**proof, "metadata_valid": True}
+
+
+def validate_rls_security_proof(
+    proof: dict[str, Any], principal: str
+) -> dict[str, Any]:
+    metadata = validate_rls_security_metadata(proof, principal)
+    valid = (
+        proof.get("positive_probe_visible") is True
         and proof.get("negative_probe_hidden") is True
     )
     if not valid:
@@ -1260,7 +1274,7 @@ def validate_rls_security_proof(
             "RLS security proof failed: "
             + json.dumps(proof, sort_keys=True, default=str)
         )
-    return {**proof, "valid": True}
+    return {**metadata, "valid": True}
 
 
 def collect_rls_security_metadata(cur: Any) -> dict[str, Any]:
