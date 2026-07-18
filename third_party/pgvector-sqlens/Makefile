@@ -4,12 +4,14 @@ EXTVERSION = 0.8.2
 MODULE_big = vector
 DATA = $(wildcard sql/*--*--*.sql)
 DATA_built = sql/$(EXTENSION)--$(EXTVERSION).sql
-OBJS = src/bitutils.o src/bitvec.o src/halfutils.o src/halfvec.o src/hnsw.o src/hnswbuild.o src/hnswinsert.o src/hnswscan.o src/hnswutils.o src/hnswvacuum.o src/ivfbuild.o src/ivfflat.o src/ivfinsert.o src/ivfkmeans.o src/ivfscan.o src/ivfutils.o src/ivfvacuum.o src/sparsevec.o src/vector.o
+OBJS = src/bitutils.o src/bitvec.o src/halfutils.o src/halfvec.o src/hnsw.o src/hnswbuild.o src/hnswclone.o src/hnswinsert.o src/hnswscan.o src/hnswutils.o src/hnswvacuum.o src/ivfbuild.o src/ivfflat.o src/ivfinsert.o src/ivfkmeans.o src/ivfscan.o src/ivfutils.o src/ivfvacuum.o src/sparsevec.o src/vector.o
 HEADERS = src/halfvec.h src/sparsevec.h src/vector.h
 
 TESTS = $(wildcard test/sql/*.sql)
 REGRESS = $(patsubst test/sql/%.sql,%,$(TESTS))
 REGRESS_OPTS = --inputdir=test --load-extension=$(EXTENSION)
+ISOLATION = hnsw_clone_hot
+ISOLATION_OPTS = --inputdir=test --load-extension=$(EXTENSION)
 
 # To compile for portability, run: make OPTFLAGS=""
 OPTFLAGS = -march=native
@@ -51,6 +53,24 @@ sql/$(EXTENSION)--$(EXTVERSION).sql: sql/$(EXTENSION).sql
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+SQLENS_SMOKE_SQL = \
+	$(abspath ../../experiments/hybrid_vector_db/sql/pgvector_clone_formality_smoke.sql) \
+	$(abspath ../../experiments/hybrid_vector_db/sql/pgvector_preferred_index_smoke.sql)
+
+.PHONY: sqlens_smoke_installcheck
+
+installcheck: sqlens_smoke_installcheck
+
+sqlens_smoke_installcheck:
+	@set -eu; \
+	db="sqlens_smoke_$$$$"; \
+	trap '$(bindir)/dropdb --if-exists "$$db" >/dev/null 2>&1 || true' EXIT HUP INT TERM; \
+	$(bindir)/createdb "$$db"; \
+	$(bindir)/psql -X -v ON_ERROR_STOP=1 -d "$$db" -c 'CREATE EXTENSION vector'; \
+	for smoke in $(SQLENS_SMOKE_SQL); do \
+		$(bindir)/psql -X -v ON_ERROR_STOP=1 -d "$$db" -f "$$smoke"; \
+	done
 
 # for Mac
 ifeq ($(PROVE),)

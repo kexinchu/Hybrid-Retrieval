@@ -74,12 +74,22 @@ SELECT vector_hnsw_guidance_activate(
 EXPLAIN (COSTS OFF)
 SELECT id, tenant_id
 FROM guidance_scan_smoke
+WHERE (SELECT vector_hnsw_guidance_bind(
+         'guidance_scan_smoke_embedding_idx'::regclass,
+         ARRAY['exact:sql:tenant_id = 1'],
+         'exact'
+       ) OFFSET 0)
 ORDER BY embedding <-> '[0,0,0]'
 LIMIT 10;
 
 WITH guided AS (
   SELECT id, tenant_id
   FROM guidance_scan_smoke
+  WHERE (SELECT vector_hnsw_guidance_bind(
+           'guidance_scan_smoke_embedding_idx'::regclass,
+           ARRAY['exact:sql:tenant_id = 1'],
+           'exact'
+         ) OFFSET 0)
   ORDER BY embedding <-> '[0,0,0]'
   LIMIT 10
 )
@@ -87,6 +97,20 @@ SELECT count(*) AS rows, bool_and(tenant_id = 1) AS all_tenant_1
 FROM guided;
 
 SELECT vector_hnsw_last_scan_profile();
+DO $$
+DECLARE
+  profile jsonb := vector_hnsw_last_scan_profile()::jsonb;
+BEGIN
+  IF (profile ->> 'profile_semantics_version')::integer <> 2
+     OR (profile ->> 'heap_fetch_ms_is_residual_proxy')::boolean IS NOT TRUE
+     OR profile ->> 'graph_elements_visited' IS DISTINCT FROM profile ->> 'visited_tuples'
+     OR profile ->> 'raw_index_tids_returned' IS DISTINCT FROM profile ->> 'returned_tuples'
+     OR profile ->> 'hnsw_am_callback_ms' IS DISTINCT FROM profile ->> 'hnsw_search_ms'
+     OR profile ->> 'executor_residual_ms' IS DISTINCT FROM profile ->> 'heap_fetch_ms' THEN
+    RAISE EXCEPTION 'scan profile compatibility aliases are inconsistent: %', profile;
+  END IF;
+END
+$$;
 SELECT vector_hnsw_guidance_reset();
 
 RESET enable_seqscan;

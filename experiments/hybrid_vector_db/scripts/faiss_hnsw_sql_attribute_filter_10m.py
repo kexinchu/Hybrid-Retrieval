@@ -10,7 +10,10 @@ from pathlib import Path
 
 import numpy as np
 
-from common_pg import pg_config_from_env, require_psycopg
+try:
+    from .common_pg import pg_config_from_env, require_psycopg
+except ImportError:  # Direct script execution puts this directory on sys.path.
+    from common_pg import pg_config_from_env, require_psycopg
 
 
 ATTR_FILTERS: list[tuple[str, str, str]] = [

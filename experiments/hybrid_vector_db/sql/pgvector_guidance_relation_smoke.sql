@@ -89,6 +89,11 @@ BEGIN
     SELECT id, tenant_id
     FROM guidance_relation_a
     WHERE tenant_id = 1
+      AND (SELECT vector_hnsw_guidance_bind(
+               'guidance_relation_a_hnsw'::regclass,
+               ARRAY['exact:sql:tenant_id = 1'],
+               'exact'
+           ) OFFSET 0)
     ORDER BY embedding <-> '[0,0,0]'
     LIMIT 10
   ) AS nearest

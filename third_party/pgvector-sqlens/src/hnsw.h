@@ -7,6 +7,7 @@
 
 #include "access/genam.h"
 #include "access/parallel.h"
+#include "executor/execdesc.h"
 #include "lib/pairingheap.h"
 #include "nodes/execnodes.h"
 #include "portability/instr_time.h"
@@ -14,6 +15,8 @@
 #include "utils/relptr.h"
 #include "utils/sampling.h"
 #include "vector.h"
+
+#define SQLENS_BUILD_ID "sqlens-v11-formal-graph-proof-20260718-r2"
 
 #if PG_VERSION_NUM >= 190000
 typedef Pointer Item;
@@ -67,6 +70,9 @@ typedef Pointer Item;
 #define HNSW_MAX_SIZE (BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(HnswPageOpaqueData)) - sizeof(ItemIdData))
 #define HNSW_TUPLE_ALLOC_SIZE BLCKSZ
 #define HNSW_PROFILE_MAX_TIDS 1000
+#define HNSW_PROFILE_MAX_PROOFS 128
+#define HNSW_INDEX_PAGE_UNIQUE_LIMIT 65536
+#define HNSW_INDEX_PAGE_UNIQUE_SLOTS (HNSW_INDEX_PAGE_UNIQUE_LIMIT * 2)
 
 #define HNSW_ELEMENT_TUPLE_SIZE(size)	MAXALIGN(offsetof(HnswElementTupleData, data) + (size))
 #define HNSW_NEIGHBOR_TUPLE_SIZE(level, m)	MAXALIGN(offsetof(HnswNeighborTupleData, indextids) + ((level) + 2) * (m) * sizeof(ItemPointerData))
@@ -125,8 +131,16 @@ extern int	hnsw_page_prefetch_min_items;
 extern int	hnsw_page_disable_after_no_merge;
 extern int	hnsw_index_page_access;
 extern int	hnsw_build_page_order;
+extern int	hnsw_build_seed;
+extern bool hnsw_require_full_memory_build;
+extern char *hnsw_clone_source;
+extern char *hnsw_preferred_index;
 extern int	hnsw_filter_strategy;
 extern int	hnsw_guided_collect_target;
+extern int	hnsw_traversal_guided_target;
+extern int	hnsw_traversal_guided_max_bridge_hops;
+extern int	hnsw_traversal_guided_max_bridge_work;
+extern double hnsw_traversal_guided_min_skip_rate;
 extern double hnsw_scan_mem_multiplier;
 extern int	hnsw_lock_tranche_id;
 
@@ -160,11 +174,44 @@ typedef enum HnswFilterStrategyMode
 {
 	HNSW_FILTER_STRATEGY_OFF,
 	HNSW_FILTER_STRATEGY_ACORN1,
-	HNSW_FILTER_STRATEGY_GUIDED_COLLECT
+	HNSW_FILTER_STRATEGY_GUIDED_COLLECT,
+	HNSW_FILTER_STRATEGY_TRAVERSAL_GUIDED,
+	HNSW_FILTER_STRATEGY_SAFE_GUIDED
 }			HnswFilterStrategyMode;
+
+typedef enum HnswTraversalFinalPath
+{
+	HNSW_TRAVERSAL_PATH_STOCK,
+	HNSW_TRAVERSAL_PATH_VALIDATION_ONLY,
+	HNSW_TRAVERSAL_PATH_LEGACY_GUIDED,
+	HNSW_TRAVERSAL_PATH_GUIDED,
+	HNSW_TRAVERSAL_PATH_STOCK_BYPASS,
+	HNSW_TRAVERSAL_PATH_FRESH_STOCK_FALLBACK
+} HnswTraversalFinalPath;
+
+typedef enum HnswTraversalStockBypassReason
+{
+	HNSW_TRAVERSAL_BYPASS_NONE,
+	HNSW_TRAVERSAL_BYPASS_NO_PROVEN_GUIDE,
+	HNSW_TRAVERSAL_BYPASS_SKIP_ESTIMATE_UNAVAILABLE,
+	HNSW_TRAVERSAL_BYPASS_LOW_ESTIMATED_SKIP_RATE,
+	HNSW_TRAVERSAL_BYPASS_ITERATIVE_SCAN
+} HnswTraversalStockBypassReason;
+
+typedef enum HnswTraversalFallbackReason
+{
+	HNSW_TRAVERSAL_FALLBACK_NONE,
+	HNSW_TRAVERSAL_FALLBACK_INSUFFICIENT_MATCHES,
+	HNSW_TRAVERSAL_FALLBACK_BRIDGE_HOPS,
+	HNSW_TRAVERSAL_FALLBACK_BRIDGE_WORK,
+	HNSW_TRAVERSAL_FALLBACK_MAX_SCAN_TUPLES,
+	HNSW_TRAVERSAL_FALLBACK_MEMORY_LIMIT,
+	HNSW_TRAVERSAL_FALLBACK_INVALID_NEIGHBOR
+} HnswTraversalFallbackReason;
 
 typedef struct HnswElementData HnswElementData;
 typedef struct HnswNeighborArray HnswNeighborArray;
+typedef struct HnswScanGuidance HnswScanGuidance;
 
 #define HnswPtrDeclare(type, relptrtype, ptrtype) \
 	relptr_declare(type, relptrtype); \
@@ -221,6 +268,107 @@ typedef struct HnswSearchCandidate
 	bool		matchesGuidance;
 }			HnswSearchCandidate;
 
+typedef enum HnswPlannerProofBypassReason
+{
+	HNSW_PROOF_BYPASS_NONE,
+	HNSW_PROOF_BYPASS_SCAN_NOT_STARTED,
+	HNSW_PROOF_BYPASS_NO_PLAN_REGISTRATION,
+	HNSW_PROOF_BYPASS_SCAN_IDENTITY,
+	HNSW_PROOF_BYPASS_NO_ACTIVE_GUIDE,
+	HNSW_PROOF_BYPASS_LATE_GENERATION,
+	HNSW_PROOF_BYPASS_NO_STATEMENT_BINDING,
+	HNSW_PROOF_BYPASS_BINDING_IDENTITY,
+	HNSW_PROOF_BYPASS_STRATEGY_OFF,
+	HNSW_PROOF_BYPASS_PARALLEL,
+	HNSW_PROOF_BYPASS_RLS_SECURITY_BARRIER,
+	HNSW_PROOF_BYPASS_STALE_RELATION,
+	HNSW_PROOF_BYPASS_PREDICATE_UNAVAILABLE,
+	HNSW_PROOF_BYPASS_NO_ACTUAL_QUALS,
+	HNSW_PROOF_BYPASS_PARAM_EXEC,
+	HNSW_PROOF_BYPASS_PARAM_EXTERN,
+	HNSW_PROOF_BYPASS_NON_TARGET_VAR,
+	HNSW_PROOF_BYPASS_UNSUPPORTED_QUAL,
+	HNSW_PROOF_BYPASS_PREDICATE_NOT_IMPLIED
+} HnswPlannerProofBypassReason;
+
+typedef struct HnswPlannerProofOutcome
+{
+	bool		attempted;
+	bool		succeeded;
+	HnswPlannerProofBypassReason bypassReason;
+	int			planNodeId;
+	Oid			indexOid;
+	Oid			heapOid;
+	uint64		guideGeneration;
+} HnswPlannerProofOutcome;
+
+typedef struct HnswTraversalGuidanceState
+{
+	bool		requested;
+	bool		phaseEnabled;
+	bool		estimatedSkipRateValid;
+	double		estimatedSkipRate;
+	int			target;
+	int			maxBridgeHops;
+	int64		maxBridgeWork;
+	int64		bridgeWork;
+	int64		maxScanTuples;
+	MemoryContext phaseContext;
+	Size		maxMemory;
+	bool		hopLimitReached;
+	bool		workLimitReached;
+	bool		maxScanReached;
+	bool		memoryLimitReached;
+	bool		invalidNeighbor;
+	int			guidedResultCount;
+	HnswTraversalFinalPath finalPath;
+	HnswTraversalStockBypassReason stockBypassReason;
+	HnswTraversalFallbackReason fallbackReason;
+} HnswTraversalGuidanceState;
+
+typedef struct HnswTraversalProfile
+{
+	int64		expandedNodes;
+	int64		neighborsExamined;
+	int64		guidanceChecks;
+	int64		guidanceMatches;
+	int64		guidanceMisses;
+	int64		neighborGuidanceChecks;
+	int64		neighborGuidanceMatches;
+	int64		neighborGuidanceMisses;
+	int64		preDistanceChecks;
+	int64		preDistanceMatches;
+	int64		preDistanceMisses;
+	int64		distanceComputationsAvoided;
+	int64		missBridgeNodes;
+	int64		missBridgeEdges;
+	int64		maxMissBridgeHops;
+	int64		guidedExpandedNodes;
+	int64		guidedPhaseDistanceComputations;
+	int64		stockPhaseExpandedNodes;
+	int64		stockPhaseDistanceComputations;
+	int64		stockBypassRequests;
+	int64		fallbackRequests;
+	int64		fallbackStockExpandedNodes;
+	int64		fallbackStockDistanceComputations;
+	int64		matchingExpanded;
+	int64		bridgeExpanded;
+	int64		candidateAdmissions;
+	int64		resultAdmissions;
+	int64		guidedAdmissions;
+	int64		guidedSuppressions;
+	int64		heapTidsSuppressed;
+	int64		stopDeferrals;
+	int64		discardedPushes;
+	int64		discardedPops;
+	int64		initialBatches;
+	int64		resumeBatches;
+	int64		strictOrderDrops;
+	int64		stockTerminations;
+	int64		maxScanTerminations;
+	int64		exhaustedTerminations;
+}			HnswTraversalProfile;
+
 typedef struct HnswScanProfile
 {
 	bool		valid;
@@ -239,6 +387,7 @@ typedef struct HnswScanProfile
 	int64		guidanceChecks;
 	int64		guidanceMatches;
 	int64		guidanceSkips;
+	HnswTraversalProfile traversal;
 	int64		indexPageNeighborLoads;
 	int64		indexPageNeighborRuns;
 	int64		indexPageNeighborDistinctPages;
@@ -246,6 +395,7 @@ typedef struct HnswScanProfile
 	int64		indexPageElementRuns;
 	int64		indexPageElementDistinctPages;
 	int64		indexPagePrefetches;
+	bool		indexPageDistinctCountsExact;
 	int64		blksHitBefore;
 	int64		blksHitAfter;
 	int64		blksReadBefore;
@@ -256,6 +406,15 @@ typedef struct HnswScanProfile
 	int64		heapBlksRead;
 	int			topkTidCount;
 	ItemPointerData topkTids[HNSW_PROFILE_MAX_TIDS];
+	HnswPlannerProofOutcome plannerProof;
+	HnswTraversalFinalPath traversalFinalPath;
+	HnswTraversalStockBypassReason traversalStockBypassReason;
+	HnswTraversalFallbackReason traversalFallbackReason;
+	bool		traversalEstimatedSkipRateValid;
+	double		traversalEstimatedSkipRate;
+	int			plannerProofCount;
+	bool		plannerProofsTruncated;
+	HnswPlannerProofOutcome plannerProofs[HNSW_PROFILE_MAX_PROOFS];
 }			HnswScanProfile;
 
 typedef struct HnswIndexPageProfile
@@ -267,7 +426,24 @@ typedef struct HnswIndexPageProfile
 	int64		elementRuns;
 	int64		elementDistinctPages;
 	int64		prefetches;
+	bool		distinctCountsExact;
 }			HnswIndexPageProfile;
+
+typedef struct HnswIndexPageSet
+{
+	uint32	   *slots;
+	int			count;
+} HnswIndexPageSet;
+
+typedef struct HnswIndexPageProfileState
+{
+	HnswIndexPageProfile profile;
+	MemoryContext context;
+	BlockNumber lastNeighborBlock;
+	BlockNumber lastElementBlock;
+	HnswIndexPageSet neighborPages;
+	HnswIndexPageSet elementPages;
+} HnswIndexPageProfileState;
 
 typedef struct HnswPageAccessItem
 {
@@ -500,6 +676,14 @@ typedef struct HnswScanOpaqueData
 	int64		guidanceChecks;
 	int64		guidanceMatches;
 	int64		guidanceSkips;
+	HnswTraversalProfile traversal;
+	HnswIndexPageProfileState indexPageProfile;
+	void	   *guidancePlan;
+	HnswScanGuidance *guidance;
+	bool		guidanceDecided;
+	HnswPlannerProofOutcome plannerProof;
+	HnswTraversalGuidanceState traversalGuidance;
+	int64		abandonedGuidedTuples;
 
 	/* Support functions */
 	HnswSupport support;
@@ -542,7 +726,7 @@ bool		HnswCheckNorm(HnswSupport * support, Datum value);
 Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
 void		HnswInitPage(Buffer buf, Page page);
 void		HnswInit(void);
-List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, int64 *distanceComputations);
+List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, int64 *distanceComputations, HnswTraversalProfile *traversalProfile, HnswScanGuidance *guidance, HnswTraversalGuidanceState *traversalGuidance, HnswIndexPageProfileState *indexPageProfile);
 HnswElement HnswGetEntryPoint(Relation index);
 void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);
@@ -570,6 +754,7 @@ PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);
 /* Index access methods */
 IndexBuildResult *hnswbuild(Relation heap, Relation index, IndexInfo *indexInfo);
 void		hnswbuildempty(Relation index);
+void		HnswCloneGraph(HnswBuildState *buildstate);
 bool		hnswinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid, Relation heap, IndexUniqueCheck checkUnique
 #if PG_VERSION_NUM >= 140000
 					   ,bool indexUnchanged
@@ -584,12 +769,21 @@ bool		hnswgettuple(IndexScanDesc scan, ScanDirection dir);
 void		hnswendscan(IndexScanDesc scan);
 void		HnswResetScanProfile(void);
 void		HnswGetLastScanProfile(HnswScanProfile *profile);
-void		HnswResetIndexPageProfile(void);
-void		HnswGetIndexPageProfile(HnswIndexPageProfile *profile);
+void		HnswInitIndexPageProfile(HnswIndexPageProfileState *state,
+								 MemoryContext context);
 bool		HnswGuidanceIsActive(void);
 bool		HnswGuidanceIsActiveForHeap(Oid heapOid);
-bool		HnswGuidancePrepareForScan(Oid heapOid);
-bool		HnswGuidanceAllowsTid(ItemPointer tid);
+void		HnswGuidanceRegisterExecutorScans(QueryDesc *queryDesc, uint64 frameId);
+void		HnswGuidanceAttachCurrentPlan(IndexScanDesc scan);
+HnswScanGuidance *HnswGuidancePrepareForScan(IndexScanDesc scan, void *planBinding,
+											 HnswPlannerProofOutcome *proof);
+bool		HnswGuidanceIsActiveForScan(HnswScanGuidance *guidance);
+bool		HnswGuidanceAllowsTid(HnswScanGuidance *guidance, ItemPointer tid);
+bool		HnswGuidanceGetEstimatedSkipRate(HnswScanGuidance *guidance, double *skipRate);
+void		HnswGuidanceEndScan(HnswScanGuidance *guidance);
+void		HnswGuidanceRecordScan(Oid heapOid, int64 candidates,
+							 int64 guidanceChecks, int64 guidanceSkips,
+							 double heapFetchMs, double totalScanMs);
 
 static inline HnswNeighborArray *
 HnswGetNeighbors(char *base, HnswElement element, int lc)

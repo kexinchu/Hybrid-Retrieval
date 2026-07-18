@@ -9,8 +9,12 @@ from pathlib import Path
 
 import psycopg
 
-from common_pg import pg_config_from_env
-from faiss_hnsw_sql_attribute_filter_10m import ATTR_FILTERS, recall_at_k
+try:
+    from .common_pg import pg_config_from_env
+    from .faiss_hnsw_sql_attribute_filter_10m import ATTR_FILTERS, recall_at_k
+except ImportError:  # Direct script execution puts this directory on sys.path.
+    from common_pg import pg_config_from_env
+    from faiss_hnsw_sql_attribute_filter_10m import ATTR_FILTERS, recall_at_k
 
 
 TABLE = "amazon_grocery_reviews_10m_pgvector"

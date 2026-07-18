@@ -141,16 +141,56 @@ candidate waste/locality/reuse 的机制图。机制证据的主位置是 Motiva
 
 | Baseline | 是否主文必需 | 使用场景 | 注意事项 |
 |---|---|---|---|
-| Stock PostgreSQL + \pgvector HNSW | 必需 | 所有 SQLens 对比 | 调优 `ef_search`、iterative scan、scan budget |
-| SQL-first exact | 必需 | ground truth 与 exact baseline | `WHERE predicate` 后 exact vector ranking |
+| Official upstream PostgreSQL + \pgvector v0.8.2 HNSW | 必需 | 主 stock baseline | 使用官方 commit/binary SHA；调优 `ef_search`、iterative scan、scan budget |
+| SQLens binary, all SQLens GUCs disabled | 必需 | instrumentation overhead control | 与 upstream 在同一表、同一索引、同一 SQL 上 A/B；不能代替 official upstream |
+| SQL-first exact | 必需 | exact system baseline | `WHERE predicate` 后 exact vector ranking；其 latency 独立测量，不能把离线 GT 生成时间当 baseline |
+| FAISS HNSW allow-list | 必需 | standalone FVS baseline | PostgreSQL 流式构造 bitmap allow-list；报告 allow-list build 与 search，主比较同时给 cached-allow-list search |
+| Weaviate v1.38 filtered vector search | 必需 | production FVS baseline | 同时调 ACORN、sweeping 与 flat-search cutoff；记录 image digest 与 schema 恢复证据 |
 | SQLens-D1 | 必需 | predicate guidance | 与 stock 使用相同 SQL final validation |
 | SQLens-D1+D2 | 必需 | locality/layout | 不把重排/构建时间混入单查询 latency |
 | SQLens-D1+D2+D3 | 必需 | cache/reusable state | 正确性必须由 PostgreSQL final recheck 保证 |
-<!-- | FAISS/HNSWlib allow-list | 可选 | payload-compatible 上界 | 说明不是 SQL-native DBMS 路径 |
-| Milvus/Weaviate/Qdrant | 可选 | 外部边界 | 只比较 payload filter，不比较 join/ACL/RLS 除非计入 denormalization | -->
 
 不再把 D4/routing 作为主文 baseline。若保留实现，可作为保守工程策略或
 appendix 结果。
+
+### Matched-recall baseline contract
+
+- 对 official pgvector、SQLens-disabled、SQLens、FAISS 与 Weaviate 分别调参，
+  在 Recall@10 为 `0.90`、`0.95`、`0.99` 的相同目标下比较 latency/QPS；
+  不允许只固定 stock 的 `ef_search=1000`。
+- 调参使用互不重叠的 q200 split：q0--19 screening、q20--99 verification、
+  q100--199 held-out final。配置选择使用 verification recall 的 95% LCB，
+  最终结论只使用 held-out final。
+- 如果某方法在完整参数网格上达不到目标，必须保留最大预算配置的证据并标成
+  `unattainable_on_grid`，不能把低 recall 点直接与达到目标的方法比较。
+- 每个 binary/system 都记录源码 tag/commit、`vector.so` 或 container image
+  digest、索引 relfilenode/参数、数据与 GT SHA。切换 binary 后必须重启并由
+  server-side digest gate 验证，实验结束恢复原 binary。
+- 预过滤系统的 filter materialization 与 ANN search 分开计时，同时报告完整
+  end-to-end；cached allow-list 只能作为额外分解，不能替代完整成本。
+
+### SQL-native scope contract
+
+Amazon 主线除单表 predicates 外，必须包含同一批 q200 query 与 14 个 filters
+上的三类真实 PostgreSQL workload：`acl_only`、
+`grant_temporal_selectivity`、`fact_temporal_selectivity`。三者都在一次 SQL
+statement 中执行 vector ORDER BY、review fact/product dimension/principal grant
+joins 和 PostgreSQL RLS；后两者分别增加 grant validity 与 source review
+timestamp validity。所有结果使用独立生成的 exact SQL-valid top-10；不能先在
+Python 中算出 allow-list 再把它称为一次 SQL-native hybrid query。
+
+### Design claim gates
+
+- D1 分成 `safe_guided`（只减少 candidate admission/final validation）与
+  `traversal_guided`（在 neighbor distance computation 前使用经 planner proof
+  绑定的安全 guidance）。只有后者实际降低 expanded nodes 或 distance
+  computations 时，论文才使用 “filter-aware traversal” 表述。
+- D2 必须是同一确定性 HNSW graph 的物理 index-page 重排。验证 top-k、距离、
+  visited counters 与 recall 相同后，单独报告 index page reads/runs、buffer
+  hit/miss、prefetch 命中以及 build/storage overhead。
+- D3 必须从空 cache 开始，使用 q10k 在线请求 trace 展示 admission、materialize、
+  reuse、eviction、phase shift、稳定 break-even 和 p95/p99；15 个预构建 fragment
+  只能作为 eager control，不能作为 online adaptation 证据。
 
 ## 统一报告标准
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import statistics
 import subprocess
 import time
@@ -18,6 +19,18 @@ from prepare_laion25m_pgvector import INDEX, QUERY_TABLE, TABLE
 
 
 METHODS = ["stock", "d1", "d1_d2", "d1_d2_d3"]
+SQLENS_V11_BUILD_PREFIX = "sqlens-v11-"
+SQLENS_MIN_PROFILE_SEMANTICS = 4.0
+SQLENS_PROFILE_FIELDS = (
+    "graph_elements_visited",
+    "raw_index_tids_returned",
+    "hnsw_am_callback_ms",
+    "executor_residual_ms",
+)
+
+
+class SqlensProvenanceGateError(RuntimeError):
+    """Raised when the formal runner is not connected to the required SQLens ABI."""
 
 
 def timed_ms(fn):
@@ -43,10 +56,71 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def require_sqlens_provenance(cur: psycopg.Cursor) -> tuple[str, dict[str, Any]]:
+    """Verify the loaded SQLens ABI before installing any C-backed SQL wrappers."""
+    try:
+        cur.execute("SELECT vector_sqlens_build_id()")
+        row = cur.fetchone()
+        build_id = str(row[0]) if row and row[0] is not None else ""
+    except Exception as exc:  # noqa: BLE001 - the gate must turn missing SQL into an actionable failure
+        raise SqlensProvenanceGateError(
+            "SQLens v11 provenance gate failed: vector_sqlens_build_id() is unavailable. "
+            "Install/reload the SQLens v11 extension (and reconnect) before running this formal benchmark."
+        ) from exc
+    if not build_id.startswith(SQLENS_V11_BUILD_PREFIX):
+        raise SqlensProvenanceGateError(
+            f"SQLens v11 provenance gate failed: vector_sqlens_build_id() returned {build_id!r}; "
+            f"expected the {SQLENS_V11_BUILD_PREFIX!r} prefix. "
+            "Rebuild/reload the SQLens v11 extension and reconnect before running this formal benchmark."
+        )
+
+    try:
+        cur.execute("SELECT vector_hnsw_last_scan_profile()")
+        row = cur.fetchone()
+        raw_profile = row[0] if row else None
+        profile = json.loads(raw_profile) if isinstance(raw_profile, str) else dict(raw_profile)
+    except Exception as exc:  # noqa: BLE001 - profile absence/ABI errors must fail closed
+        raise SqlensProvenanceGateError(
+            "SQLens v11 provenance gate failed: vector_hnsw_last_scan_profile() is unavailable or is not valid JSON. "
+            "Load the SQLens v11 extension and reconnect before running this formal benchmark."
+        ) from exc
+    if not isinstance(profile, dict):
+        raise SqlensProvenanceGateError(
+            "SQLens v11 provenance gate failed: vector_hnsw_last_scan_profile() did not return a JSON object. "
+            "Load the SQLens v11 extension and reconnect before running this formal benchmark."
+        )
+    try:
+        profile_version = float(profile["profile_semantics_version"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SqlensProvenanceGateError(
+            "SQLens v11 provenance gate failed: vector_hnsw_last_scan_profile() is missing a numeric "
+            "profile_semantics_version. Load the SQLens v11 extension and reconnect."
+        ) from exc
+    missing = [field for field in SQLENS_PROFILE_FIELDS if field not in profile]
+    if not math.isfinite(profile_version) or profile_version < SQLENS_MIN_PROFILE_SEMANTICS or missing:
+        details = []
+        if not math.isfinite(profile_version) or profile_version < SQLENS_MIN_PROFILE_SEMANTICS:
+            details.append(
+                f"profile_semantics_version={profile.get('profile_semantics_version')!r} "
+                f"(need >= {SQLENS_MIN_PROFILE_SEMANTICS:g})"
+            )
+        if missing:
+            details.append(f"missing fields={missing!r}")
+        raise SqlensProvenanceGateError(
+            "SQLens v11 provenance gate failed: vector_hnsw_last_scan_profile() is incompatible: "
+            + "; ".join(details)
+            + ". Load the SQLens v11 extension and reconnect before running this formal benchmark."
+        )
+    return build_id, profile
+
+
 def ensure_functions(cur: psycopg.Cursor) -> None:
+    require_sqlens_provenance(cur)
     functions = [
         "CREATE OR REPLACE FUNCTION vector_hnsw_guidance_activate(regclass, text[], text) "
         "RETURNS int4 AS 'vector' LANGUAGE C VOLATILE PARALLEL UNSAFE",
+        "CREATE OR REPLACE FUNCTION vector_hnsw_guidance_bind(regclass, text[], text) "
+        "RETURNS boolean AS 'vector' LANGUAGE C VOLATILE PARALLEL UNSAFE",
         "CREATE OR REPLACE FUNCTION vector_hnsw_guidance_reset() "
         "RETURNS void AS 'vector' LANGUAGE C VOLATILE PARALLEL SAFE",
         "CREATE OR REPLACE FUNCTION vector_hnsw_fragment_epoch_bump_trigger() "
@@ -191,6 +265,14 @@ def method_uses_d2(method: str) -> bool:
     return method in {"d1_d2", "d1_d2_d3"}
 
 
+def guidance_kind(args: argparse.Namespace, method: str) -> str:
+    return "adaptive" if method == "d1_d2_d3" else args.guidance_kind
+
+
+def warmup_enabled(args: argparse.Namespace, method: str) -> bool:
+    return bool(args.warmup_all_queries) and method != "d1_d2_d3"
+
+
 def configure(cur: psycopg.Cursor, args: argparse.Namespace, method: str) -> None:
     cur.execute("SET jit = off")
     cur.execute(f"SET statement_timeout = {int(args.statement_timeout_ms)}")
@@ -213,7 +295,7 @@ def configure(cur: psycopg.Cursor, args: argparse.Namespace, method: str) -> Non
     cur.execute(f"SET hnsw.page_window = {int(args.d2_page_window)}")
     cur.execute(f"SET hnsw.page_prefetch_min_items = {int(args.d2_page_prefetch_min_items)}")
     cur.execute(f"SET hnsw.page_disable_after_no_merge = {int(args.d2_page_disable_after_no_merge)}")
-    cur.execute(f"SET hnsw.filter_strategy = {'off' if method == 'stock' else 'guided_collect'}")
+    cur.execute(f"SET hnsw.filter_strategy = {'off' if method == 'stock' else args.guidance_filter_strategy}")
     if args.force_hnsw:
         cur.execute("SET enable_sort = off")
 
@@ -230,7 +312,7 @@ def activate_guidance(cur: psycopg.Cursor, args: argparse.Namespace, method: str
     if method == "stock":
         cur.execute("SET hnsw.filter_strategy = off")
         return {"guidance_enabled": False, "guidance_route": "stock", "table": table, "index": index}, 0.0
-    enabled, route = should_enable_guidance(args, row, method)
+    enabled, route = (True, "enabled") if method == "d1_d2_d3" else should_enable_guidance(args, row, method)
     if not enabled:
         cur.execute("SET hnsw.filter_strategy = off")
         return {
@@ -242,114 +324,134 @@ def activate_guidance(cur: psycopg.Cursor, args: argparse.Namespace, method: str
             "d3_guard_can_compose_exact_or": False,
             "d3_guard_disabled_after_activation": False,
         }, 0.0
-    cur.execute("SET hnsw.filter_strategy = guided_collect")
+    cur.execute(f"SET hnsw.filter_strategy = {args.guidance_filter_strategy}")
     atoms = guidance_atoms(row)
     can_compose_exact_or = guidance_can_compose_exact_or(atoms)
     predicted_skip = predicted_skip_rate(row)
-    if (
-        method == "d1_d2_d3"
-        and args.d3_enable_policy == "compose_or_skip"
-        and predicted_skip < float(args.d3_min_predicted_skip_rate)
-        and not can_compose_exact_or
-    ):
-        cur.execute("SET hnsw.filter_strategy = off")
-        return {
-            "guidance_enabled": False,
-            "guidance_route": f"d3_guard_predicted_skip<{args.d3_min_predicted_skip_rate:g}",
-            "table": table,
-            "index": index,
-            "predicted_skip_rate": predicted_skip,
-            "d3_guard_can_compose_exact_or": can_compose_exact_or,
-            "d3_guard_disabled_after_activation": False,
-        }, 0.0
-
     def run():
         cur.execute(
             "SELECT vector_hnsw_guidance_activate(%s::regclass, %s::text[], %s)",
-            (index, atoms, args.guidance_kind),
+            (index, atoms, guidance_kind(args, method)),
         )
-        return fetch_json(cur, "SELECT vector_hnsw_guidance_profile()")
+        activation_row = cur.fetchone()
+        activated_atoms = int(activation_row[0]) if activation_row and activation_row[0] is not None else 0
+        return fetch_json(cur, "SELECT vector_hnsw_guidance_profile()"), activated_atoms
 
-    profile, elapsed_ms = timed_ms(run)
-    guidance_enabled = True
-    if method == "d1_d2_d3" and args.d3_enable_policy == "compose_or_skip":
-        composed_exact_active = bool(profile.get("composed_exact_active", False))
-        if not composed_exact_active and predicted_skip < float(args.d3_min_predicted_skip_rate):
-            cur.execute("SELECT vector_hnsw_guidance_reset()")
-            cur.execute("SET hnsw.filter_strategy = off")
-            guidance_enabled = False
-            profile["guidance_route"] = f"d3_guard_no_composed_exact_and_predicted_skip<{args.d3_min_predicted_skip_rate:g}"
-            profile["d3_guard_disabled_after_activation"] = True
-    profile["guidance_enabled"] = guidance_enabled
-    profile.setdefault("guidance_route", route)
+    (profile, activated_atoms), elapsed_ms = timed_ms(run)
+    profile["activation_atom_count"] = activated_atoms
+    if method == "d1_d2_d3" and (activated_atoms <= 0 or not bool(profile.get("active", False))):
+        cur.execute("SET hnsw.filter_strategy = off")
+        profile["guidance_enabled"] = False
+        profile["guidance_route"] = "d3_probe"
+    else:
+        profile["guidance_enabled"] = True
+        profile["guidance_route"] = route
     profile["table"] = table
     profile["index"] = index
     profile["predicted_skip_rate"] = predicted_skip
     profile["d3_guard_can_compose_exact_or"] = can_compose_exact_or
-    profile.setdefault("d3_guard_disabled_after_activation", False)
+    profile["d3_guard_disabled_after_activation"] = False
     return profile, elapsed_ms
 
 
-def d3_guidance_signature(args: argparse.Namespace, method: str, row: dict[str, Any]) -> tuple[str, str, tuple[str, ...]] | None:
-    if method != "d1_d2_d3" or not args.d3_reuse_active_guidance:
-        return None
-    enabled, _ = should_enable_guidance(args, row, method)
-    if not enabled:
-        return None
-    table, index = method_table_index(args, method)
-    return table, index, tuple(guidance_atoms(row))
-
-
-def reuse_activation_profile(args: argparse.Namespace, method: str, row: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
-    table, index = method_table_index(args, method)
-    reused = dict(profile)
-    reused["table"] = table
-    reused["index"] = index
-    reused["guidance_enabled"] = True
-    reused["guidance_route"] = "d3_reuse_active_guidance"
-    reused["d3_active_guidance_reused"] = True
-    reused.setdefault("predicted_skip_rate", predicted_skip_rate(row))
-    return reused
-
-
-def prewarm_d3(cur: psycopg.Cursor, args: argparse.Namespace, selected: list[dict[str, Any]]) -> None:
-    if not args.prewarm_d3:
-        return
-    seen: set[tuple[str, ...]] = set()
-    cur.execute("SELECT vector_hnsw_metadata_cache_reset()")
-    configure(cur, args, "d1_d2_d3")
-    for row in selected:
-        if not should_enable_guidance(args, row, "d1_d2_d3")[0]:
-            continue
-        key = tuple(guidance_atoms(row))
-        if key in seen:
-            continue
-        seen.add(key)
-        activate_guidance(cur, args, "d1_d2_d3", row)
+def reset_after_plan_gate(cur: psycopg.Cursor, args: argparse.Namespace, method: str) -> None:
+    """Discard gate state so adaptive admission starts with the measured workload."""
     cur.execute("SELECT vector_hnsw_guidance_reset()")
-    print(f"prewarmed D3 guidance for {len(seen)} unique filters", flush=True)
+    cur.execute("SELECT vector_hnsw_metadata_cache_reset()")
+    configure(cur, args, method)
 
 
-def run_query(cur: psycopg.Cursor, args: argparse.Namespace, method: str, row: dict[str, Any]) -> tuple[list[int], float, dict[str, Any], str]:
+def plan_index_nodes(value: Any) -> list[dict[str, Any]]:
+    nodes: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        if "Index Name" in value:
+            nodes.append(value)
+        for child in value.values():
+            nodes.extend(plan_index_nodes(child))
+    elif isinstance(value, list):
+        for child in value:
+            nodes.extend(plan_index_nodes(child))
+    return nodes
+
+
+def gate_method_plan(cur: psycopg.Cursor, args: argparse.Namespace, method: str, row: dict[str, Any]) -> bool:
+    """Prove the expected HNSW index once, then reset before workload execution."""
+    try:
+        activation_profile, _ = activate_guidance(cur, args, method, row)
+        sql, params = build_hybrid_query(args, method, row, activation_profile)
+        cur.execute("EXPLAIN (FORMAT JSON, VERBOSE) " + sql, params)
+        plan = cur.fetchone()[0]
+        if isinstance(plan, str):
+            plan = json.loads(plan)
+        _, expected_index = method_table_index(args, method)
+        expected_name = expected_index.rsplit(".", 1)[-1]
+        return any(
+            node.get("Node Type") in {"Index Scan", "Index Only Scan"}
+            and node.get("Index Name") == expected_name
+            for node in plan_index_nodes(plan)
+        )
+    finally:
+        reset_after_plan_gate(cur, args, method)
+
+
+def build_hybrid_query(
+    args: argparse.Namespace,
+    method: str,
+    row: dict[str, Any],
+    activation_profile: dict[str, Any],
+) -> tuple[str, tuple[Any, ...]]:
     table, _ = method_table_index(args, method)
-    cur.execute("SELECT vector_hnsw_reset_scan_profile()")
-
-    def execute():
-        cur.execute(
-            f"""
+    binding = ""
+    params: tuple[Any, ...] = ()
+    if activation_profile.get("guidance_enabled") is True:
+        index = str(activation_profile.get("index") or method_table_index(args, method)[1])
+        params = (index, guidance_atoms(row), guidance_kind(args, method))
+        binding = "(SELECT vector_hnsw_guidance_bind(%s::regclass, %s::text[], %s) OFFSET 0) AND "
+    params += (int(row["qid"]),)
+    return (
+        f"""
             SELECT id
             FROM {table}
-            WHERE {row["predicate"]}
+            WHERE {binding}({row["predicate"]})
             ORDER BY embedding <-> (SELECT embedding FROM {args.query_table} WHERE qid = %s)
             LIMIT {int(args.k)}
             """,
-            (int(row["qid"]),),
-        )
+        params,
+    )
+
+
+def guidance_scan_contract_satisfied(profile: dict[str, Any], strategy: str) -> bool:
+    if int(profile.get("guidance_checks", 0) or 0) <= 0:
+        return False
+    return strategy != "guided_collect" or int(
+        profile.get("traversal_guidance_checks", 0) or 0
+    ) > 0
+
+
+def run_query(
+    cur: psycopg.Cursor,
+    args: argparse.Namespace,
+    method: str,
+    row: dict[str, Any],
+    activation_profile: dict[str, Any] | None = None,
+) -> tuple[list[int], float, dict[str, Any], str]:
+    activation_profile = activation_profile or {}
+    cur.execute("SELECT vector_hnsw_reset_scan_profile()")
+
+    def execute():
+        sql, params = build_hybrid_query(args, method, row, activation_profile)
+        cur.execute(sql, params)
         return [int(x[0]) for x in cur.fetchall()]
 
     try:
         ids, latency_ms = timed_ms(execute)
-        return ids, latency_ms, fetch_json(cur, "SELECT vector_hnsw_last_scan_profile()"), ""
+        profile = fetch_json(cur, "SELECT vector_hnsw_last_scan_profile()")
+        error = ""
+        if activation_profile.get("guidance_enabled") is True and not guidance_scan_contract_satisfied(
+            profile, args.guidance_filter_strategy
+        ):
+            error = "GuidanceBindingInactive"
+        return ids, latency_ms, profile, error
     except errors.QueryCanceled as exc:
         cur.connection.rollback()
         configure(cur, args, method)
@@ -400,6 +502,23 @@ def summarize(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "visited_tuples_mean": statistics.fmean(vals("visited_tuples")),
                 "returned_tuples_mean": statistics.fmean(vals("returned_tuples")),
                 "distance_compute_count_mean": statistics.fmean(vals("distance_compute_count")),
+                "traversal_expanded_nodes_mean": statistics.fmean(vals("traversal_expanded_nodes")),
+                "traversal_neighbors_examined_mean": statistics.fmean(vals("traversal_neighbors_examined")),
+                "traversal_guidance_checks_mean": statistics.fmean(vals("traversal_guidance_checks")),
+                "traversal_guidance_matches_mean": statistics.fmean(vals("traversal_guidance_matches")),
+                "traversal_matching_expanded_mean": statistics.fmean(vals("traversal_matching_expanded")),
+                "traversal_bridge_expanded_mean": statistics.fmean(vals("traversal_bridge_expanded")),
+                "traversal_candidate_admissions_mean": statistics.fmean(vals("traversal_candidate_admissions")),
+                "traversal_result_admissions_mean": statistics.fmean(vals("traversal_result_admissions")),
+                "traversal_guided_admissions_mean": statistics.fmean(vals("traversal_guided_admissions")),
+                "traversal_guided_suppressions_mean": statistics.fmean(vals("traversal_guided_suppressions")),
+                "traversal_heap_tids_suppressed_mean": statistics.fmean(vals("traversal_heap_tids_suppressed")),
+                "traversal_stop_deferrals_mean": statistics.fmean(vals("traversal_stop_deferrals")),
+                "traversal_discarded_pushes_mean": statistics.fmean(vals("traversal_discarded_pushes")),
+                "traversal_discarded_pops_mean": statistics.fmean(vals("traversal_discarded_pops")),
+                "traversal_initial_batches_mean": statistics.fmean(vals("traversal_initial_batches")),
+                "traversal_resume_batches_mean": statistics.fmean(vals("traversal_resume_batches")),
+                "traversal_strict_order_drops_mean": statistics.fmean(vals("traversal_strict_order_drops")),
                 "idx_blks_hit_mean": statistics.fmean(vals("idx_blks_hit")),
                 "idx_blks_read_mean": statistics.fmean(vals("idx_blks_read")),
                 "heap_blks_hit_mean": statistics.fmean(vals("heap_blks_hit")),
@@ -443,6 +562,7 @@ def main() -> None:
     parser.add_argument("--d1-cache-mb", type=int, default=4096)
     parser.add_argument("--d3-cache-mb", type=int, default=4096)
     parser.add_argument("--guidance-kind", default="exact", choices=["exact", "page", "bloom"])
+    parser.add_argument("--guidance-filter-strategy", default="guided_collect", choices=["safe_guided", "guided_collect", "acorn1"])
     parser.add_argument("--guidance-compose-exact-or", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--require-compose-exact-guc",
@@ -450,7 +570,12 @@ def main() -> None:
         default=False,
         help="Fail if the loaded pgvector library does not expose hnsw.guidance_compose_exact_or.",
     )
-    parser.add_argument("--d3-reuse-active-guidance", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--d3-reuse-active-guidance",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Deprecated no-op: D3 activates workload-driven adaptive guidance for every request.",
+    )
     parser.add_argument(
         "--d3-enable-policy",
         default="legacy",
@@ -461,7 +586,7 @@ def main() -> None:
     parser.add_argument(
         "--guidance-selectivity-max-pct",
         type=float,
-        default=10.0,
+        default=50.0,
         help="Disable predicate guidance above this actual filter percentage; D1+D2 then runs as D2-only.",
     )
     parser.add_argument(
@@ -478,7 +603,12 @@ def main() -> None:
     )
     parser.add_argument("--statement-timeout-ms", type=int, default=300000)
     parser.add_argument("--force-hnsw", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--prewarm-d3", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--prewarm-d3",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Deprecated no-op: D3 never prebuilds guidance fragments.",
+    )
     parser.add_argument(
         "--warmup-all-queries",
         action=argparse.BooleanOptionalAction,
@@ -501,7 +631,9 @@ def main() -> None:
         ensure_tracking(cur, args.table, args.bfs_table)
         pin_backend(cur, args.backend_cpu_list)
         if "d1_d2_d3" in args.methods:
-            prewarm_d3(cur, args, selected)
+            # Tracking creates only descriptors; adaptive fragments are workload-driven.
+            cur.execute("SELECT vector_hnsw_guidance_reset()")
+            cur.execute("SELECT vector_hnsw_metadata_cache_reset()")
         with args.out.open("w", newline="", encoding="utf-8") as f:
             fieldnames = [
                 "method",
@@ -527,6 +659,20 @@ def main() -> None:
                 "d3_guard_can_compose_exact_or",
                 "d3_guard_disabled_after_activation",
                 "d3_active_guidance_reused",
+                "d3_initialization",
+                "prebuilt_fragments",
+                "planner_proof_verified",
+                "guidance_scan_verified",
+                "activation_atom_count",
+                "adaptive_active",
+                "adaptive_probes",
+                "adaptive_admissions",
+                "adaptive_page_builds",
+                "adaptive_bloom_builds",
+                "adaptive_refinements",
+                "adaptive_rejections",
+                "adaptive_bytes",
+                "adaptive_score",
                 "table",
                 "index",
                 "fragment_cache_hits",
@@ -553,6 +699,24 @@ def main() -> None:
                 "guidance_checks",
                 "guidance_skips",
                 "guidance_skip_rate",
+                "traversal_expanded_nodes",
+                "traversal_neighbors_examined",
+                "traversal_guidance_checks",
+                "traversal_guidance_matches",
+                "traversal_guidance_misses",
+                "traversal_matching_expanded",
+                "traversal_bridge_expanded",
+                "traversal_candidate_admissions",
+                "traversal_result_admissions",
+                "traversal_guided_admissions",
+                "traversal_guided_suppressions",
+                "traversal_heap_tids_suppressed",
+                "traversal_stop_deferrals",
+                "traversal_discarded_pushes",
+                "traversal_discarded_pops",
+                "traversal_initial_batches",
+                "traversal_resume_batches",
+                "traversal_strict_order_drops",
                 "index_page_prefetches",
                 "page_access_batches",
                 "page_access_candidates",
@@ -570,13 +734,14 @@ def main() -> None:
             writer.writeheader()
             for method in args.methods:
                 configure(cur, args, method)
-                active_signature: tuple[str, str, tuple[str, ...]] | None = None
-                active_profile: dict[str, Any] = {}
-                if args.warmup_all_queries:
+                planner_proof_verified = gate_method_plan(cur, args, method, selected[0])
+                if not planner_proof_verified:
+                    raise RuntimeError(f"HNSW plan gate failed for method={method}")
+                if warmup_enabled(args, method):
                     for qno, query in enumerate(selected, start=1):
                         try:
-                            activate_guidance(cur, args, method, query)
-                            run_query(cur, args, method, query)
+                            warmup_profile, _ = activate_guidance(cur, args, method, query)
+                            run_query(cur, args, method, query, warmup_profile)
                         except Exception:
                             try:
                                 cur.execute("ROLLBACK")
@@ -586,17 +751,12 @@ def main() -> None:
                         if args.progress_queries and qno % args.progress_queries == 0:
                             print(f"{method} warmup {qno}/{len(selected)}", flush=True)
                 for qno, query in enumerate(selected, start=1):
-                    signature = d3_guidance_signature(args, method, query)
-                    if signature is not None and signature == active_signature:
-                        activation_profile = reuse_activation_profile(args, method, query, active_profile)
-                        activation_ms = 0.0
-                    else:
-                        activation_profile, activation_ms = activate_guidance(cur, args, method, query)
-                        active_signature = signature
-                        active_profile = dict(activation_profile) if signature is not None else {}
                     expected = truth.get(truth_key(query))
                     for repeat in range(args.repeats):
-                        ids, latency_ms, scan_profile, error = run_query(cur, args, method, query)
+                        activation_profile, activation_ms = activate_guidance(cur, args, method, query)
+                        ids, latency_ms, scan_profile, error = run_query(
+                            cur, args, method, query, activation_profile
+                        )
                         try:
                             cache_profile = fetch_json(cur, "SELECT vector_hnsw_metadata_cache_profile()")
                         except Exception:
@@ -626,7 +786,24 @@ def main() -> None:
                             "predicted_skip_rate": float(activation_profile.get("predicted_skip_rate", predicted_skip_rate(query)) or 0),
                             "d3_guard_can_compose_exact_or": bool(activation_profile.get("d3_guard_can_compose_exact_or", False)),
                             "d3_guard_disabled_after_activation": bool(activation_profile.get("d3_guard_disabled_after_activation", False)),
-                            "d3_active_guidance_reused": bool(activation_profile.get("d3_active_guidance_reused", False)),
+                            "d3_active_guidance_reused": False,
+                            "d3_initialization": "workload_driven_adaptive",
+                            "prebuilt_fragments": 0,
+                            "planner_proof_verified": planner_proof_verified,
+                            "guidance_scan_verified": (
+                                not bool(activation_profile.get("guidance_enabled", False))
+                                or guidance_scan_contract_satisfied(scan_profile, args.guidance_filter_strategy)
+                            ),
+                            "activation_atom_count": int(activation_profile.get("activation_atom_count", 0) or 0),
+                            "adaptive_active": bool(activation_profile.get("active", False)),
+                            "adaptive_probes": int(activation_profile.get("adaptive_probes", 0) or 0),
+                            "adaptive_admissions": int(activation_profile.get("adaptive_admissions", 0) or 0),
+                            "adaptive_page_builds": int(activation_profile.get("adaptive_page_builds", 0) or 0),
+                            "adaptive_bloom_builds": int(activation_profile.get("adaptive_bloom_builds", 0) or 0),
+                            "adaptive_refinements": int(activation_profile.get("adaptive_refinements", 0) or 0),
+                            "adaptive_rejections": int(activation_profile.get("adaptive_rejections", 0) or 0),
+                            "adaptive_bytes": int(activation_profile.get("adaptive_bytes", cache_profile.get("adaptive_bytes", 0)) or 0),
+                            "adaptive_score": float(activation_profile.get("adaptive_score", cache_profile.get("adaptive_score", 0)) or 0),
                             "table": str(activation_profile.get("table", method_table_index(args, method)[0])),
                             "index": str(activation_profile.get("index", method_table_index(args, method)[1])),
                             "fragment_cache_hits": int(activation_profile.get("fragment_cache_hits", 0) or 0),
@@ -653,6 +830,24 @@ def main() -> None:
                             "guidance_checks": checks,
                             "guidance_skips": skips,
                             "guidance_skip_rate": skips / checks if checks else 0.0,
+                            "traversal_expanded_nodes": float(scan_profile.get("traversal_expanded_nodes", 0) or 0),
+                            "traversal_neighbors_examined": float(scan_profile.get("traversal_neighbors_examined", 0) or 0),
+                            "traversal_guidance_checks": float(scan_profile.get("traversal_guidance_checks", 0) or 0),
+                            "traversal_guidance_matches": float(scan_profile.get("traversal_guidance_matches", 0) or 0),
+                            "traversal_guidance_misses": float(scan_profile.get("traversal_guidance_misses", 0) or 0),
+                            "traversal_matching_expanded": float(scan_profile.get("traversal_matching_expanded", 0) or 0),
+                            "traversal_bridge_expanded": float(scan_profile.get("traversal_bridge_expanded", 0) or 0),
+                            "traversal_candidate_admissions": float(scan_profile.get("traversal_candidate_admissions", 0) or 0),
+                            "traversal_result_admissions": float(scan_profile.get("traversal_result_admissions", 0) or 0),
+                            "traversal_guided_admissions": float(scan_profile.get("traversal_guided_admissions", 0) or 0),
+                            "traversal_guided_suppressions": float(scan_profile.get("traversal_guided_suppressions", 0) or 0),
+                            "traversal_heap_tids_suppressed": float(scan_profile.get("traversal_heap_tids_suppressed", 0) or 0),
+                            "traversal_stop_deferrals": float(scan_profile.get("traversal_stop_deferrals", 0) or 0),
+                            "traversal_discarded_pushes": float(scan_profile.get("traversal_discarded_pushes", 0) or 0),
+                            "traversal_discarded_pops": float(scan_profile.get("traversal_discarded_pops", 0) or 0),
+                            "traversal_initial_batches": float(scan_profile.get("traversal_initial_batches", 0) or 0),
+                            "traversal_resume_batches": float(scan_profile.get("traversal_resume_batches", 0) or 0),
+                            "traversal_strict_order_drops": float(scan_profile.get("traversal_strict_order_drops", 0) or 0),
                             "index_page_prefetches": float(scan_profile.get("index_page_prefetches", 0) or 0),
                             "page_access_batches": float(scan_profile.get("page_access_batches", 0) or 0),
                             "page_access_candidates": float(scan_profile.get("page_access_candidates", 0) or 0),

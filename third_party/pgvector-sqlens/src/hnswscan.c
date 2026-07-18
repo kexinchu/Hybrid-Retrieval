@@ -25,6 +25,8 @@
  */
 static HnswScanProfile hnsw_last_profile;
 
+static Datum GetScanValue(IndexScanDesc scan);
+
 static Oid
 HnswScanHeapOid(IndexScanDesc scan)
 {
@@ -70,7 +72,7 @@ ComparePageAccessItemsByRank(const void *a, const void *b)
 }
 
 static List *
-GetScanItems(IndexScanDesc scan, Datum value)
+RunScanItems(IndexScanDesc scan, Datum value)
 {
 	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
 	Relation	index = scan->indexRelation;
@@ -100,7 +102,7 @@ GetScanItems(IndexScanDesc scan, Datum value)
 		instr_time elapsed;
 
 		INSTR_TIME_SET_CURRENT(start);
-		w = HnswSearchLayer(base, q, ep, 1, lc, index, support, m, false, NULL, NULL, NULL, true, NULL, &so->distanceComputations);
+		w = HnswSearchLayer(base, q, ep, 1, lc, index, support, m, false, NULL, NULL, NULL, true, NULL, &so->distanceComputations, &so->traversal, so->guidance, &so->traversalGuidance, &so->indexPageProfile);
 		INSTR_TIME_SET_CURRENT(elapsed);
 		INSTR_TIME_SUBTRACT(elapsed, start);
 		so->vectorSearchMs += INSTR_TIME_GET_MILLISEC(elapsed);
@@ -113,12 +115,167 @@ GetScanItems(IndexScanDesc scan, Datum value)
 		List	   *next;
 
 		INSTR_TIME_SET_CURRENT(start);
+		so->traversal.initialBatches++;
 		next = HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v,
-							   hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples, &so->distanceComputations);
+									   hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples, &so->distanceComputations, &so->traversal, so->guidance, &so->traversalGuidance, &so->indexPageProfile);
 		INSTR_TIME_SET_CURRENT(elapsed);
 		INSTR_TIME_SUBTRACT(elapsed, start);
 		so->vectorSearchMs += INSTR_TIME_GET_MILLISEC(elapsed);
 		return next;
+	}
+}
+
+static void
+HnswInitializeTraversalGuidance(HnswScanOpaque so)
+{
+	HnswTraversalGuidanceState *state = &so->traversalGuidance;
+
+	MemSet(state, 0, sizeof(*state));
+	state->finalPath = HNSW_TRAVERSAL_PATH_STOCK;
+
+	if (hnsw_filter_strategy == HNSW_FILTER_STRATEGY_SAFE_GUIDED)
+	{
+		state->finalPath = HNSW_TRAVERSAL_PATH_VALIDATION_ONLY;
+		return;
+	}
+	if (hnsw_filter_strategy == HNSW_FILTER_STRATEGY_ACORN1 ||
+		hnsw_filter_strategy == HNSW_FILTER_STRATEGY_GUIDED_COLLECT)
+	{
+		state->finalPath = HNSW_TRAVERSAL_PATH_LEGACY_GUIDED;
+		return;
+	}
+	if (hnsw_filter_strategy != HNSW_FILTER_STRATEGY_TRAVERSAL_GUIDED)
+		return;
+
+	state->requested = true;
+	/* The GUC is not a SQL LIMIT; never certify less than the layer-0 ef. */
+	state->target = Max(hnsw_traversal_guided_target, hnsw_ef_search);
+	state->maxBridgeHops = hnsw_traversal_guided_max_bridge_hops;
+	state->maxBridgeWork = hnsw_traversal_guided_max_bridge_work;
+	state->maxScanTuples = hnsw_max_scan_tuples;
+	state->maxMemory = so->maxMemory;
+	state->estimatedSkipRateValid = HnswGuidanceGetEstimatedSkipRate(
+		so->guidance, &state->estimatedSkipRate);
+
+	if (!HnswGuidanceIsActiveForScan(so->guidance))
+		state->stockBypassReason = HNSW_TRAVERSAL_BYPASS_NO_PROVEN_GUIDE;
+	else if (hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF)
+		state->stockBypassReason = HNSW_TRAVERSAL_BYPASS_ITERATIVE_SCAN;
+	else if (!state->estimatedSkipRateValid)
+		state->stockBypassReason = HNSW_TRAVERSAL_BYPASS_SKIP_ESTIMATE_UNAVAILABLE;
+	else if (state->estimatedSkipRate < hnsw_traversal_guided_min_skip_rate)
+		state->stockBypassReason = HNSW_TRAVERSAL_BYPASS_LOW_ESTIMATED_SKIP_RATE;
+	else
+	{
+		state->phaseEnabled = true;
+		state->finalPath = HNSW_TRAVERSAL_PATH_GUIDED;
+		return;
+	}
+
+	state->finalPath = HNSW_TRAVERSAL_PATH_STOCK_BYPASS;
+	so->traversal.stockBypassRequests++;
+}
+
+static HnswTraversalFallbackReason
+HnswTraversalGuidanceFallbackReason(HnswTraversalGuidanceState *state)
+{
+	if (state->invalidNeighbor)
+		return HNSW_TRAVERSAL_FALLBACK_INVALID_NEIGHBOR;
+	if (state->memoryLimitReached)
+		return HNSW_TRAVERSAL_FALLBACK_MEMORY_LIMIT;
+	if (state->maxScanReached)
+		return HNSW_TRAVERSAL_FALLBACK_MAX_SCAN_TUPLES;
+	if (state->workLimitReached)
+		return HNSW_TRAVERSAL_FALLBACK_BRIDGE_WORK;
+	if (state->hopLimitReached)
+		return HNSW_TRAVERSAL_FALLBACK_BRIDGE_HOPS;
+	return HNSW_TRAVERSAL_FALLBACK_INSUFFICIENT_MATCHES;
+}
+
+static List *
+GetScanItems(IndexScanDesc scan)
+{
+	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+	HnswTraversalGuidanceState *state = &so->traversalGuidance;
+	int64		distanceStart = so->distanceComputations;
+	int64		expandedStart = so->traversal.expandedNodes;
+	int64		avoidedStart = so->traversal.distanceComputationsAvoided;
+	List	   *items;
+
+	if (!state->phaseEnabled)
+	{
+		bool		continuingFallback =
+			state->finalPath == HNSW_TRAVERSAL_PATH_FRESH_STOCK_FALLBACK;
+
+		if (continuingFallback)
+			so->traversal.fallbackRequests++;
+		items = RunScanItems(scan, GetScanValue(scan));
+		if (state->requested)
+		{
+			int64		stockDistance = so->distanceComputations - distanceStart;
+			int64		stockExpanded =
+				so->traversal.expandedNodes - expandedStart;
+
+			so->traversal.stockPhaseDistanceComputations += stockDistance;
+			so->traversal.stockPhaseExpandedNodes += stockExpanded;
+			if (continuingFallback)
+			{
+				so->traversal.fallbackStockDistanceComputations += stockDistance;
+				so->traversal.fallbackStockExpandedNodes += stockExpanded;
+			}
+		}
+		return items;
+	}
+
+	{
+		MemoryContext guidedContext;
+		MemoryContext oldContext;
+		bool		guidedUsable;
+
+		guidedContext = AllocSetContextCreate(so->tmpCtx,
+			"HNSW traversal-guided attempt", ALLOCSET_DEFAULT_SIZES);
+		state->phaseContext = guidedContext;
+		oldContext = MemoryContextSwitchTo(guidedContext);
+		items = RunScanItems(scan, GetScanValue(scan));
+		MemoryContextSwitchTo(oldContext);
+
+		so->traversal.guidedPhaseDistanceComputations +=
+			so->distanceComputations - distanceStart;
+		guidedUsable = state->guidedResultCount >= state->target &&
+			!state->maxScanReached && !state->memoryLimitReached &&
+			!state->invalidNeighbor && !state->workLimitReached &&
+			!state->hopLimitReached;
+		if (guidedUsable)
+			return items;
+
+		state->fallbackReason = HnswTraversalGuidanceFallbackReason(state);
+		state->finalPath = HNSW_TRAVERSAL_PATH_FRESH_STOCK_FALLBACK;
+		state->phaseEnabled = false;
+		state->phaseContext = NULL;
+		so->traversal.fallbackRequests++;
+		/* Abandoned pre-distance skips are attempted work, not net savings. */
+		so->traversal.distanceComputationsAvoided = avoidedStart;
+		so->abandonedGuidedTuples += so->tuples;
+		so->tuples = 0;
+
+		MemoryContextDelete(guidedContext);
+		so->w = NIL;
+		MemSet(&so->v, 0, sizeof(so->v));
+		so->discarded = NULL;
+		MemSet(&so->q, 0, sizeof(so->q));
+
+		distanceStart = so->distanceComputations;
+		expandedStart = so->traversal.expandedNodes;
+		items = RunScanItems(scan, GetScanValue(scan));
+		so->traversal.stockPhaseDistanceComputations +=
+			so->distanceComputations - distanceStart;
+		so->traversal.stockPhaseExpandedNodes +=
+			so->traversal.expandedNodes - expandedStart;
+		so->traversal.fallbackStockDistanceComputations +=
+			so->distanceComputations - distanceStart;
+		so->traversal.fallbackStockExpandedNodes +=
+			so->traversal.expandedNodes - expandedStart;
+		return items;
 	}
 }
 
@@ -146,6 +303,7 @@ ResumeScanItems(IndexScanDesc scan)
 			break;
 
 		sc = HnswGetSearchCandidate(w_node, pairingheap_remove_first(so->discarded));
+		so->traversal.discardedPops++;
 
 		ep = lappend(ep, sc);
 	}
@@ -156,8 +314,9 @@ ResumeScanItems(IndexScanDesc scan)
 		List	   *next;
 
 		INSTR_TIME_SET_CURRENT(start);
+		so->traversal.resumeBatches++;
 		next = HnswSearchLayer(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, false, NULL, &so->v, &so->discarded, false,
-							  &so->tuples, &so->distanceComputations);
+									  &so->tuples, &so->distanceComputations, &so->traversal, so->guidance, &so->traversalGuidance, &so->indexPageProfile);
 		INSTR_TIME_SET_CURRENT(elapsed);
 		INSTR_TIME_SUBTRACT(elapsed, start);
 		so->vectorSearchMs += INSTR_TIME_GET_MILLISEC(elapsed);
@@ -184,6 +343,7 @@ HnswResetScanProfile(void)
 	hnsw_last_profile.guidanceChecks = 0;
 	hnsw_last_profile.guidanceMatches = 0;
 	hnsw_last_profile.guidanceSkips = 0;
+	MemSet(&hnsw_last_profile.traversal, 0, sizeof(HnswTraversalProfile));
 	hnsw_last_profile.indexPageNeighborLoads = 0;
 	hnsw_last_profile.indexPageNeighborRuns = 0;
 	hnsw_last_profile.indexPageNeighborDistinctPages = 0;
@@ -191,6 +351,7 @@ HnswResetScanProfile(void)
 	hnsw_last_profile.indexPageElementRuns = 0;
 	hnsw_last_profile.indexPageElementDistinctPages = 0;
 	hnsw_last_profile.indexPagePrefetches = 0;
+	hnsw_last_profile.indexPageDistinctCountsExact = true;
 	hnsw_last_profile.blksHitBefore = 0;
 	hnsw_last_profile.blksHitAfter = 0;
 	hnsw_last_profile.blksReadBefore = 0;
@@ -200,7 +361,18 @@ HnswResetScanProfile(void)
 	hnsw_last_profile.heapBlksHit = 0;
 	hnsw_last_profile.heapBlksRead = 0;
 	hnsw_last_profile.topkTidCount = 0;
-	HnswResetIndexPageProfile();
+	MemSet(&hnsw_last_profile.plannerProof, 0,
+		   sizeof(hnsw_last_profile.plannerProof));
+	hnsw_last_profile.plannerProof.bypassReason = HNSW_PROOF_BYPASS_SCAN_NOT_STARTED;
+	hnsw_last_profile.traversalFinalPath = HNSW_TRAVERSAL_PATH_STOCK;
+	hnsw_last_profile.traversalStockBypassReason = HNSW_TRAVERSAL_BYPASS_NONE;
+	hnsw_last_profile.traversalFallbackReason = HNSW_TRAVERSAL_FALLBACK_NONE;
+	hnsw_last_profile.traversalEstimatedSkipRateValid = false;
+	hnsw_last_profile.traversalEstimatedSkipRate = 0;
+	hnsw_last_profile.plannerProofCount = 0;
+	hnsw_last_profile.plannerProofsTruncated = false;
+	MemSet(hnsw_last_profile.plannerProofs, 0,
+		   sizeof(hnsw_last_profile.plannerProofs));
 }
 
 void
@@ -268,6 +440,7 @@ HnswGetNextHeapTid(IndexScanDesc scan, ItemPointerData *heaptid, double *distanc
 
 				/* Return remaining tuples */
 				so->w = lappend(so->w, HnswGetSearchCandidate(w_node, pairingheap_remove_first(so->discarded)));
+				so->traversal.discardedPops++;
 			}
 			else
 			{
@@ -318,7 +491,10 @@ HnswGetNextHeapTid(IndexScanDesc scan, ItemPointerData *heaptid, double *distanc
 		if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_STRICT)
 		{
 			if (sc->distance < so->previousDistance)
+			{
+				so->traversal.strictOrderDrops++;
 				continue;
+			}
 
 			so->previousDistance = sc->distance;
 		}
@@ -328,6 +504,16 @@ HnswGetNextHeapTid(IndexScanDesc scan, ItemPointerData *heaptid, double *distanc
 			*distance = sc->distance;
 		return true;
 	}
+}
+
+static bool
+HnswScanUsesGuidanceValidation(HnswScanOpaque so)
+{
+	if (so->traversalGuidance.requested)
+		return so->traversalGuidance.finalPath == HNSW_TRAVERSAL_PATH_GUIDED &&
+			HnswGuidanceIsActiveForScan(so->guidance);
+
+	return HnswGuidanceIsActiveForScan(so->guidance);
 }
 
 static bool
@@ -373,16 +559,21 @@ HnswFillPageAccessBuffer(IndexScanDesc scan, int pageAccessMode)
 		rawPulls++;
 
 		item->guidanceChecked = false;
-		if (HnswGuidanceIsActiveForHeap(HnswScanHeapOid(scan)))
+		if (HnswScanUsesGuidanceValidation(so))
 		{
 			item->guidanceChecked = true;
 			so->guidanceChecks++;
-			if (!HnswGuidanceAllowsTid(&item->heaptid))
+			so->traversal.guidanceChecks++;
+			if (!HnswGuidanceAllowsTid(so->guidance, &item->heaptid))
 			{
 				so->guidanceSkips++;
+				so->traversal.guidanceMisses++;
+				so->traversal.guidedSuppressions++;
+				so->traversal.heapTidsSuppressed++;
 				continue;
 			}
 			so->guidanceMatches++;
+			so->traversal.guidanceMatches++;
 		}
 
 		item->rank = so->pageItemCount;
@@ -491,29 +682,43 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 	 * tuples for iterative search before exceeding work_mem
 	 */
 	so->tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
-									   "Hnsw scan temporary context",
-									   0, 8 * 1024, 256 * 1024);
+										   "Hnsw scan temporary context",
+										   0, 8 * 1024, 256 * 1024);
+	HnswInitIndexPageProfile(&so->indexPageProfile, so->tmpCtx);
 	so->pageItems = NULL;
 	so->pageItemCount = 0;
 	so->pageItemIndex = 0;
 	so->pageItemCapacity = 0;
 	so->pageAccessBatches = 0;
 	so->pageAccessCandidates = 0;
-		so->pageAccessPrefetches = 0;
-		so->pageAccessDistanceRuns = 0;
-		so->pageAccessDistinctPages = 0;
-		so->pageAccessNoMergeBatches = 0;
-		so->pageAccessDisabled = false;
-		so->guidanceChecks = 0;
-		so->guidanceMatches = 0;
-		so->guidanceSkips = 0;
+	so->pageAccessPrefetches = 0;
+	so->pageAccessDistanceRuns = 0;
+	so->pageAccessDistinctPages = 0;
+	so->pageAccessNoMergeBatches = 0;
+	so->pageAccessDisabled = false;
+	so->guidanceChecks = 0;
+	so->guidanceMatches = 0;
+	so->guidanceSkips = 0;
+	MemSet(&so->traversal, 0, sizeof(HnswTraversalProfile));
+	so->guidancePlan = NULL;
+	so->guidance = NULL;
+	so->guidanceDecided = false;
+	MemSet(&so->plannerProof, 0, sizeof(so->plannerProof));
+	MemSet(&so->traversalGuidance, 0, sizeof(so->traversalGuidance));
+	so->traversalGuidance.finalPath = HNSW_TRAVERSAL_PATH_STOCK;
+	so->abandonedGuidedTuples = 0;
+	so->plannerProof.bypassReason = HNSW_PROOF_BYPASS_SCAN_NOT_STARTED;
+	so->plannerProof.indexOid = RelationGetRelid(index);
+	so->plannerProof.heapOid = index->rd_index != NULL ?
+		index->rd_index->indrelid : InvalidOid;
 
-		/* Calculate max memory */
+	/* Calculate max memory */
 	/* Add 256 extra bytes to fill last block when close */
 	maxMemory = (double) work_mem * hnsw_scan_mem_multiplier * 1024.0 + 256;
 	so->maxMemory = Min(maxMemory, (double) SIZE_MAX);
 
 	scan->opaque = so;
+	HnswGuidanceAttachCurrentPlan(scan);
 
 	return scan;
 }
@@ -543,6 +748,7 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	so->topkTidCount = 0;
 	so->previousDistance = -get_float8_infinity();
 	MemoryContextReset(so->tmpCtx);
+	HnswInitIndexPageProfile(&so->indexPageProfile, so->tmpCtx);
 	so->pageItems = NULL;
 	so->pageItemCount = 0;
 	so->pageItemIndex = 0;
@@ -557,6 +763,18 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	so->guidanceChecks = 0;
 	so->guidanceMatches = 0;
 	so->guidanceSkips = 0;
+	MemSet(&so->traversal, 0, sizeof(HnswTraversalProfile));
+	so->abandonedGuidedTuples = 0;
+	so->traversalGuidance.phaseContext = NULL;
+	so->traversalGuidance.bridgeWork = 0;
+	so->traversalGuidance.hopLimitReached = false;
+	so->traversalGuidance.workLimitReached = false;
+	so->traversalGuidance.maxScanReached = false;
+	so->traversalGuidance.memoryLimitReached = false;
+	so->traversalGuidance.invalidNeighbor = false;
+	so->traversalGuidance.guidedResultCount = 0;
+	so->traversalGuidance.phaseEnabled =
+		so->traversalGuidance.finalPath == HNSW_TRAVERSAL_PATH_GUIDED;
 	HnswResetScanProfile();
 
 	if (keys && scan->numberOfKeys > 0)
@@ -584,7 +802,7 @@ bool
 hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 {
 	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
-	MemoryContext oldCtx = MemoryContextSwitchTo(so->tmpCtx);
+	MemoryContext oldCtx;
 	int64		entryBlksHit = pgBufferUsage.shared_blks_hit;
 	int64		entryBlksRead = pgBufferUsage.shared_blks_read;
 	instr_time	entryTime;
@@ -597,13 +815,19 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 	 */
 	Assert(ScanDirectionIsForward(dir));
 
+	if (so->first && !so->guidanceDecided)
+	{
+		/* This decision is final for the lifetime of this IndexScanDesc. */
+		so->guidanceDecided = true;
+		so->guidance = HnswGuidancePrepareForScan(scan, so->guidancePlan,
+											 &so->plannerProof);
+		HnswInitializeTraversalGuidance(so);
+	}
+
+	oldCtx = MemoryContextSwitchTo(so->tmpCtx);
+
 	if (so->first)
 	{
-		Datum		value;
-
-		/* Disable stale hard-pruning state before graph traversal starts. */
-		(void) HnswGuidancePrepareForScan(HnswScanHeapOid(scan));
-
 		/* Count index scan for stats */
 		pgstat_count_index_scan(scan->indexRelation);
 #if PG_VERSION_NUM >= 180000
@@ -620,16 +844,13 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		if (!IsMVCCSnapshot(scan->xs_snapshot))
 			elog(ERROR, "non-MVCC snapshots are not supported with hnsw");
 
-		/* Get scan value */
-		value = GetScanValue(scan);
-
 		/*
 		 * Get a shared lock. This allows vacuum to ensure no in-flight scans
 		 * before marking tuples as deleted.
 		 */
 		LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
 
-		so->w = GetScanItems(scan, value);
+		so->w = GetScanItems(scan);
 
 		/* Release shared lock */
 		UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
@@ -649,7 +870,9 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 
 		CHECK_FOR_INTERRUPTS();
 
-		if (pageAccessMode == HNSW_PAGE_ACCESS_REORDER && hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_STRICT)
+		if (pageAccessMode == HNSW_PAGE_ACCESS_REORDER &&
+			(so->traversalGuidance.requested ||
+			 hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_STRICT))
 			pageAccessMode = HNSW_PAGE_ACCESS_PREFETCH;
 
 		if (so->pageAccessDisabled)
@@ -677,15 +900,20 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		else if (!HnswGetNextHeapTid(scan, &heaptid, NULL))
 			break;
 
-		if (HnswGuidanceIsActiveForHeap(HnswScanHeapOid(scan)) && !guidanceChecked)
+		if (HnswScanUsesGuidanceValidation(so) && !guidanceChecked)
 		{
 			so->guidanceChecks++;
-			if (!HnswGuidanceAllowsTid(&heaptid))
+			so->traversal.guidanceChecks++;
+			if (!HnswGuidanceAllowsTid(so->guidance, &heaptid))
 			{
 				so->guidanceSkips++;
+				so->traversal.guidanceMisses++;
+				so->traversal.guidedSuppressions++;
+				so->traversal.heapTidsSuppressed++;
 				continue;
 			}
 			so->guidanceMatches++;
+			so->traversal.guidanceMatches++;
 		}
 
 		MemoryContextSwitchTo(oldCtx);
@@ -714,7 +942,14 @@ hnswendscan(IndexScanDesc scan)
 {
 	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
 
-	if (so->tuples > 0 || so->returnedTuples > 0)
+	if (so->traversalGuidance.requested &&
+		so->traversalGuidance.finalPath == HNSW_TRAVERSAL_PATH_STOCK_BYPASS)
+	{
+		so->traversal.stockPhaseExpandedNodes = so->traversal.expandedNodes;
+		so->traversal.stockPhaseDistanceComputations = so->distanceComputations;
+	}
+
+	if (!so->first)
 	{
 		HnswIndexPageProfile indexPageProfile;
 		instr_time	now;
@@ -725,7 +960,7 @@ hnswendscan(IndexScanDesc scan)
 		int64		totalBlksHit;
 		int64		totalBlksRead;
 
-		HnswGetIndexPageProfile(&indexPageProfile);
+		indexPageProfile = so->indexPageProfile.profile;
 		INSTR_TIME_SET_CURRENT(now);
 		elapsed = now;
 		INSTR_TIME_SUBTRACT(elapsed, so->scanStart);
@@ -742,7 +977,7 @@ hnswendscan(IndexScanDesc scan)
 		hnsw_last_profile.hnswSearchMs += hnswSearchMs;
 		hnsw_last_profile.heapFetchMs += heapFetchMs;
 		hnsw_last_profile.vectorSearchMs += so->vectorSearchMs;
-		hnsw_last_profile.visitedTuples += so->tuples;
+		hnsw_last_profile.visitedTuples += so->tuples + so->abandonedGuidedTuples;
 		hnsw_last_profile.returnedTuples += so->returnedTuples;
 		hnsw_last_profile.distanceComputations += so->distanceComputations;
 		hnsw_last_profile.pageAccessBatches += so->pageAccessBatches;
@@ -753,6 +988,47 @@ hnswendscan(IndexScanDesc scan)
 		hnsw_last_profile.guidanceChecks += so->guidanceChecks;
 		hnsw_last_profile.guidanceMatches += so->guidanceMatches;
 		hnsw_last_profile.guidanceSkips += so->guidanceSkips;
+		hnsw_last_profile.traversal.expandedNodes += so->traversal.expandedNodes;
+		hnsw_last_profile.traversal.neighborsExamined += so->traversal.neighborsExamined;
+		hnsw_last_profile.traversal.guidanceChecks += so->traversal.guidanceChecks;
+		hnsw_last_profile.traversal.guidanceMatches += so->traversal.guidanceMatches;
+		hnsw_last_profile.traversal.guidanceMisses += so->traversal.guidanceMisses;
+		hnsw_last_profile.traversal.neighborGuidanceChecks += so->traversal.neighborGuidanceChecks;
+		hnsw_last_profile.traversal.neighborGuidanceMatches += so->traversal.neighborGuidanceMatches;
+		hnsw_last_profile.traversal.neighborGuidanceMisses += so->traversal.neighborGuidanceMisses;
+		hnsw_last_profile.traversal.preDistanceChecks += so->traversal.preDistanceChecks;
+		hnsw_last_profile.traversal.preDistanceMatches += so->traversal.preDistanceMatches;
+		hnsw_last_profile.traversal.preDistanceMisses += so->traversal.preDistanceMisses;
+		hnsw_last_profile.traversal.distanceComputationsAvoided += so->traversal.distanceComputationsAvoided;
+		hnsw_last_profile.traversal.missBridgeNodes += so->traversal.missBridgeNodes;
+		hnsw_last_profile.traversal.missBridgeEdges += so->traversal.missBridgeEdges;
+		hnsw_last_profile.traversal.maxMissBridgeHops = Max(
+			hnsw_last_profile.traversal.maxMissBridgeHops,
+			so->traversal.maxMissBridgeHops);
+		hnsw_last_profile.traversal.guidedExpandedNodes += so->traversal.guidedExpandedNodes;
+		hnsw_last_profile.traversal.guidedPhaseDistanceComputations += so->traversal.guidedPhaseDistanceComputations;
+		hnsw_last_profile.traversal.stockPhaseExpandedNodes += so->traversal.stockPhaseExpandedNodes;
+		hnsw_last_profile.traversal.stockPhaseDistanceComputations += so->traversal.stockPhaseDistanceComputations;
+		hnsw_last_profile.traversal.stockBypassRequests += so->traversal.stockBypassRequests;
+		hnsw_last_profile.traversal.fallbackRequests += so->traversal.fallbackRequests;
+		hnsw_last_profile.traversal.fallbackStockExpandedNodes += so->traversal.fallbackStockExpandedNodes;
+		hnsw_last_profile.traversal.fallbackStockDistanceComputations += so->traversal.fallbackStockDistanceComputations;
+		hnsw_last_profile.traversal.matchingExpanded += so->traversal.matchingExpanded;
+		hnsw_last_profile.traversal.bridgeExpanded += so->traversal.bridgeExpanded;
+		hnsw_last_profile.traversal.candidateAdmissions += so->traversal.candidateAdmissions;
+		hnsw_last_profile.traversal.resultAdmissions += so->traversal.resultAdmissions;
+		hnsw_last_profile.traversal.guidedAdmissions += so->traversal.guidedAdmissions;
+		hnsw_last_profile.traversal.guidedSuppressions += so->traversal.guidedSuppressions;
+		hnsw_last_profile.traversal.heapTidsSuppressed += so->traversal.heapTidsSuppressed;
+		hnsw_last_profile.traversal.stopDeferrals += so->traversal.stopDeferrals;
+		hnsw_last_profile.traversal.discardedPushes += so->traversal.discardedPushes;
+		hnsw_last_profile.traversal.discardedPops += so->traversal.discardedPops;
+		hnsw_last_profile.traversal.initialBatches += so->traversal.initialBatches;
+		hnsw_last_profile.traversal.resumeBatches += so->traversal.resumeBatches;
+		hnsw_last_profile.traversal.strictOrderDrops += so->traversal.strictOrderDrops;
+		hnsw_last_profile.traversal.stockTerminations += so->traversal.stockTerminations;
+		hnsw_last_profile.traversal.maxScanTerminations += so->traversal.maxScanTerminations;
+		hnsw_last_profile.traversal.exhaustedTerminations += so->traversal.exhaustedTerminations;
 		hnsw_last_profile.indexPageNeighborLoads += indexPageProfile.neighborLoads;
 		hnsw_last_profile.indexPageNeighborRuns += indexPageProfile.neighborRuns;
 		hnsw_last_profile.indexPageNeighborDistinctPages += indexPageProfile.neighborDistinctPages;
@@ -760,6 +1036,8 @@ hnswendscan(IndexScanDesc scan)
 		hnsw_last_profile.indexPageElementRuns += indexPageProfile.elementRuns;
 		hnsw_last_profile.indexPageElementDistinctPages += indexPageProfile.elementDistinctPages;
 		hnsw_last_profile.indexPagePrefetches += indexPageProfile.prefetches;
+		if (!indexPageProfile.distinctCountsExact)
+			hnsw_last_profile.indexPageDistinctCountsExact = false;
 		hnsw_last_profile.blksHitBefore = so->blksHitBefore;
 		hnsw_last_profile.blksHitAfter = pgBufferUsage.shared_blks_hit;
 		hnsw_last_profile.blksReadBefore = so->blksReadBefore;
@@ -770,8 +1048,32 @@ hnswendscan(IndexScanDesc scan)
 		hnsw_last_profile.heapBlksRead += totalBlksRead - so->idxBlksRead;
 		hnsw_last_profile.topkTidCount = Min(so->topkTidCount, HNSW_PROFILE_MAX_TIDS);
 		memcpy(hnsw_last_profile.topkTids, so->topkTids, sizeof(ItemPointerData) * hnsw_last_profile.topkTidCount);
+
+		/* Adaptive admission records the completed stock or guided scan here;
+		 * fragment construction is intentionally confined to activation. */
+		HnswGuidanceRecordScan(HnswScanHeapOid(scan),
+							   so->tuples + so->abandonedGuidedTuples,
+							   so->guidanceChecks, so->guidanceSkips,
+							   heapFetchMs, totalScanMs);
 	}
 
+	HnswGuidanceEndScan(so->guidance);
+	so->guidance = NULL;
+	hnsw_last_profile.plannerProof = so->plannerProof;
+	hnsw_last_profile.traversalFinalPath = so->traversalGuidance.finalPath;
+	hnsw_last_profile.traversalStockBypassReason =
+		so->traversalGuidance.stockBypassReason;
+	hnsw_last_profile.traversalFallbackReason =
+		so->traversalGuidance.fallbackReason;
+	hnsw_last_profile.traversalEstimatedSkipRateValid =
+		so->traversalGuidance.estimatedSkipRateValid;
+	hnsw_last_profile.traversalEstimatedSkipRate =
+		so->traversalGuidance.estimatedSkipRate;
+	if (hnsw_last_profile.plannerProofCount < HNSW_PROFILE_MAX_PROOFS)
+		hnsw_last_profile.plannerProofs[hnsw_last_profile.plannerProofCount++] =
+			so->plannerProof;
+	else
+		hnsw_last_profile.plannerProofsTruncated = true;
 	MemoryContextDelete(so->tmpCtx);
 
 	pfree(so);

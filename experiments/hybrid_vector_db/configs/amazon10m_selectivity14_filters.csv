@@ -1,0 +1,15 @@
+target_rate,filter_name,predicate,atoms,count,actual_pct,source
+50.0%,popular_ge1000,item_rating_number >= 1000,sql:item_rating_number >= 1000,5031984,50.3198,observed
+45.0%,popular_ge1340,item_rating_number >= 1340,sql:item_rating_number >= 1340,4500375,45.0037,observed
+40.0%,popular_ge1780,item_rating_number >= 1780,sql:item_rating_number >= 1780,4000444,40.0044,observed
+35.0%,popular_ge2428,item_rating_number >= 2428,sql:item_rating_number >= 2428,3499884,34.9988,observed
+30.0%,popular_ge3284,item_rating_number >= 3284,sql:item_rating_number >= 3284,3000207,30.0021,observed
+25.0%,popular_ge4559,item_rating_number >= 4559,sql:item_rating_number >= 4559,2500079,25.0008,observed
+20.0%,price_10_to_20,has_price AND price > 10 AND price <= 20,sql:has_price AND price > 10 AND price <= 20,2189009,21.8901,observed
+15.0%,popular_ge10066,item_rating_number >= 10066,sql:item_rating_number >= 10066,1500795,15.0079,observed
+10.0%,rating5_price_le10,has_price AND price <= 10 AND rating = 5,sql:has_price AND price <= 10||sql:rating = 5,958716,9.5872,observed
+5.0%,long_review_ge500,review_text_len >= 500,sql:review_text_len >= 500,588019,5.8802,observed
+2.0%,grocery_rating5,main_category = 'Grocery' AND rating = 5,sql:main_category = 'Grocery'||sql:rating = 5,234056,2.3406,observed
+1.0%,grocery_helpful,main_category = 'Grocery' AND helpful_vote >= 1,sql:main_category = 'Grocery'||sql:helpful_vote >= 1,101481,1.0148,observed
+0.5%,helpful_ge20,helpful_vote >= 20,sql:helpful_vote >= 20,60689,0.6069,observed
+0.2%,grocery_long500,main_category = 'Grocery' AND review_text_len >= 500,sql:main_category = 'Grocery'||sql:review_text_len >= 500,21317,0.2132,observed

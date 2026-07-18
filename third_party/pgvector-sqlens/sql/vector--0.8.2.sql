@@ -108,11 +108,42 @@ CREATE FUNCTION vector_hnsw_last_scan_profile() RETURNS text
 CREATE FUNCTION vector_hnsw_reset_scan_profile() RETURNS void
 	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL SAFE;
 
+-- kind = adaptive is backend-local D3/FragReuse admission. It observes the
+-- first requests without pruning, then activates page/Bloom fragments only.
 CREATE FUNCTION vector_hnsw_guidance_activate(regclass, text[], text) RETURNS int4
+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
+
+-- A query must call this from an uncorrelated initplan with the same index,
+-- atoms, and kind used at activation. Mismatches fail open to stock HNSW.
+CREATE FUNCTION vector_hnsw_guidance_bind(regclass, text[], text) RETURNS boolean
 	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
 
 CREATE FUNCTION vector_hnsw_guidance_reset() RETURNS void
 	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL SAFE;
+
+CREATE FUNCTION vector_sqlens_build_id() RETURNS text
+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE PARALLEL SAFE;
+
+CREATE FUNCTION vector_hnsw_graph_fingerprint(regclass) RETURNS jsonb
+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT PARALLEL UNSAFE;
+
+COMMENT ON FUNCTION vector_hnsw_graph_fingerprint(regclass) IS
+	'Canonical HNSW logical SHA-256 and physical-layout SHA-256. The logical digest covers format/options, canonical entrypoint identity, and every node ordered by its same-heap ordered heap-TID bundle, including level, version, exact vector bytes, and ordered per-level neighbor identities.';
+
+CREATE FUNCTION vector_hnsw_graph_compare(regclass, regclass) RETURNS jsonb
+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT PARALLEL UNSAFE;
+
+COMMENT ON FUNCTION vector_hnsw_graph_compare(regclass, regclass) IS
+	'Compares canonical logical graph digests, physical-layout digests, entrypoint identity, exact node/heap-TID coverage, and heap identity for two HNSW indexes.';
+
+REVOKE ALL ON FUNCTION vector_hnsw_graph_fingerprint(regclass) FROM PUBLIC;
+REVOKE ALL ON FUNCTION vector_hnsw_graph_compare(regclass, regclass) FROM PUBLIC;
+
+CREATE FUNCTION vector_hnsw_fragment_epoch_bump_trigger() RETURNS trigger
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION vector_hnsw_fragment_tracking_enable(regclass) RETURNS int8
+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
 
 CREATE FUNCTION vector_hnsw_guidance_profile() RETURNS text
 	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL SAFE;
@@ -132,6 +163,8 @@ CREATE FUNCTION vector_hnsw_metadata_page_cache_build(regclass, text) RETURNS in
 CREATE FUNCTION vector_hnsw_metadata_bloom_cache_build(regclass, text) RETURNS int8
 	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
 
+-- Compatibility symbol that raises an error: the legacy implementation could
+-- return cached IDs without PostgreSQL heap/MVCC/predicate rechecks.
 CREATE FUNCTION vector_hnsw_metadata_filter_search(regclass, vector, int4, int4, text) RETURNS TABLE(rank int4, id int8, ctid text)
 	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
 

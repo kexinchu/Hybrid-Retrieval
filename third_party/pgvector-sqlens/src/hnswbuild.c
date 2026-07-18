@@ -388,22 +388,62 @@ typedef struct HnswBuildOrderEntry
 } HnswBuildOrderEntry;
 
 static bool
-BuildOrderMarkVisited(HTAB *visited, HnswElement element)
+BuildOrderMarkVisited(HTAB *visited, HnswElement element,
+					  HnswBuildState *buildstate)
 {
 	HnswBuildOrderKey key;
 	bool		found;
+	Size		graphUsed;
+	Size		scratchUsed;
 
 	key.ptr = (uintptr_t) element;
 	hash_search(visited, &key, HASH_ENTER, &found);
+	graphUsed = buildstate->hnswarea == NULL ?
+		MemoryContextMemAllocated(buildstate->graphCtx, true) :
+		buildstate->graph->memoryUsed;
+	scratchUsed = MemoryContextMemAllocated(buildstate->tmpCtx, true);
+	if (graphUsed > buildstate->graph->memoryTotal ||
+		scratchUsed > buildstate->graph->memoryTotal - graphUsed)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("HNSW BFS page-order scratch exceeds maintenance_work_mem"),
+				 errdetail("The graph and BFS scratch use %zu bytes; the limit is %zu bytes.",
+						   graphUsed + scratchUsed,
+						   buildstate->graph->memoryTotal),
+				 errhint("Increase maintenance_work_mem or use hnsw.build_page_order = insertion.")));
 	return !found;
 }
 
 static void
-BuildOrderAppend(HnswElement **items, int *count, int *capacity, HnswElement element)
+BuildOrderAppend(HnswElement **items, int *count, int *capacity,
+				 HnswElement element, HnswBuildState *buildstate)
 {
 	if (*count >= *capacity)
 	{
-		*capacity *= 2;
+		int			newCapacity;
+		Size		graphUsed = buildstate->hnswarea == NULL ?
+			MemoryContextMemAllocated(buildstate->graphCtx, true) :
+			buildstate->graph->memoryUsed;
+		Size		scratchUsed = MemoryContextMemAllocated(buildstate->tmpCtx, true);
+		Size		additional;
+
+		if (*capacity > MaxAllocSize / (2 * sizeof(HnswElement)))
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("HNSW graph has too many nodes for BFS page order")));
+		newCapacity = *capacity * 2;
+		additional = sizeof(HnswElement) * (newCapacity - *capacity);
+		if (graphUsed > buildstate->graph->memoryTotal ||
+			additional > buildstate->graph->memoryTotal - graphUsed ||
+			scratchUsed > buildstate->graph->memoryTotal - graphUsed - additional)
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("HNSW BFS page-order scratch exceeds maintenance_work_mem"),
+					 errdetail("Growing the BFS order requires at least %zu bytes; the limit is %zu bytes.",
+							   graphUsed + scratchUsed + additional,
+							   buildstate->graph->memoryTotal),
+					 errhint("Increase maintenance_work_mem or use hnsw.build_page_order = insertion.")));
+		*capacity = newCapacity;
 		*items = repalloc(*items, sizeof(HnswElement) * *capacity);
 	}
 
@@ -423,31 +463,30 @@ OrderGraphPagesByBfs(HnswBuildState *buildstate)
 	HnswElement entryPoint = HnswPtrAccess(base, graph->entryPoint);
 	HASHCTL		ctl;
 	HTAB	   *visited;
-	HnswElement *order;
 	HnswElement *queue;
-	int			orderCount = 0;
-	int			orderCapacity = 1024;
 	int			queueHead = 0;
 	int			queueCount = 0;
 	int			queueCapacity = 1024;
 	HnswElementPtr iter;
+	MemoryContext oldContext;
 
 	if (entryPoint == NULL)
 		return;
 
+	MemoryContextReset(buildstate->tmpCtx);
+	oldContext = MemoryContextSwitchTo(buildstate->tmpCtx);
 	MemSet(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(HnswBuildOrderKey);
 	ctl.entrysize = sizeof(HnswBuildOrderEntry);
-	visited = hash_create("hnsw build page order visited", 1024, &ctl, HASH_ELEM | HASH_BLOBS);
+	ctl.hcxt = buildstate->tmpCtx;
+	visited = hash_create("hnsw build page order visited", 1024, &ctl,
+					  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
-	order = palloc(sizeof(HnswElement) * orderCapacity);
 	queue = palloc(sizeof(HnswElement) * queueCapacity);
 
-	if (BuildOrderMarkVisited(visited, entryPoint))
-	{
-		BuildOrderAppend(&order, &orderCount, &orderCapacity, entryPoint);
-		BuildOrderAppend(&queue, &queueCount, &queueCapacity, entryPoint);
-	}
+	if (BuildOrderMarkVisited(visited, entryPoint, buildstate))
+		BuildOrderAppend(&queue, &queueCount, &queueCapacity, entryPoint,
+						 buildstate);
 
 	while (queueHead < queueCount)
 	{
@@ -465,11 +504,9 @@ OrderGraphPagesByBfs(HnswBuildState *buildstate)
 				if (neighbor == NULL)
 					continue;
 
-				if (BuildOrderMarkVisited(visited, neighbor))
-				{
-					BuildOrderAppend(&order, &orderCount, &orderCapacity, neighbor);
-					BuildOrderAppend(&queue, &queueCount, &queueCapacity, neighbor);
-				}
+				if (BuildOrderMarkVisited(visited, neighbor, buildstate))
+					BuildOrderAppend(&queue, &queueCount, &queueCapacity, neighbor,
+								 buildstate);
 			}
 		}
 	}
@@ -480,22 +517,23 @@ OrderGraphPagesByBfs(HnswBuildState *buildstate)
 		HnswElement element = HnswPtrAccess(base, iter);
 
 		iter = element->next;
-		if (BuildOrderMarkVisited(visited, element))
-			BuildOrderAppend(&order, &orderCount, &orderCapacity, element);
+		if (BuildOrderMarkVisited(visited, element, buildstate))
+			BuildOrderAppend(&queue, &queueCount, &queueCapacity, element,
+						 buildstate);
 	}
 
-	for (int i = 0; i < orderCount; i++)
+	for (int i = 0; i < queueCount; i++)
 	{
-		HnswElement next = i + 1 < orderCount ? order[i + 1] : NULL;
+		HnswElement next = i + 1 < queueCount ? queue[i + 1] : NULL;
 
-		HnswPtrStore(base, order[i]->next, next);
+		HnswPtrStore(base, queue[i]->next, next);
 	}
 
-	HnswPtrStore(base, graph->head, orderCount > 0 ? order[0] : NULL);
+	HnswPtrStore(base, graph->head, queueCount > 0 ? queue[0] : NULL);
 
 	hash_destroy(visited);
-	pfree(order);
-	pfree(queue);
+	MemoryContextSwitchTo(oldContext);
+	MemoryContextReset(buildstate->tmpCtx);
 }
 
 /*
@@ -659,6 +697,11 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 
 		if (!graph->flushed)
 		{
+			if (hnsw_require_full_memory_build)
+				ereport(ERROR,
+						(errmsg("hnsw graph does not fit into maintenance_work_mem after " INT64_FORMAT " tuples", (int64) graph->indtuples),
+						 errdetail("hnsw.require_full_memory_build is enabled, so the build will not switch to on-disk insertion."),
+						 errhint("Increase maintenance_work_mem and rebuild the index.")));
 			ereport(NOTICE,
 					(errmsg("hnsw graph no longer fits into maintenance_work_mem after " INT64_FORMAT " tuples", (int64) graph->indtuples),
 					 errdetail("Building will take significantly more time."),
@@ -1209,9 +1252,22 @@ BuildGraph(HnswBuildState * buildstate)
 
 	pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE, PROGRESS_HNSW_PHASE_LOAD);
 
+	if (buildstate->forkNum == MAIN_FORKNUM && buildstate->heap != NULL &&
+		hnsw_clone_source[0] != '\0')
+	{
+		HnswCloneGraph(buildstate);
+		FlushPages(buildstate);
+		return;
+	}
+
 	/* Calculate parallel workers */
 	if (buildstate->heap != NULL)
 		parallel_workers = ComputeParallelWorkers(buildstate->heap, buildstate->index);
+	if (hnsw_build_seed >= 0 && parallel_workers > 0)
+		ereport(ERROR,
+				(errmsg("deterministic HNSW builds require max_parallel_maintenance_workers = 0"),
+				 errdetail("hnsw.build_seed is set to %d, but %d parallel build workers were requested.", hnsw_build_seed, parallel_workers),
+				 errhint("Disable parallel maintenance workers or reset hnsw.build_seed to -1.")));
 
 	/* Attempt to launch parallel worker scan when required */
 	if (parallel_workers > 0)
@@ -1245,8 +1301,8 @@ static void
 BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 		   HnswBuildState * buildstate, ForkNumber forkNum)
 {
-	/* Keep experimental physical-layout builds comparable. */
-	SeedRandom(42);
+	if (hnsw_build_seed >= 0)
+		SeedRandom(hnsw_build_seed);
 
 	InitBuildState(buildstate, heap, index, indexInfo, forkNum);
 

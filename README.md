@@ -59,6 +59,23 @@ make
 make install
 ```
 
+Restart PostgreSQL after replacing `vector.so`, then verify that the server is
+using the expected SQLens build:
+
+```sql
+SELECT vector_sqlens_build_id();
+```
+
+Run the Python regression suite from the repository root:
+
+```bash
+.venv/bin/python -m pytest -q experiments/hybrid_vector_db/tests
+```
+
+The SQL smoke tests in `experiments/hybrid_vector_db/sql/pgvector_*_smoke.sql`
+cover candidate-admission safety, MVCC/epoch invalidation, HOT updates,
+same-graph physical layout, build guards, and adaptive fragment reuse.
+
 The patch in `patches/pgvector-sqlens.patch` is kept for auditability. It shows
 the SQLens changes relative to upstream pgvector commit
 `cab9da72c04353f143bb06b42ab70a403daac64a`.

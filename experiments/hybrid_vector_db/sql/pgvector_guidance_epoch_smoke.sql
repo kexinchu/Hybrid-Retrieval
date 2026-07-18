@@ -40,6 +40,11 @@ BEGIN
   SELECT id INTO actual_id
   FROM guidance_epoch_smoke
   WHERE tenant_id = 1
+    AND (SELECT vector_hnsw_guidance_bind(
+             'guidance_epoch_smoke_hnsw'::regclass,
+             ARRAY['exact:sql:tenant_id = 1'],
+             'exact'
+         ) OFFSET 0)
   ORDER BY embedding <-> '[0,0,0]'
   LIMIT 1;
 
@@ -67,6 +72,11 @@ BEGIN
   SELECT id INTO actual_id
   FROM guidance_epoch_smoke
   WHERE tenant_id = 1
+    AND (SELECT vector_hnsw_guidance_bind(
+             'guidance_epoch_smoke_hnsw'::regclass,
+             ARRAY['exact:sql:tenant_id = 1'],
+             'exact'
+         ) OFFSET 0)
   ORDER BY embedding <-> '[0,0,0]'
   LIMIT 1;
 

@@ -6,7 +6,12 @@
 
 #include "access/amapi.h"
 #include "access/genam.h"
+#include "access/relation.h"
 #include "access/reloptions.h"
+#include "catalog/index.h"
+#include "catalog/pg_index.h"
+#include "catalog/pg_class_d.h"
+#include "commands/defrem.h"
 #include "commands/progress.h"
 #include "commands/vacuum.h"
 #include "fmgr.h"
@@ -14,10 +19,17 @@
 #include "miscadmin.h"
 #include "nodes/pg_list.h"
 #include "utils/float.h"
+#include "utils/builtins.h"
+#include "utils/acl.h"
+#include "utils/fmgrprotos.h"
 #include "utils/guc.h"
+#include "utils/lsyscache.h"
+#include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/selfuncs.h"
 #include "utils/spccache.h"
+#include "utils/plancache.h"
+#include "utils/syscache.h"
 #include "vector.h"
 
 #if PG_VERSION_NUM < 150000
@@ -54,6 +66,8 @@ static const struct config_enum_entry hnsw_filter_strategy_options[] = {
 	{"off", HNSW_FILTER_STRATEGY_OFF, false},
 	{"acorn1", HNSW_FILTER_STRATEGY_ACORN1, false},
 	{"guided_collect", HNSW_FILTER_STRATEGY_GUIDED_COLLECT, false},
+	{"traversal_guided", HNSW_FILTER_STRATEGY_TRAVERSAL_GUIDED, false},
+	{"safe_guided", HNSW_FILTER_STRATEGY_SAFE_GUIDED, false},
 	{NULL, 0, false}
 };
 
@@ -66,11 +80,131 @@ int			hnsw_page_prefetch_min_items;
 int			hnsw_page_disable_after_no_merge;
 int			hnsw_index_page_access;
 int			hnsw_build_page_order;
+int			hnsw_build_seed;
+bool		hnsw_require_full_memory_build;
+char	   *hnsw_clone_source;
+char	   *hnsw_preferred_index;
 int			hnsw_filter_strategy;
 int			hnsw_guided_collect_target;
+int			hnsw_traversal_guided_target;
+int			hnsw_traversal_guided_max_bridge_hops;
+int			hnsw_traversal_guided_max_bridge_work;
+double		hnsw_traversal_guided_min_skip_rate;
 double		hnsw_scan_mem_multiplier;
 int			hnsw_lock_tranche_id;
 static relopt_kind hnsw_relopt_kind;
+static Oid	hnsw_preferred_index_oid = InvalidOid;
+
+static void
+HnswValidatePreferredIndex(Relation index, Oid expectedHeapOid)
+{
+	char	   *amName = index->rd_rel->relkind == RELKIND_INDEX ?
+		get_am_name(index->rd_rel->relam) : NULL;
+	bool		isHnsw = amName != NULL && strcmp(amName, "hnsw") == 0;
+
+	if (index->rd_rel->relkind != RELKIND_INDEX || index->rd_index == NULL ||
+		!isHnsw)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("hnsw.preferred_index must name an HNSW index"),
+				 errdetail("Relation \"%s\" is not a valid HNSW index.",
+						   RelationGetRelationName(index))));
+	pfree(amName);
+	if (!index->rd_index->indisvalid || !index->rd_index->indisready ||
+		!index->rd_index->indislive)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("hnsw.preferred_index must name a valid and ready index"),
+				 errdetail("HNSW index \"%s\" is invalid, not ready, or not live.",
+						   RelationGetRelationName(index))));
+	if (OidIsValid(expectedHeapOid) &&
+		index->rd_index->indrelid != expectedHeapOid)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("hnsw.preferred_index is on a different heap"),
+				 errdetail("Preferred index \"%s\" belongs to relation %u, but this HNSW path belongs to relation %u.",
+						   RelationGetRelationName(index),
+						   index->rd_index->indrelid, expectedHeapOid)));
+}
+
+static bool
+HnswPreferredIndexCheck(char **newval, void **extra, GucSource source)
+{
+	Oid		   *parsedOid = guc_malloc(ERROR, sizeof(Oid));
+	HeapTuple	relationTuple;
+	HeapTuple	indexTuple;
+	Form_pg_class relationForm;
+	Form_pg_index indexForm;
+	char	   *relationName;
+	char	   *amName;
+	bool		isHnsw;
+
+	(void) source;
+	*parsedOid = InvalidOid;
+	if ((*newval)[0] == '\0')
+	{
+		*extra = parsedOid;
+		return true;
+	}
+
+	*parsedOid = DatumGetObjectId(DirectFunctionCall1(
+		regclassin, CStringGetDatum(*newval)));
+	if (!object_ownercheck(RelationRelationId, *parsedOid, GetUserId()))
+		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_INDEX, get_rel_name(*parsedOid));
+
+	relationTuple = SearchSysCache1(RELOID, ObjectIdGetDatum(*parsedOid));
+	if (!HeapTupleIsValid(relationTuple))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("relation with OID %u does not exist", *parsedOid)));
+	relationForm = (Form_pg_class) GETSTRUCT(relationTuple);
+	relationName = pstrdup(NameStr(relationForm->relname));
+	amName = relationForm->relkind == RELKIND_INDEX ?
+		get_am_name(relationForm->relam) : NULL;
+	isHnsw = amName != NULL && strcmp(amName, "hnsw") == 0;
+	ReleaseSysCache(relationTuple);
+	if (!isHnsw)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("hnsw.preferred_index must name an HNSW index"),
+				 errdetail("Relation \"%s\" is not a valid HNSW index.",
+						   relationName)));
+	pfree(amName);
+
+	indexTuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(*parsedOid));
+	if (!HeapTupleIsValid(indexTuple))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("hnsw.preferred_index must name an HNSW index")));
+	indexForm = (Form_pg_index) GETSTRUCT(indexTuple);
+	if (!indexForm->indisvalid || !indexForm->indisready ||
+		!indexForm->indislive)
+	{
+		ReleaseSysCache(indexTuple);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("hnsw.preferred_index must name a valid and ready index"),
+				 errdetail("HNSW index \"%s\" is invalid, not ready, or not live.",
+						   relationName)));
+	}
+	ReleaseSysCache(indexTuple);
+	pfree(relationName);
+	*extra = parsedOid;
+	return true;
+}
+
+static void
+HnswPreferredIndexAssign(const char *newval, void *extra)
+{
+	Oid			newOid = newval[0] == '\0' || extra == NULL ?
+		InvalidOid : *((Oid *) extra);
+
+	if (newOid != hnsw_preferred_index_oid)
+	{
+		hnsw_preferred_index_oid = newOid;
+		ResetPlanCache();
+	}
+}
 
 /*
  * Assign a tranche ID for our LWLocks. This only needs to be done by one
@@ -165,15 +299,56 @@ HnswInit(void)
 							 &hnsw_build_page_order,
 							 HNSW_BUILD_PAGE_ORDER_INSERTION, hnsw_build_page_order_options, PGC_USERSET, 0, NULL, NULL, NULL);
 
+	DefineCustomIntVariable("hnsw.build_seed", "Sets an optional deterministic seed and tie order for HNSW index builds",
+							"-1 preserves stock pgvector behavior. Nonnegative seeds are experimental reproducibility controls, not a graph quality guarantee; physical graph determinism requires a serial full-memory build.",
+							&hnsw_build_seed,
+							-1, -1, PG_INT32_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("hnsw.require_full_memory_build", "Rejects an HNSW build instead of switching to on-disk insertion",
+							 "Use for physical-layout experiments that require every graph element to participate in the selected layout.",
+							 &hnsw_require_full_memory_build,
+							 false, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomStringVariable("hnsw.clone_source", "Clones an existing same-heap HNSW logical graph",
+							   "An empty value performs a normal build. Clone mode requires a non-concurrent full-memory BFS build and never scans the heap or constructs graph edges.",
+							   &hnsw_clone_source,
+							   "", PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomStringVariable("hnsw.preferred_index", "Restricts HNSW planning to one named index",
+							   "An empty value preserves normal planning. This session-local experimental control makes other HNSW index paths infinitely costly so same-heap physical-layout experiments can select a proven source or clone index.",
+							   &hnsw_preferred_index,
+							   "", PGC_USERSET, 0, HnswPreferredIndexCheck,
+							   HnswPreferredIndexAssign, NULL);
+
 	DefineCustomEnumVariable("hnsw.filter_strategy", "Sets predicate-aware HNSW traversal strategy",
-							 "off preserves pgvector behavior; acorn1 filters the L0 W heap with active guidance; guided_collect keeps the stock frontier and returns guided candidates collected during traversal.",
+							 "off preserves pgvector behavior; safe_guided is validation-only and preserves stock graph traversal; traversal_guided performs planner-proven pre-distance filtering with bounded bridge expansion and fresh-stock fallback when iterative_scan is off, and otherwise bypasses to stock; acorn1 and guided_collect are experimental heuristic modes.",
 							 &hnsw_filter_strategy,
 							 HNSW_FILTER_STRATEGY_OFF, hnsw_filter_strategy_options, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable("hnsw.guided_collect_target", "Sets minimum guided candidates to collect before guided_collect can stop",
 							"Only used when hnsw.filter_strategy = guided_collect. A smaller value is faster; a larger value improves filtered recall.",
 							&hnsw_guided_collect_target,
-							100, 1, 1000000, PGC_USERSET, 0, NULL, NULL, NULL);
+							 100, 1, 1000000, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("hnsw.traversal_guided_target", "Sets the minimum matching candidate batch for traversal_guided",
+							 "A guided phase that cannot produce this many candidates before uncertainty is discarded and rerun through a fresh stock traversal.",
+							 &hnsw_traversal_guided_target,
+							 40, 1, 1000000, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("hnsw.traversal_guided_max_bridge_hops", "Sets the maximum consecutive predicate-miss bridge hops for traversal_guided",
+							 "Miss nodes may be expanded without vector distance only up to this level-0 hop bound.",
+							 &hnsw_traversal_guided_max_bridge_hops,
+							 2, 0, 64, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("hnsw.traversal_guided_max_bridge_work", "Sets the maximum predicate-miss bridge work for traversal_guided",
+							 "The bound counts expanded miss nodes and their newly discovered level-0 edges before a fresh-stock fallback.",
+							 &hnsw_traversal_guided_max_bridge_work,
+							 10000, 1, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomRealVariable("hnsw.traversal_guided_min_skip_rate", "Sets the minimum conservative skip-rate estimate for traversal_guided admission",
+							 "Requests below this estimated benefit threshold bypass directly to stock traversal without membership checks.",
+							 &hnsw_traversal_guided_min_skip_rate,
+							 0.20, 0, 1, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	/* Same range as hash_mem_multiplier */
 	DefineCustomRealVariable("hnsw.scan_mem_multiplier", "Sets the multiple of work_mem to use for iterative scans",
@@ -215,6 +390,31 @@ hnswcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	double		startupPages;
 	double		spc_seq_page_cost;
 	Relation	index;
+	Oid			preferredIndexOid = hnsw_preferred_index_oid;
+
+	if (hnsw_preferred_index[0] != '\0')
+	{
+		Oid			pathHeapOid = IndexGetRelation(path->indexinfo->indexoid, false);
+		Relation	preferredIndex;
+
+		if (!OidIsValid(preferredIndexOid))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("hnsw.preferred_index no longer resolves to an index")));
+		preferredIndex = relation_open(preferredIndexOid, AccessShareLock);
+		HnswValidatePreferredIndex(preferredIndex, pathHeapOid);
+		relation_close(preferredIndex, AccessShareLock);
+	}
+	if (OidIsValid(preferredIndexOid) &&
+		path->indexinfo->indexoid != preferredIndexOid)
+	{
+		*indexStartupCost = get_float8_infinity();
+		*indexTotalCost = get_float8_infinity();
+		*indexSelectivity = 0;
+		*indexCorrelation = 0;
+		*indexPages = 0;
+		return;
+	}
 
 	/* Never use index without order */
 	if (path->indexorderbys == NIL)

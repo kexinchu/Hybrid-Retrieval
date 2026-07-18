@@ -22,22 +22,42 @@
 #include "varatt.h"
 #endif
 
-static HnswIndexPageProfile hnsw_index_page_profile;
-static BlockNumber hnsw_index_page_last_neighbor_block = InvalidBlockNumber;
-static BlockNumber hnsw_index_page_last_element_block = InvalidBlockNumber;
-
 static bool
-HnswElementMatchesGuidance(HnswElement element, Oid heapOid)
+HnswElementMatchesGuidance(HnswElement element, HnswScanGuidance *guidance,
+						   HnswTraversalProfile *profile, bool preDistance)
 {
-	if (!HnswGuidanceIsActiveForHeap(heapOid))
+	if (!HnswGuidanceIsActiveForScan(guidance))
 		return true;
 
+	if (profile != NULL)
+	{
+		profile->guidanceChecks++;
+		profile->neighborGuidanceChecks++;
+		if (preDistance)
+			profile->preDistanceChecks++;
+	}
 	for (int i = 0; i < element->heaptidsLength; i++)
 	{
-		if (HnswGuidanceAllowsTid(&element->heaptids[i]))
+		if (HnswGuidanceAllowsTid(guidance, &element->heaptids[i]))
+		{
+			if (profile != NULL)
+			{
+				profile->guidanceMatches++;
+				profile->neighborGuidanceMatches++;
+				if (preDistance)
+					profile->preDistanceMatches++;
+			}
 			return true;
+		}
 	}
 
+	if (profile != NULL)
+	{
+		profile->guidanceMisses++;
+		profile->neighborGuidanceMisses++;
+		if (preDistance)
+			profile->preDistanceMisses++;
+	}
 	return false;
 }
 
@@ -55,40 +75,67 @@ CompareBlockNumbers(const void *a, const void *b)
 }
 
 void
-HnswResetIndexPageProfile(void)
+HnswInitIndexPageProfile(HnswIndexPageProfileState *state,
+						 MemoryContext context)
 {
-	hnsw_index_page_profile.neighborLoads = 0;
-	hnsw_index_page_profile.neighborRuns = 0;
-	hnsw_index_page_profile.neighborDistinctPages = 0;
-	hnsw_index_page_profile.elementLoads = 0;
-	hnsw_index_page_profile.elementRuns = 0;
-	hnsw_index_page_profile.elementDistinctPages = 0;
-	hnsw_index_page_profile.prefetches = 0;
-	hnsw_index_page_last_neighbor_block = InvalidBlockNumber;
-	hnsw_index_page_last_element_block = InvalidBlockNumber;
+	MemSet(state, 0, sizeof(*state));
+	state->context = context;
+	state->lastNeighborBlock = InvalidBlockNumber;
+	state->lastElementBlock = InvalidBlockNumber;
+	state->profile.distinctCountsExact = true;
 }
 
-void
-HnswGetIndexPageProfile(HnswIndexPageProfile *profile)
+static bool
+HnswIndexPageSetAdd(HnswIndexPageProfileState *state, HnswIndexPageSet *set,
+						BlockNumber block)
 {
-	if (profile != NULL)
-		*profile = hnsw_index_page_profile;
-}
+	uint32		value;
+	uint32		slot;
 
-static void
-HnswRecordIndexNeighborPage(BlockNumber block)
-{
-	hnsw_index_page_profile.neighborLoads++;
-	if (block != hnsw_index_page_last_neighbor_block)
+	if (state == NULL || !BlockNumberIsValid(block))
+		return false;
+	if (set->slots == NULL)
+		set->slots = MemoryContextAllocZero(state->context,
+			sizeof(uint32) * HNSW_INDEX_PAGE_UNIQUE_SLOTS);
+
+	value = ((uint32) block) + 1;
+	slot = hash_uint32((uint32) block) & (HNSW_INDEX_PAGE_UNIQUE_SLOTS - 1);
+	while (set->slots[slot] != 0)
 	{
-		hnsw_index_page_profile.neighborRuns++;
-		hnsw_index_page_profile.neighborDistinctPages++;
+		if (set->slots[slot] == value)
+			return false;
+		slot = (slot + 1) & (HNSW_INDEX_PAGE_UNIQUE_SLOTS - 1);
 	}
-	hnsw_index_page_last_neighbor_block = block;
+
+	if (set->count >= HNSW_INDEX_PAGE_UNIQUE_LIMIT)
+	{
+		state->profile.distinctCountsExact = false;
+		return false;
+	}
+
+	set->slots[slot] = value;
+	set->count++;
+	return true;
 }
 
 static void
-HnswPrefetchUnvisitedIndexPages(Relation index, HnswUnvisited *unvisited, int unvisitedLength)
+HnswRecordIndexNeighborPage(HnswIndexPageProfileState *state,
+							BlockNumber block)
+{
+	state->profile.neighborLoads++;
+	if (block != state->lastNeighborBlock)
+	{
+		state->profile.neighborRuns++;
+	}
+	state->lastNeighborBlock = block;
+	if (HnswIndexPageSetAdd(state, &state->neighborPages, block))
+		state->profile.neighborDistinctPages++;
+}
+
+static void
+HnswPrefetchUnvisitedIndexPages(Relation index, HnswUnvisited *unvisited,
+								int unvisitedLength,
+								HnswIndexPageProfileState *state)
 {
 	BlockNumber blocks[HNSW_MAX_M * 2];
 	int			blockCount = 0;
@@ -106,10 +153,12 @@ HnswPrefetchUnvisitedIndexPages(Relation index, HnswUnvisited *unvisited, int un
 			continue;
 
 		block = ItemPointerGetBlockNumber(indextid);
-		hnsw_index_page_profile.elementLoads++;
-		if (block != hnsw_index_page_last_element_block)
-			hnsw_index_page_profile.elementRuns++;
-		hnsw_index_page_last_element_block = block;
+		state->profile.elementLoads++;
+		if (block != state->lastElementBlock)
+			state->profile.elementRuns++;
+		state->lastElementBlock = block;
+		if (HnswIndexPageSetAdd(state, &state->elementPages, block))
+			state->profile.elementDistinctPages++;
 		blocks[blockCount++] = block;
 	}
 
@@ -124,11 +173,10 @@ HnswPrefetchUnvisitedIndexPages(Relation index, HnswUnvisited *unvisited, int un
 		if (i > 0 && block == previousBlock)
 			continue;
 
-		hnsw_index_page_profile.elementDistinctPages++;
 		if (hnsw_index_page_access == HNSW_INDEX_PAGE_ACCESS_PREFETCH)
 		{
 			PrefetchBuffer(index, MAIN_FORKNUM, block);
-			hnsw_index_page_profile.prefetches++;
+			state->profile.prefetches++;
 		}
 		previousBlock = block;
 	}
@@ -731,17 +779,36 @@ HnswEntryCandidate(char *base, HnswElement entryPoint, HnswQuery * q, Relation i
 	return HnswInitSearchCandidate(base, entryPoint, distance);
 }
 
+typedef struct HnswSearchHeapCompareContext
+{
+	char	   *base;
+} HnswSearchHeapCompareContext;
+
+static int CompareSeededElementKeys(HnswElement a, HnswElement b);
+
 /*
  * Compare candidate distances
  */
 static int
 CompareNearestCandidates(const pairingheap_node *a, const pairingheap_node *b, void *arg)
 {
-	if (HnswGetSearchCandidateConst(c_node, a)->distance < HnswGetSearchCandidateConst(c_node, b)->distance)
+	const HnswSearchCandidate *candidateA = HnswGetSearchCandidateConst(c_node, a);
+	const HnswSearchCandidate *candidateB = HnswGetSearchCandidateConst(c_node, b);
+
+	if (candidateA->distance < candidateB->distance)
 		return 1;
 
-	if (HnswGetSearchCandidateConst(c_node, a)->distance > HnswGetSearchCandidateConst(c_node, b)->distance)
+	if (candidateA->distance > candidateB->distance)
 		return -1;
+
+	if (arg != NULL)
+	{
+		HnswSearchHeapCompareContext *context = arg;
+		HnswElement elementA = HnswPtrAccess(context->base, candidateA->element);
+		HnswElement elementB = HnswPtrAccess(context->base, candidateB->element);
+
+		return -CompareSeededElementKeys(elementA, elementB);
+	}
 
 	return 0;
 }
@@ -767,11 +834,23 @@ CompareNearestDiscardedCandidates(const pairingheap_node *a, const pairingheap_n
 static int
 CompareFurthestCandidates(const pairingheap_node *a, const pairingheap_node *b, void *arg)
 {
-	if (HnswGetSearchCandidateConst(w_node, a)->distance < HnswGetSearchCandidateConst(w_node, b)->distance)
+	const HnswSearchCandidate *candidateA = HnswGetSearchCandidateConst(w_node, a);
+	const HnswSearchCandidate *candidateB = HnswGetSearchCandidateConst(w_node, b);
+
+	if (candidateA->distance < candidateB->distance)
 		return -1;
 
-	if (HnswGetSearchCandidateConst(w_node, a)->distance > HnswGetSearchCandidateConst(w_node, b)->distance)
+	if (candidateA->distance > candidateB->distance)
 		return 1;
+
+	if (arg != NULL)
+	{
+		HnswSearchHeapCompareContext *context = arg;
+		HnswElement elementA = HnswPtrAccess(context->base, candidateA->element);
+		HnswElement elementB = HnswPtrAccess(context->base, candidateB->element);
+
+		return CompareSeededElementKeys(elementA, elementB);
+	}
 
 	return 0;
 }
@@ -794,18 +873,34 @@ CompareFurthestGuidedCandidates(const pairingheap_node *a, const pairingheap_nod
 static inline bool CountElement(HnswElement skipElement, HnswElement e);
 
 static inline void
-HnswAddGuidedCandidate(pairingheap *G, int *glen, int ef, HnswSearchCandidate *sc, HnswElement element, HnswElement skipElement)
+HnswAddGuidedCandidate(pairingheap *G, List **guidedCandidates, List *wCandidates, pairingheap *discarded, int *glen, int ef, HnswSearchCandidate *sc, HnswElement element, HnswElement skipElement, HnswTraversalProfile *profile)
 {
 	if (G == NULL || !sc->matchesGuidance || !CountElement(skipElement, element))
 		return;
 
 	pairingheap_add(G, &sc->g_node);
+	*guidedCandidates = lappend(*guidedCandidates, sc);
 	(*glen)++;
+	if (profile != NULL)
+		profile->guidedAdmissions++;
 
 	if (*glen > ef)
 	{
-		(void) pairingheap_remove_first(G);
+		HnswSearchCandidate *evicted = HnswGetSearchCandidate(g_node, pairingheap_remove_first(G));
+
+		*guidedCandidates = list_delete_ptr(*guidedCandidates, evicted);
 		(*glen)--;
+
+		/*
+		 * A G-evicted candidate may already have left W.  Preserve it for a
+		 * resume in that case; candidates still owned by W are moved below.
+		 */
+		if (discarded != NULL && !list_member_ptr(wCandidates, evicted))
+		{
+			pairingheap_add(discarded, &evicted->w_node);
+			if (profile != NULL)
+				profile->discardedPushes++;
+		}
 	}
 }
 
@@ -935,7 +1030,7 @@ HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation i
 /*
  * Load unvisited neighbors from disk
  */
-static void
+static bool
 HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, int m, int lm, int lc)
 {
 	ItemPointerData indextids[HNSW_MAX_M * 2];
@@ -943,7 +1038,7 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 	*unvisitedLength = 0;
 
 	if (!HnswLoadNeighborTids(element, indextids, index, m, lm, lc))
-		return;
+		return false;
 
 	for (int i = 0; i < lm; i++)
 	{
@@ -958,18 +1053,423 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 		if (!found)
 			unvisited[(*unvisitedLength)++].indextid = *indextid;
 	}
+
+	return true;
+}
+
+typedef struct HnswMissBridgeCandidate
+{
+	struct HnswMissBridgeCandidate *next;
+	HnswElement element;
+	int			hops;
+} HnswMissBridgeCandidate;
+
+typedef struct HnswTraversalGuidedSearch
+{
+	HnswQuery  *query;
+	Relation	index;
+	HnswSupport *support;
+	int			ef;
+	int			m;
+	int			lm;
+	visited_hash *visited;
+	int64	   *tuples;
+	int64	   *distanceComputations;
+	HnswTraversalProfile *profile;
+	HnswIndexPageProfileState *indexPageProfile;
+	HnswScanGuidance *guidance;
+	HnswTraversalGuidanceState *state;
+	pairingheap *candidates;
+	pairingheap *results;
+	int			resultCount;
+	HnswUnvisited *unvisited;
+	HnswMissBridgeCandidate *bridgeHead;
+	HnswMissBridgeCandidate *bridgeTail;
+} HnswTraversalGuidedSearch;
+
+static bool
+HnswTraversalGuidedCheckUncertainty(HnswTraversalGuidedSearch *search);
+
+static HnswElement
+HnswTraversalGuidedLoadElement(ItemPointer indextid,
+							   HnswTraversalGuidedSearch *search,
+							   bool *matches, double *distance)
+{
+	BlockNumber blkno = ItemPointerGetBlockNumber(indextid);
+	OffsetNumber offno = ItemPointerGetOffsetNumber(indextid);
+	Buffer		buf;
+	Page		page;
+	ItemId		itemId;
+	HnswElementTuple etup;
+	HnswElement element;
+
+	if (blkno == HNSW_METAPAGE_BLKNO ||
+		blkno >= RelationGetNumberOfBlocks(search->index) ||
+		!OffsetNumberIsValid(offno))
+	{
+		search->state->invalidNeighbor = true;
+		return NULL;
+	}
+
+	buf = ReadBuffer(search->index, blkno);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	if (PageGetSpecialSize(page) != MAXALIGN(sizeof(HnswPageOpaqueData)) ||
+		HnswPageGetOpaque(page)->page_id != HNSW_PAGE_ID ||
+		offno > PageGetMaxOffsetNumber(page))
+		goto invalid;
+	itemId = PageGetItemId(page, offno);
+	if (!ItemIdIsNormal(itemId))
+		goto invalid;
+	etup = (HnswElementTuple) PageGetItem(page, itemId);
+	if (!HnswIsElementTuple(etup))
+		goto invalid;
+
+	element = HnswInitElementFromBlock(blkno, offno);
+	HnswLoadElementFromTuple(element, etup, true, false);
+	if (HnswTraversalGuidedCheckUncertainty(search))
+	{
+		UnlockReleaseBuffer(buf);
+		return NULL;
+	}
+	*matches = HnswElementMatchesGuidance(element, search->guidance,
+										 search->profile, true);
+	if (*matches)
+	{
+		if (DatumGetPointer(search->query->value) == NULL)
+			*distance = 0;
+		else
+			*distance = HnswGetDistance(search->query->value,
+									  PointerGetDatum(&etup->data), search->support);
+		if (search->distanceComputations != NULL)
+			(*search->distanceComputations)++;
+	}
+	else if (search->profile != NULL)
+		search->profile->distanceComputationsAvoided++;
+
+	UnlockReleaseBuffer(buf);
+	return element;
+
+invalid:
+	UnlockReleaseBuffer(buf);
+	search->state->invalidNeighbor = true;
+	return NULL;
+}
+
+static void
+HnswTraversalGuidedEnqueueBridge(HnswTraversalGuidedSearch *search,
+								 HnswElement element, int hops)
+{
+	HnswMissBridgeCandidate *bridge;
+
+	if (HnswTraversalGuidedCheckUncertainty(search))
+		return;
+	if (hops > search->state->maxBridgeHops)
+	{
+		search->state->hopLimitReached = true;
+		return;
+	}
+
+	bridge = MemoryContextAlloc(search->state->phaseContext, sizeof(*bridge));
+	bridge->next = NULL;
+	bridge->element = element;
+	bridge->hops = hops;
+	if (search->bridgeTail == NULL)
+		search->bridgeHead = bridge;
+	else
+		search->bridgeTail->next = bridge;
+	search->bridgeTail = bridge;
+}
+
+static void
+HnswTraversalGuidedAdmitMatch(HnswTraversalGuidedSearch *search,
+								  HnswElement element, double distance)
+{
+	HnswSearchCandidate *furthest = pairingheap_is_empty(search->results) ?
+		NULL : HnswGetSearchCandidate(w_node, pairingheap_first(search->results));
+	bool		alwaysAdd = search->resultCount < search->ef;
+	HnswSearchCandidate *candidate;
+
+	if (!alwaysAdd && furthest != NULL && distance >= furthest->distance)
+		return;
+
+	candidate = HnswInitSearchCandidate(NULL, element, distance);
+	candidate->matchesGuidance = true;
+	pairingheap_add(search->candidates, &candidate->c_node);
+	pairingheap_add(search->results, &candidate->w_node);
+	search->resultCount++;
+	if (search->profile != NULL)
+	{
+		search->profile->candidateAdmissions++;
+		search->profile->resultAdmissions++;
+		search->profile->guidedAdmissions++;
+	}
+
+	if (search->resultCount > search->ef)
+	{
+		(void) pairingheap_remove_first(search->results);
+		search->resultCount--;
+	}
+}
+
+static void
+HnswTraversalGuidedInspectNeighbor(HnswTraversalGuidedSearch *search,
+								   ItemPointer indextid, int missHops)
+{
+	HnswElement element;
+	bool		matches;
+	double		distance = 0;
+
+	if (HnswTraversalGuidedCheckUncertainty(search))
+		return;
+	element = HnswTraversalGuidedLoadElement(indextid, search, &matches,
+											 &distance);
+	if (element == NULL)
+		return;
+	if (matches)
+		HnswTraversalGuidedAdmitMatch(search, element, distance);
+	else
+		HnswTraversalGuidedEnqueueBridge(search, element, missHops);
+}
+
+static bool
+HnswTraversalGuidedCheckUncertainty(HnswTraversalGuidedSearch *search)
+{
+	if (search->tuples != NULL && search->state->maxScanTuples > 0 &&
+		*search->tuples >= search->state->maxScanTuples)
+		search->state->maxScanReached = true;
+	if (search->state->phaseContext != NULL &&
+		MemoryContextMemAllocated(search->state->phaseContext, true) >
+		search->state->maxMemory)
+		search->state->memoryLimitReached = true;
+
+	return search->state->maxScanReached || search->state->memoryLimitReached ||
+		search->state->invalidNeighbor || search->state->workLimitReached ||
+		search->state->hopLimitReached;
+}
+
+static bool
+HnswTraversalGuidedExpand(HnswTraversalGuidedSearch *search,
+							  HnswElement element, bool bridge, int bridgeHops)
+{
+	int			unvisitedLength = 0;
+
+	if (HnswTraversalGuidedCheckUncertainty(search))
+		return false;
+	if (bridge)
+	{
+		if (search->state->bridgeWork + 1 + search->lm >
+			search->state->maxBridgeWork)
+		{
+			search->state->workLimitReached = true;
+			return false;
+		}
+		search->state->bridgeWork += 1 + search->lm;
+	}
+
+	HnswRecordIndexNeighborPage(search->indexPageProfile,
+								element->neighborPage);
+	if (!HnswLoadUnvisitedFromDisk(element, search->unvisited, &unvisitedLength,
+									 search->visited, search->index,
+									 search->m, search->lm, 0))
+	{
+		search->state->invalidNeighbor = true;
+		return false;
+	}
+	HnswPrefetchUnvisitedIndexPages(search->index, search->unvisited,
+		unvisitedLength,
+		search->indexPageProfile);
+
+	if (search->tuples != NULL)
+		*search->tuples += unvisitedLength;
+	if (search->profile != NULL)
+	{
+		search->profile->expandedNodes++;
+		search->profile->guidedExpandedNodes++;
+		search->profile->neighborsExamined += unvisitedLength;
+		if (bridge)
+		{
+			search->profile->bridgeExpanded++;
+			search->profile->missBridgeNodes++;
+			search->profile->missBridgeEdges += unvisitedLength;
+			search->profile->maxMissBridgeHops = Max(
+				search->profile->maxMissBridgeHops, bridgeHops);
+		}
+		else
+			search->profile->matchingExpanded++;
+	}
+
+	if (HnswTraversalGuidedCheckUncertainty(search))
+		return false;
+
+	for (int i = 0; i < unvisitedLength; i++)
+	{
+		HnswTraversalGuidedInspectNeighbor(search,
+			&search->unvisited[i].indextid,
+			bridge ? bridgeHops + 1 : 1);
+		if (HnswTraversalGuidedCheckUncertainty(search))
+			return false;
+	}
+
+	return true;
+}
+
+static List *
+HnswSearchLayerTraversalGuided(List *ep, int ef, Relation index,
+							   HnswQuery *query, HnswSupport *support, int m,
+								   visited_hash *visited, int64 *tuples,
+								   int64 *distanceComputations,
+								   HnswTraversalProfile *profile,
+								   HnswScanGuidance *guidance,
+								   HnswTraversalGuidanceState *state,
+								   HnswIndexPageProfileState *indexPageProfile)
+{
+	HnswTraversalGuidedSearch search;
+	char	   *base = NULL;
+	ListCell   *cell;
+	List	   *result = NIL;
+	bool		terminated = false;
+
+	if (state->phaseContext == NULL ||
+		CurrentMemoryContext != state->phaseContext)
+	{
+		state->invalidNeighbor = true;
+		return NIL;
+	}
+
+	MemSet(&search, 0, sizeof(search));
+	search.query = query;
+	search.index = index;
+	search.support = support;
+	state->target = Max(state->target, ef);
+	search.ef = state->target;
+	search.m = m;
+	search.lm = HnswGetLayerM(m, 0);
+	search.visited = visited;
+	search.tuples = tuples;
+	search.distanceComputations = distanceComputations;
+	search.profile = profile;
+	search.indexPageProfile = indexPageProfile;
+	search.guidance = guidance;
+	search.state = state;
+	search.candidates = pairingheap_allocate(CompareNearestCandidates, NULL);
+	search.results = pairingheap_allocate(CompareFurthestCandidates, NULL);
+	search.unvisited = palloc(search.lm * sizeof(HnswUnvisited));
+	InitVisited(NULL, visited, false, search.ef, m);
+
+	foreach(cell, ep)
+	{
+		HnswSearchCandidate *candidate = (HnswSearchCandidate *) lfirst(cell);
+		HnswElement element = HnswPtrAccess(base, candidate->element);
+		bool		found;
+		bool		matches;
+
+		if (HnswTraversalGuidedCheckUncertainty(&search))
+			break;
+		AddToVisited(NULL, visited, candidate->element, false, &found);
+		if (HnswTraversalGuidedCheckUncertainty(&search))
+			break;
+		if (tuples != NULL)
+			(*tuples)++;
+		matches = HnswElementMatchesGuidance(element, guidance, profile, false);
+		candidate->matchesGuidance = matches;
+		if (matches)
+		{
+			pairingheap_add(search.candidates, &candidate->c_node);
+			pairingheap_add(search.results, &candidate->w_node);
+			search.resultCount++;
+			if (profile != NULL)
+			{
+				profile->candidateAdmissions++;
+				profile->resultAdmissions++;
+				profile->guidedAdmissions++;
+			}
+		}
+		else
+			HnswTraversalGuidedEnqueueBridge(&search, element, 0);
+		if (HnswTraversalGuidedCheckUncertainty(&search))
+			break;
+	}
+
+	while (!pairingheap_is_empty(search.candidates) || search.bridgeHead != NULL)
+	{
+		CHECK_FOR_INTERRUPTS();
+
+		if (HnswTraversalGuidedCheckUncertainty(&search))
+			break;
+
+		if (!pairingheap_is_empty(search.candidates))
+		{
+			HnswSearchCandidate *candidate = HnswGetSearchCandidate(c_node,
+				pairingheap_remove_first(search.candidates));
+			HnswSearchCandidate *furthest = pairingheap_is_empty(search.results) ?
+				NULL : HnswGetSearchCandidate(w_node,
+					pairingheap_first(search.results));
+
+			if (furthest != NULL && search.resultCount >= state->target &&
+				candidate->distance > furthest->distance)
+			{
+				terminated = true;
+				break;
+			}
+			if (!HnswTraversalGuidedExpand(&search,
+					HnswPtrAccess(base, candidate->element), false, 0))
+				break;
+			continue;
+		}
+
+		if (search.resultCount >= state->target)
+		{
+			terminated = true;
+			break;
+		}
+
+		if (search.bridgeHead != NULL)
+		{
+			HnswMissBridgeCandidate *bridge = search.bridgeHead;
+
+			search.bridgeHead = bridge->next;
+			if (search.bridgeHead == NULL)
+				search.bridgeTail = NULL;
+			if (!HnswTraversalGuidedExpand(&search, bridge->element, true,
+										bridge->hops))
+				break;
+		}
+	}
+
+	state->guidedResultCount = search.resultCount;
+	if (profile != NULL && !terminated &&
+		!state->maxScanReached && !state->memoryLimitReached &&
+		!state->invalidNeighbor && !state->workLimitReached &&
+		!state->hopLimitReached)
+		profile->exhaustedTerminations++;
+
+	while (!pairingheap_is_empty(search.results))
+	{
+		HnswSearchCandidate *candidate = HnswGetSearchCandidate(w_node,
+			pairingheap_remove_first(search.results));
+
+		result = lappend(result, candidate);
+	}
+
+	return result;
 }
 
 /*
  * Algorithm 2 from paper
  */
 List *
-HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, int64 *distanceComputations)
+HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, int64 *distanceComputations, HnswTraversalProfile *traversalProfile, HnswScanGuidance *guidance, HnswTraversalGuidanceState *traversalGuidance, HnswIndexPageProfileState *indexPageProfile)
 {
+	HnswSearchHeapCompareContext heapCompareContext = {base};
+	void	   *heapCompareArg = inserting && index == NULL &&
+		hnsw_build_seed >= 0 ? &heapCompareContext : NULL;
 	List	   *w = NIL;
-	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
-	pairingheap *W = pairingheap_allocate(CompareFurthestCandidates, NULL);
+	pairingheap *C = NULL;
+	pairingheap *W = NULL;
 	pairingheap *G = NULL;
+	List	   *guidedCandidates = NIL;
+	List	   *wCandidates = NIL;
 	int			wlen = 0;
 	int			glen = 0;
 	visited_hash vh;
@@ -977,13 +1477,34 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	HnswNeighborArray *localNeighborhood = NULL;
 	Size		neighborhoodSize = 0;
 	int			lm = HnswGetLayerM(m, lc);
-	HnswUnvisited *unvisited = palloc(lm * sizeof(HnswUnvisited));
+	HnswUnvisited *unvisited = NULL;
 	int			unvisitedLength;
 	bool		inMemory = index == NULL;
-	Oid			heapOid = !inMemory && index->rd_index != NULL ? index->rd_index->indrelid : InvalidOid;
-	bool		useAcorn1 = !inserting && lc == 0 && hnsw_filter_strategy == HNSW_FILTER_STRATEGY_ACORN1 && HnswGuidanceIsActiveForHeap(heapOid);
-	bool		useGuidedCollect = !inserting && lc == 0 && hnsw_filter_strategy == HNSW_FILTER_STRATEGY_GUIDED_COLLECT && HnswGuidanceIsActiveForHeap(heapOid);
+	bool		useAcorn1 = !inserting && lc == 0 && hnsw_filter_strategy == HNSW_FILTER_STRATEGY_ACORN1 && HnswGuidanceIsActiveForScan(guidance);
+	bool		useGuidedCollect = !inserting && lc == 0 && hnsw_filter_strategy == HNSW_FILTER_STRATEGY_GUIDED_COLLECT && HnswGuidanceIsActiveForScan(guidance);
+	bool		useTraversalGuided = !inserting && lc == 0 &&
+		hnsw_filter_strategy == HNSW_FILTER_STRATEGY_TRAVERSAL_GUIDED &&
+		traversalGuidance != NULL && traversalGuidance->phaseEnabled &&
+		HnswGuidanceIsActiveForScan(guidance);
+	bool		trackTraversal = !inserting && lc == 0 && traversalProfile != NULL;
+	bool		terminationRecorded = false;
 	int			guidedTarget = hnsw_guided_collect_target;
+
+	if (useTraversalGuided)
+	{
+		if (inMemory || !initVisited || v == NULL || discarded != NULL)
+		{
+			traversalGuidance->invalidNeighbor = true;
+			return NIL;
+		}
+		return HnswSearchLayerTraversalGuided(ep, ef, index, q, support, m,
+			v, tuples, distanceComputations, traversalProfile, guidance,
+			traversalGuidance, indexPageProfile);
+	}
+
+	C = pairingheap_allocate(CompareNearestCandidates, heapCompareArg);
+	W = pairingheap_allocate(CompareFurthestCandidates, heapCompareArg);
+	unvisited = palloc(lm * sizeof(HnswUnvisited));
 
 	if (useGuidedCollect)
 	{
@@ -1030,13 +1551,22 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		}
 
 		pairingheap_add(C, &sc->c_node);
+		if (trackTraversal)
+			traversalProfile->candidateAdmissions++;
 		if (useAcorn1 || useGuidedCollect)
-				matchesGuidance = HnswElementMatchesGuidance(HnswPtrAccess(base, sc->element), heapOid);
+			matchesGuidance = HnswElementMatchesGuidance(HnswPtrAccess(base, sc->element), guidance, traversalProfile, false);
 		sc->matchesGuidance = matchesGuidance;
 		if (!useAcorn1 || matchesGuidance)
+		{
 			pairingheap_add(W, &sc->w_node);
+			if (trackTraversal)
+				traversalProfile->resultAdmissions++;
+			if (useGuidedCollect)
+				wCandidates = lappend(wCandidates, sc);
+		}
 		if (useGuidedCollect)
-			HnswAddGuidedCandidate(G, &glen, ef, sc, HnswPtrAccess(base, sc->element), skipElement);
+			HnswAddGuidedCandidate(G, &guidedCandidates, wCandidates, discarded != NULL ? *discarded : NULL,
+							   &glen, ef, sc, HnswPtrAccess(base, sc->element), skipElement, traversalProfile);
 
 		/*
 		 * Do not count elements being deleted towards ef when vacuuming. It
@@ -1058,28 +1588,55 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		if (f != NULL && wlen >= ef && c->distance > f->distance)
 		{
 			if (!useGuidedCollect || glen >= guidedTarget)
+			{
+				if (trackTraversal)
+					traversalProfile->stockTerminations++;
+				terminationRecorded = true;
 				break;
+			}
 
 			if (tuples != NULL && hnsw_max_scan_tuples > 0 && *tuples >= hnsw_max_scan_tuples)
+			{
+				if (trackTraversal)
+					traversalProfile->maxScanTerminations++;
+				terminationRecorded = true;
 				break;
+			}
+			if (trackTraversal)
+				traversalProfile->stopDeferrals++;
 		}
 
 		cElement = HnswPtrAccess(base, c->element);
+		if (trackTraversal)
+		{
+			traversalProfile->expandedNodes++;
+			if (useAcorn1 || useGuidedCollect)
+			{
+				if (c->matchesGuidance)
+					traversalProfile->matchingExpanded++;
+				else
+					traversalProfile->bridgeExpanded++;
+			}
+		}
 
 		if (inMemory)
 			HnswLoadUnvisitedFromMemory(base, cElement, unvisited, &unvisitedLength, v, lc, localNeighborhood, neighborhoodSize);
 		else
 		{
 			if (!inserting)
-				HnswRecordIndexNeighborPage(cElement->neighborPage);
-			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc);
+					HnswRecordIndexNeighborPage(indexPageProfile,
+						cElement->neighborPage);
+			(void) HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc);
 			if (!inserting)
-				HnswPrefetchUnvisitedIndexPages(index, unvisited, unvisitedLength);
+					HnswPrefetchUnvisitedIndexPages(index, unvisited,
+						unvisitedLength, indexPageProfile);
 		}
 
 		/* OK to count elements instead of tuples */
 		if (tuples != NULL)
 			(*tuples) += unvisitedLength;
+		if (trackTraversal)
+			traversalProfile->neighborsExamined += unvisitedLength;
 
 		for (int i = 0; i < unvisitedLength; i++)
 		{
@@ -1117,7 +1674,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			}
 
 			if (useAcorn1 || useGuidedCollect)
-					matchesGuidance = HnswElementMatchesGuidance(eElement, heapOid);
+				matchesGuidance = HnswElementMatchesGuidance(eElement, guidance, traversalProfile, false);
 
 			if (useAcorn1 && !matchesGuidance)
 			{
@@ -1126,6 +1683,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 					e = HnswInitSearchCandidate(base, eElement, eDistance);
 					e->matchesGuidance = false;
 					pairingheap_add(C, &e->c_node);
+					if (trackTraversal)
+						traversalProfile->candidateAdmissions++;
 				}
 
 				continue;
@@ -1139,9 +1698,14 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 					e = HnswInitSearchCandidate(base, eElement, eDistance);
 					e->matchesGuidance = matchesGuidance;
 					if (useGuidedCollect)
-						HnswAddGuidedCandidate(G, &glen, ef, e, eElement, skipElement);
+						HnswAddGuidedCandidate(G, &guidedCandidates, wCandidates, discarded != NULL ? *discarded : NULL,
+										   &glen, ef, e, eElement, skipElement, traversalProfile);
 					if (discarded != NULL && !(useGuidedCollect && matchesGuidance))
+					{
 						pairingheap_add(*discarded, &e->w_node);
+						if (trackTraversal)
+							traversalProfile->discardedPushes++;
+					}
 				}
 
 				continue;
@@ -1157,7 +1721,15 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			pairingheap_add(C, &e->c_node);
 			pairingheap_add(W, &e->w_node);
 			if (useGuidedCollect)
-				HnswAddGuidedCandidate(G, &glen, ef, e, eElement, skipElement);
+				wCandidates = lappend(wCandidates, e);
+			if (trackTraversal)
+			{
+				traversalProfile->candidateAdmissions++;
+				traversalProfile->resultAdmissions++;
+			}
+			if (useGuidedCollect)
+				HnswAddGuidedCandidate(G, &guidedCandidates, wCandidates, discarded != NULL ? *discarded : NULL,
+									   &glen, ef, e, eElement, skipElement, traversalProfile);
 
 			/*
 			 * Do not count elements being deleted towards ef when vacuuming.
@@ -1173,15 +1745,45 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 				{
 					HnswSearchCandidate *d = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
 
-					if (discarded != NULL && !(useGuidedCollect && d->matchesGuidance))
+					if (useGuidedCollect)
+						wCandidates = list_delete_ptr(wCandidates, d);
+
+					if (discarded != NULL &&
+						!(useGuidedCollect && d->matchesGuidance && list_member_ptr(guidedCandidates, d)))
+					{
 						pairingheap_add(*discarded, &d->w_node);
+						if (trackTraversal)
+							traversalProfile->discardedPushes++;
+					}
 				}
 			}
 		}
 	}
+	if (trackTraversal && !terminationRecorded)
+		traversalProfile->exhaustedTerminations++;
 
 	if (useGuidedCollect && G != NULL && !pairingheap_is_empty(G))
 	{
+		/*
+		 * W owns the bridge frontier.  Remove every W node before either
+		 * returning its G candidate or handing it to the resume heap.  A
+		 * matching candidate still in G is returned, while every other W
+		 * candidate remains available for iterative expansion.
+		 */
+		while (!pairingheap_is_empty(W))
+		{
+			HnswSearchCandidate *sc = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+
+			wCandidates = list_delete_ptr(wCandidates, sc);
+			if (discarded != NULL &&
+				!(sc->matchesGuidance && list_member_ptr(guidedCandidates, sc)))
+			{
+				pairingheap_add(*discarded, &sc->w_node);
+				if (trackTraversal)
+					traversalProfile->discardedPushes++;
+			}
+		}
+
 		while (!pairingheap_is_empty(G))
 		{
 			HnswSearchCandidate *sc = HnswGetSearchCandidate(g_node, pairingheap_remove_first(G));
@@ -1203,20 +1805,83 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	return w;
 }
 
+static int
+CompareElementHeapTids(HnswElement a, HnswElement b)
+{
+	BlockNumber aBlock = ItemPointerGetBlockNumber(&a->heaptids[0]);
+	BlockNumber bBlock = ItemPointerGetBlockNumber(&b->heaptids[0]);
+	OffsetNumber aOffset = ItemPointerGetOffsetNumber(&a->heaptids[0]);
+	OffsetNumber bOffset = ItemPointerGetOffsetNumber(&b->heaptids[0]);
+
+	if (aBlock < bBlock)
+		return -1;
+	if (aBlock > bBlock)
+		return 1;
+	if (aOffset < bOffset)
+		return -1;
+	if (aOffset > bOffset)
+		return 1;
+	return 0;
+}
+
+static uint64
+HashElementHeapTid(HnswElement element)
+{
+	BlockNumber block = ItemPointerGetBlockNumber(&element->heaptids[0]);
+	OffsetNumber offset = ItemPointerGetOffsetNumber(&element->heaptids[0]);
+	unsigned char bytes[6];
+
+	/* Serialize explicitly so the tie order is independent of struct padding. */
+	bytes[0] = (unsigned char) (block & 0xff);
+	bytes[1] = (unsigned char) ((block >> 8) & 0xff);
+	bytes[2] = (unsigned char) ((block >> 16) & 0xff);
+	bytes[3] = (unsigned char) ((block >> 24) & 0xff);
+	bytes[4] = (unsigned char) (offset & 0xff);
+	bytes[5] = (unsigned char) ((offset >> 8) & 0xff);
+
+	return hash_any_extended(bytes, sizeof(bytes), (uint64) (uint32) hnsw_build_seed);
+}
+
+static int
+CompareSeededElementKeys(HnswElement a, HnswElement b)
+{
+	uint64		aHash = HashElementHeapTid(a);
+	uint64		bHash = HashElementHeapTid(b);
+
+	if (aHash < bHash)
+		return -1;
+	if (aHash > bHash)
+		return 1;
+	return CompareElementHeapTids(a, b);
+}
+
 /*
- * Compare candidate distances with pointer tie-breaker
+ * Compare candidate distances with a stable tie-breaker for reproducible
+ * serial builds. Pointer addresses are process-local and can otherwise make
+ * equal-distance candidates produce different logical graphs.
  */
 static int
 CompareCandidateDistances(const ListCell *a, const ListCell *b)
 {
 	HnswCandidate *hca = lfirst(a);
 	HnswCandidate *hcb = lfirst(b);
+	HnswElement aElement;
+	HnswElement bElement;
+	int			keyCompare;
 
 	if (hca->distance < hcb->distance)
 		return 1;
 
 	if (hca->distance > hcb->distance)
 		return -1;
+
+	if (hnsw_build_seed >= 0)
+	{
+		aElement = HnswPtrPointer(hca->element);
+		bElement = HnswPtrPointer(hcb->element);
+		keyCompare = CompareSeededElementKeys(aElement, bElement);
+		return -keyCompare;
+	}
 
 	if (HnswPtrPointer(hca->element) < HnswPtrPointer(hcb->element))
 		return 1;
@@ -1290,12 +1955,7 @@ SelectNeighbors(char *base, List *c, int lm, HnswSupport * support, bool *closer
 	List	   *added = NIL;
 	bool		removedAny = false;
 
-	if (list_length(w) <= lm)
-		return w;
-
-	wd = palloc(sizeof(HnswCandidate *) * list_length(w));
-
-	/* Ensure order of candidates is deterministic for closer caching */
+	/* Seeded builds also need stable ordering when every candidate fits. */
 	if (sortCandidates)
 	{
 		if (base == NULL)
@@ -1303,6 +1963,11 @@ SelectNeighbors(char *base, List *c, int lm, HnswSupport * support, bool *closer
 		else
 			list_sort(w, CompareCandidateDistancesOffset);
 	}
+
+	if (list_length(w) <= lm)
+		return w;
+
+	wd = palloc(sizeof(HnswCandidate *) * list_length(w));
 
 	while (list_length(w) > 0 && list_length(r) < lm)
 	{
@@ -1522,7 +2187,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 	/* 1st phase: greedy search to insert level */
 	for (int lc = entryLevel; lc >= level + 1; lc--)
 	{
-		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL);
+		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL, NULL, NULL, NULL, NULL);
 		ep = w;
 	}
 
@@ -1541,7 +2206,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 		List	   *lw = NIL;
 		ListCell   *lc2;
 
-		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL);
+		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL, NULL, NULL, NULL, NULL);
 
 		/* Convert search candidates to candidates */
 		foreach(lc2, w)
@@ -1560,12 +2225,8 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 		if (!inMemory)
 			lw = RemoveElements(base, lw, skipElement);
 
-		/*
-		 * Candidates are sorted, but not deterministically. Could set
-		 * sortCandidates to true for in-memory builds to enable closer
-		 * caching, but there does not seem to be a difference in performance.
-		 */
-		neighbors = SelectNeighbors(base, lw, lm, support, &HnswGetNeighbors(base, element, lc)->closerSet, NULL, NULL, false);
+		/* A seeded serial build uses heap TIDs to make every tie deterministic. */
+		neighbors = SelectNeighbors(base, lw, lm, support, &HnswGetNeighbors(base, element, lc)->closerSet, NULL, NULL, hnsw_build_seed >= 0);
 
 		AddConnections(base, element, neighbors, lc);
 
