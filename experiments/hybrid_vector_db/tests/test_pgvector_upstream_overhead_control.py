@@ -108,6 +108,62 @@ class PgvectorUpstreamOverheadControlTests(unittest.TestCase):
                 }
             )
 
+        accepted = runner.config_from_mapping(
+            {
+                "ef_search": 10_000,
+                "iterative_scan": "strict_order",
+                "max_scan_tuples": 5_000_000,
+                "scan_mem_multiplier": 32,
+                "budget_rank": 3,
+            },
+            max_ef_search=10_000,
+        )
+        self.assertEqual(accepted.ef_search, 10_000)
+
+    def test_candidate_validity_is_part_of_sql_but_not_the_workload_predicate(self):
+        sql = runner.build_hybrid_sql(
+            "public.items",
+            "rating = 5",
+            10,
+            "embedding_valid",
+        )
+        normalized = " ".join(sql.split())
+        self.assertIn(
+            "WHERE (rating = 5) AND (embedding_valid) AND id <> %s",
+            normalized,
+        )
+        with self.assertRaisesRegex(ValueError, "candidate-validity"):
+            runner.build_hybrid_sql("public.items", "rating = 5", 10, "true; DROP")
+
+    def test_upstream_evaluation_patch_must_equal_the_canonical_two_file_diff(self):
+        canonical = Path("patches/pgvector-v0.8.2-ef-search-10000.patch").read_bytes()
+        with TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            source.mkdir()
+            patch = Path(temporary) / "ceiling.patch"
+            patch.write_bytes(canonical)
+            command_results = [
+                SimpleNamespace(returncode=0, stdout=canonical, stderr=b""),
+                SimpleNamespace(
+                    returncode=0,
+                    stdout="src/hnsw.c\nsrc/hnsw.h\n",
+                    stderr="",
+                ),
+                SimpleNamespace(returncode=0, stdout="", stderr=""),
+            ]
+            with mock.patch.object(runner.subprocess, "run", side_effect=command_results):
+                proof = runner.upstream_parameter_ceiling_provenance(
+                    source, patch, 10_000
+                )
+
+            self.assertFalse(proof["algorithm_change"])
+            self.assertEqual(proof["patch_sha256"], runner.UPSTREAM_EF10000_PATCH_SHA256)
+            self.assertEqual(proof["changed_files"], ["src/hnsw.c", "src/hnsw.h"])
+
+            patch.write_bytes(canonical + b"\n")
+            with self.assertRaisesRegex(runner.ProvenanceGateError, "canonical"):
+                runner.upstream_parameter_ceiling_provenance(source, patch, 10_000)
+
     def test_promotion_includes_margin_winner_family_recall_and_max_budget_proofs(self):
         configs = [
             runner.Config(100, "off", 100_000, 1.0, 0),

@@ -1082,6 +1082,7 @@ typedef struct HnswTraversalGuidedSearch
 	pairingheap *candidates;
 	pairingheap *results;
 	int			resultCount;
+	int			bridgePending;
 	HnswUnvisited *unvisited;
 	HnswMissBridgeCandidate *bridgeHead;
 	HnswMissBridgeCandidate *bridgeTail;
@@ -1145,7 +1146,10 @@ HnswTraversalGuidedLoadElement(ItemPointer indextid,
 			(*search->distanceComputations)++;
 	}
 	else if (search->profile != NULL)
+	{
+		search->profile->attemptedDistanceComputationsAvoided++;
 		search->profile->distanceComputationsAvoided++;
+	}
 
 	UnlockReleaseBuffer(buf);
 	return element;
@@ -1162,6 +1166,8 @@ HnswTraversalGuidedEnqueueBridge(HnswTraversalGuidedSearch *search,
 {
 	HnswMissBridgeCandidate *bridge;
 
+	/* Count unresolved misses before checking whether they can be queued. */
+	search->bridgePending++;
 	if (HnswTraversalGuidedCheckUncertainty(search))
 		return;
 	if (hops > search->state->maxBridgeHops)
@@ -1314,6 +1320,24 @@ HnswTraversalGuidedExpand(HnswTraversalGuidedSearch *search,
 	return true;
 }
 
+static bool
+HnswTraversalGuidedExpandNextBridge(HnswTraversalGuidedSearch *search)
+{
+	HnswMissBridgeCandidate *bridge = search->bridgeHead;
+
+	Assert(bridge != NULL);
+	search->bridgeHead = bridge->next;
+	if (search->bridgeHead == NULL)
+		search->bridgeTail = NULL;
+	if (!HnswTraversalGuidedExpand(search, bridge->element, true,
+									bridge->hops))
+		return false;
+
+	Assert(search->bridgePending > 0);
+	search->bridgePending--;
+	return true;
+}
+
 static List *
 HnswSearchLayerTraversalGuided(List *ep, int ef, Relation index,
 							   HnswQuery *query, HnswSupport *support, int m,
@@ -1409,8 +1433,16 @@ HnswSearchLayerTraversalGuided(List *ep, int ef, Relation index,
 			if (furthest != NULL && search.resultCount >= state->target &&
 				candidate->distance > furthest->distance)
 			{
-				terminated = true;
-				break;
+				if (search.bridgeHead == NULL)
+				{
+					terminated = true;
+					break;
+				}
+				if (profile != NULL)
+					profile->stopDeferrals++;
+				if (!HnswTraversalGuidedExpandNextBridge(&search))
+					break;
+				continue;
 			}
 			if (!HnswTraversalGuidedExpand(&search,
 					HnswPtrAccess(base, candidate->element), false, 0))
@@ -1418,26 +1450,19 @@ HnswSearchLayerTraversalGuided(List *ep, int ef, Relation index,
 			continue;
 		}
 
-		if (search.resultCount >= state->target)
-		{
-			terminated = true;
-			break;
-		}
-
 		if (search.bridgeHead != NULL)
 		{
-			HnswMissBridgeCandidate *bridge = search.bridgeHead;
-
-			search.bridgeHead = bridge->next;
-			if (search.bridgeHead == NULL)
-				search.bridgeTail = NULL;
-			if (!HnswTraversalGuidedExpand(&search, bridge->element, true,
-										bridge->hops))
+			if (search.resultCount >= state->target && profile != NULL)
+				profile->stopDeferrals++;
+			if (!HnswTraversalGuidedExpandNextBridge(&search))
 				break;
 		}
 	}
 
 	state->guidedResultCount = search.resultCount;
+	state->bridgePendingAtTermination = search.bridgePending;
+	if (profile != NULL)
+		profile->bridgePendingAtTermination = search.bridgePending;
 	if (profile != NULL && !terminated &&
 		!state->maxScanReached && !state->memoryLimitReached &&
 		!state->invalidNeighbor && !state->workLimitReached &&
@@ -1486,6 +1511,12 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		hnsw_filter_strategy == HNSW_FILTER_STRATEGY_TRAVERSAL_GUIDED &&
 		traversalGuidance != NULL && traversalGuidance->phaseEnabled &&
 		HnswGuidanceIsActiveForScan(guidance);
+	bool		useTraversalAdmission = !inserting && lc == 0 &&
+		hnsw_filter_strategy == HNSW_FILTER_STRATEGY_TRAVERSAL_GUIDED &&
+		traversalGuidance != NULL &&
+		traversalGuidance->finalPath == HNSW_TRAVERSAL_PATH_GUIDED &&
+		HnswGuidanceIsActiveForScan(guidance);
+	bool		useAdmissionGuidance = useAcorn1 || useTraversalAdmission;
 	bool		trackTraversal = !inserting && lc == 0 && traversalProfile != NULL;
 	bool		terminationRecorded = false;
 	int			guidedTarget = hnsw_guided_collect_target;
@@ -1553,16 +1584,26 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		pairingheap_add(C, &sc->c_node);
 		if (trackTraversal)
 			traversalProfile->candidateAdmissions++;
-		if (useAcorn1 || useGuidedCollect)
+		if (useAdmissionGuidance || useGuidedCollect)
 			matchesGuidance = HnswElementMatchesGuidance(HnswPtrAccess(base, sc->element), guidance, traversalProfile, false);
 		sc->matchesGuidance = matchesGuidance;
-		if (!useAcorn1 || matchesGuidance)
+		if (!useAdmissionGuidance || matchesGuidance)
 		{
 			pairingheap_add(W, &sc->w_node);
 			if (trackTraversal)
+			{
 				traversalProfile->resultAdmissions++;
+				if (useTraversalAdmission)
+					traversalProfile->guidedAdmissions++;
+			}
 			if (useGuidedCollect)
 				wCandidates = lappend(wCandidates, sc);
+		}
+		else if (trackTraversal && useTraversalAdmission)
+		{
+			traversalProfile->guidedSuppressions++;
+			traversalProfile->heapTidsSuppressed +=
+				HnswPtrAccess(base, sc->element)->heaptidsLength;
 		}
 		if (useGuidedCollect)
 			HnswAddGuidedCandidate(G, &guidedCandidates, wCandidates, discarded != NULL ? *discarded : NULL,
@@ -1573,7 +1614,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		 * would be ideal to do this for inserts as well, but this could
 		 * affect insert performance.
 		 */
-		if ((!useAcorn1 || matchesGuidance) && CountElement(skipElement, HnswPtrAccess(base, sc->element)))
+		if ((!useAdmissionGuidance || matchesGuidance) && CountElement(skipElement, HnswPtrAccess(base, sc->element)))
 			wlen++;
 	}
 
@@ -1610,7 +1651,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		if (trackTraversal)
 		{
 			traversalProfile->expandedNodes++;
-			if (useAcorn1 || useGuidedCollect)
+			if (useAdmissionGuidance || useGuidedCollect)
 			{
 				if (c->matchesGuidance)
 					traversalProfile->matchingExpanded++;
@@ -1637,6 +1678,11 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			(*tuples) += unvisitedLength;
 		if (trackTraversal)
 			traversalProfile->neighborsExamined += unvisitedLength;
+		if (trackTraversal && useTraversalAdmission && !c->matchesGuidance)
+		{
+			traversalProfile->missBridgeNodes++;
+			traversalProfile->missBridgeEdges += unvisitedLength;
+		}
 
 		for (int i = 0; i < unvisitedLength; i++)
 		{
@@ -1673,10 +1719,10 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 					continue;
 			}
 
-			if (useAcorn1 || useGuidedCollect)
+			if (useAdmissionGuidance || useGuidedCollect)
 				matchesGuidance = HnswElementMatchesGuidance(eElement, guidance, traversalProfile, false);
 
-			if (useAcorn1 && !matchesGuidance)
+			if (useAdmissionGuidance && !matchesGuidance)
 			{
 				if (alwaysAdd || f == NULL || eDistance < f->distance)
 				{
@@ -1684,7 +1730,15 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 					e->matchesGuidance = false;
 					pairingheap_add(C, &e->c_node);
 					if (trackTraversal)
+					{
 						traversalProfile->candidateAdmissions++;
+						if (useTraversalAdmission)
+						{
+							traversalProfile->guidedSuppressions++;
+							traversalProfile->heapTidsSuppressed +=
+								eElement->heaptidsLength;
+						}
+					}
 				}
 
 				continue;
@@ -1726,6 +1780,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			{
 				traversalProfile->candidateAdmissions++;
 				traversalProfile->resultAdmissions++;
+				if (useTraversalAdmission)
+					traversalProfile->guidedAdmissions++;
 			}
 			if (useGuidedCollect)
 				HnswAddGuidedCandidate(G, &guidedCandidates, wCandidates, discarded != NULL ? *discarded : NULL,

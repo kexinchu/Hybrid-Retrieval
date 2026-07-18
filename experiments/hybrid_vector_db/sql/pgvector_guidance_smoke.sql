@@ -101,12 +101,20 @@ DO $$
 DECLARE
   profile jsonb := vector_hnsw_last_scan_profile()::jsonb;
 BEGIN
-  IF (profile ->> 'profile_semantics_version')::integer <> 2
+  IF (profile ->> 'profile_semantics_version')::integer <> 6
      OR (profile ->> 'heap_fetch_ms_is_residual_proxy')::boolean IS NOT TRUE
      OR profile ->> 'graph_elements_visited' IS DISTINCT FROM profile ->> 'visited_tuples'
      OR profile ->> 'raw_index_tids_returned' IS DISTINCT FROM profile ->> 'returned_tuples'
      OR profile ->> 'hnsw_am_callback_ms' IS DISTINCT FROM profile ->> 'hnsw_search_ms'
-     OR profile ->> 'executor_residual_ms' IS DISTINCT FROM profile ->> 'heap_fetch_ms' THEN
+     OR profile ->> 'executor_residual_ms' IS DISTINCT FROM profile ->> 'heap_fetch_ms'
+     OR NOT profile ? 'final_path'
+     OR NOT profile ? 'filter_strategy'
+     OR NOT profile ? 'iterative_scan'
+     OR NOT profile ? 'net_distance_saved_available'
+     OR profile ->> 'traversal_guidance_scope' <>
+          'candidate_admission_and_validation'
+     OR (profile ->> 'graph_expansion_pruned')::boolean
+     OR (profile ->> 'distance_computations_pruned')::boolean THEN
     RAISE EXCEPTION 'scan profile compatibility aliases are inconsistent: %', profile;
   END IF;
 END

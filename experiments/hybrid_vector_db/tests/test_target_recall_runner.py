@@ -1,5 +1,6 @@
 import argparse
 import csv
+import hashlib
 import json
 import tempfile
 import unittest
@@ -24,6 +25,8 @@ from experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_run
     calibrate_mode_filter,
     consolidate_final,
     configs_for_mode,
+    database_fingerprint,
+    explicit_candidate_validity_predicate,
     formal_completion_gate,
     final_eligible_rows,
     mode_calibration_grids,
@@ -33,6 +36,7 @@ from experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_run
     plan_evidence_path,
     require_plan_evidence,
     run_d123,
+    run_d123_interleaved,
     run_final_interleaved,
     seeded_calibration_block,
     select_row,
@@ -133,6 +137,49 @@ class TargetRecallRunnerTests(unittest.TestCase):
         connection.commit.assert_not_called()
         connection.close.assert_not_called()
 
+    def test_database_fingerprint_binds_candidate_validity_contract(self):
+        cursor = mock.Mock()
+        cursor.fetchone.side_effect = [
+            ("16.4", "0.8.2"),
+            (10, 20, 100, 1000, True, True, None),
+            (11, 21, 100, 2000, True, True, "embedding_valid"),
+            (12, 22, 100, 2000, True, True, "embedding_valid"),
+        ]
+        connection = mock.MagicMock()
+        connection.cursor.return_value = cursor
+        connect = mock.MagicMock()
+        connect.return_value.__enter__.return_value = connection
+        args = argparse.Namespace(
+            insertion_table="public.items",
+            insertion_index="public.items_hnsw",
+            bfs_table="public.items",
+            bfs_index="public.items_hnsw_bfs",
+            query_table="public.queries",
+            candidate_validity_predicate="embedding_valid",
+        )
+        with (
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.psycopg.connect",
+                connect,
+            ),
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.pg_config_from_env",
+                return_value=argparse.Namespace(conninfo="postgresql://test"),
+            ),
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.query_relation_provenance",
+                return_value={"name": "public.queries", "row_count": 200},
+            ),
+        ):
+            fingerprint = database_fingerprint(args, "sqlens-v11-test")
+
+        self.assertEqual(
+            fingerprint["candidate_validity_predicate"],
+            "embedding_valid",
+        )
+        self.assertEqual(len(fingerprint["candidate_validity_predicate_sha256"]), 64)
+        self.assertEqual(fingerprint["query_table"]["row_count"], 200)
+
     def test_q200_external_truth_requires_non_self_excluded_contract(self):
         with tempfile.TemporaryDirectory() as tmp:
             truth = Path(tmp) / "q200.csv"
@@ -145,6 +192,68 @@ class TargetRecallRunnerTests(unittest.TestCase):
             self.assertEqual(truth_query_ids(truth, expected_self_excluded=False), {200: 9001})
             with self.assertRaisesRegex(RuntimeError, "expected query contract"):
                 truth_query_ids(truth, expected_self_excluded=True)
+
+    def test_truth_candidate_validity_contract_is_optional_but_fail_closed_when_explicit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            truth = Path(tmp) / "q200.csv"
+            truth.write_text(
+                "method,filter_name,query_no,query_id,filtered_rows,kth_distance_sq,"
+                "tie_tolerance,self_excluded,candidate_validity_predicate\n"
+                "pre_filter_exact,f,200,9001,10,0.25,1e-12,false,embedding_valid\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                truth_query_ids(
+                    truth,
+                    expected_self_excluded=False,
+                    expected_candidate_validity_predicate="embedding_valid",
+                ),
+                {200: 9001},
+            )
+            with self.assertRaisesRegex(RuntimeError, "candidate contract"):
+                truth_query_ids(
+                    truth,
+                    expected_self_excluded=False,
+                    expected_candidate_validity_predicate="embedding_valid AND public",
+                )
+
+            legacy = Path(tmp) / "legacy.csv"
+            legacy.write_text(
+                "method,filter_name,query_no,query_id,filtered_rows,kth_distance_sq,"
+                "tie_tolerance,self_excluded\n"
+                "pre_filter_exact,f,200,9001,10,0.25,1e-12,false\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                truth_query_ids(legacy, expected_self_excluded=False),
+                {200: 9001},
+            )
+            with self.assertRaisesRegex(RuntimeError, "missing candidate_validity_predicate"):
+                truth_query_ids(
+                    legacy,
+                    expected_self_excluded=False,
+                    expected_candidate_validity_predicate="embedding_valid",
+                )
+
+    def test_explicit_candidate_validity_respects_cli_presence_marker(self):
+        self.assertIsNone(
+            explicit_candidate_validity_predicate(
+                argparse.Namespace(
+                    candidate_validity_predicate="embedding_valid",
+                    candidate_validity_predicate_explicit=False,
+                )
+            )
+        )
+        self.assertEqual(
+            explicit_candidate_validity_predicate(
+                argparse.Namespace(
+                    candidate_validity_predicate="",
+                    candidate_validity_predicate_explicit=True,
+                )
+            ),
+            "TRUE",
+        )
 
     def test_percentile_uses_sorted_floor_index_and_empty_is_zero(self):
         self.assertEqual(percentile([], 0.95), 0.0)
@@ -539,6 +648,7 @@ class TargetRecallRunnerTests(unittest.TestCase):
             warmup_all_queries=False,
             force_hnsw=True,
             backend_cpu_list="48-51",
+            candidate_validity_predicate="embedding_valid",
             sqlens_runtime_provenance={
                 "loaded_vector_sqlens_build_id": "sqlens-v11-exact",
                 "loaded_vector_so_sha256": "a" * 64,
@@ -564,10 +674,75 @@ class TargetRecallRunnerTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--expected-sqlens-build-id") + 1], "sqlens-v11-exact")
         self.assertEqual(cmd[cmd.index("--expected-vector-so-sha256") + 1], "a" * 64)
         self.assertEqual(cmd[cmd.index("--backend-cpu-list") + 1], "48-51")
+        self.assertEqual(
+            cmd[cmd.index("--candidate-validity-predicate") + 1],
+            "embedding_valid",
+        )
+
+    def test_interleaved_parent_forwards_candidate_validity_predicate(self):
+        args = argparse.Namespace(
+            final_queries=2,
+            final_query_offset=10,
+            final_repeats=1,
+            schedule_seed=7,
+            progress_queries=0,
+            statement_timeout_ms=1000,
+            guidance_filter_strategy="traversal_guided",
+            guidance_selectivity_max_pct=100.0,
+            guidance_max_atoms=64,
+            d2_page_access="off",
+            d2_index_page_access="off",
+            d1_cache_mb=16,
+            d3_cache_mb=16,
+            preferred_index_guc="hnsw.preferred_index",
+            d2_graph_proof={"required": False},
+            filters_csv=None,
+            truth_csv=None,
+            insertion_table=None,
+            insertion_index=None,
+            bfs_table=None,
+            bfs_index=None,
+            query_table="public.queries",
+            query_id_column="query_key",
+            query_vector_column="query_embedding",
+            candidate_validity_predicate="embedding_valid",
+            expected_truth_self_excluded=False,
+            backend_cpu_list=None,
+            require_preferred_index_guc=False,
+            warmup_all_queries=False,
+            force_hnsw=True,
+            sqlens_runtime_provenance={
+                "loaded_vector_sqlens_build_id": "sqlens-v11-exact",
+                "loaded_vector_so_sha256": "a" * 64,
+            },
+        )
+        modes = ["original", "design1_bloom"]
+        configs = {
+            mode: Config(100, 1000, 8.0, "off", 100) for mode in modes
+        }
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.run_command",
+            return_value=1.0,
+        ) as command_mock:
+            run_d123_interleaved(
+                Path(tmp) / "out.csv",
+                "f",
+                modes,
+                configs,
+                args,
+                None,
+            )
+
+        cmd = command_mock.call_args.args[0]
+        self.assertEqual(
+            cmd[cmd.index("--candidate-validity-predicate") + 1],
+            "embedding_valid",
+        )
+        self.assertIn("--no-expected-truth-self-excluded", cmd)
 
     def test_sqlens_runtime_provenance_records_loaded_contract_and_fails_closed(self):
         profile = {
-            "profile_semantics_version": 4,
+            "profile_semantics_version": 6,
             "graph_elements_visited": 1,
             "raw_index_tids_returned": 2,
             "hnsw_am_callback_ms": 0.1,
@@ -601,8 +776,8 @@ class TargetRecallRunnerTests(unittest.TestCase):
         self.assertEqual(provenance["loaded_vector_sqlens_build_id"], "sqlens-v11-test")
         self.assertEqual(provenance["loaded_vector_so_sha256"], binary_sha256)
         self.assertEqual(provenance["required_build_prefix"], "sqlens-v11-")
-        self.assertEqual(provenance["minimum_profile_semantics_version"], 4.0)
-        self.assertEqual(provenance["profile_semantics_version"], 4)
+        self.assertEqual(provenance["minimum_profile_semantics_version"], 6.0)
+        self.assertEqual(provenance["profile_semantics_version"], 6)
         self.assertEqual(provenance["required_profile_fields"], {
             key: profile[key]
             for key in SQLENS_PROFILE_REQUIRED_FIELDS + SQLENS_TRAVERSAL_PROFILE_REQUIRED_FIELDS
@@ -620,7 +795,7 @@ class TargetRecallRunnerTests(unittest.TestCase):
                 sqlens_runtime_provenance()
 
         profile.pop("executor_residual_ms")
-        profile["profile_semantics_version"] = 3
+        profile["profile_semantics_version"] = 5
         cursor.fetchone.side_effect = [
             ("sqlens-v11-test", "/usr/lib/postgresql/16/lib/vector.so", binary_sha256),
             (json.dumps(profile),),
@@ -754,6 +929,15 @@ class TargetRecallRunnerTests(unittest.TestCase):
             "planner_proof_succeeded": "true",
             "stock_bypass_requests": "0",
             "fallback_requests": "0",
+            "traversal_guidance_scope": "candidate_admission_and_validation",
+            "graph_expansion_pruned": "false",
+            "distance_computations_pruned": "false",
+            "pre_distance_membership_checks": "0",
+            "distance_computations_avoided": "0",
+            "neighbor_expansion_guidance_checks": "5",
+            "traversal_guided_admissions": "3",
+            "traversal_guided_suppressions": "2",
+            "traversal_heap_tids_suppressed": "2",
             "traversal_estimated_skip_rate_valid": "true",
             "traversal_estimated_skip_rate": "0.5",
             "recall_contract": TIE_AWARE_RECALL_CONTRACT,
@@ -793,6 +977,67 @@ class TargetRecallRunnerTests(unittest.TestCase):
             raw.write_text("value\n2\n", encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "SHA256 mismatch"):
                 require_plan_evidence(raw)
+
+    def test_plan_evidence_binds_explicit_candidate_validity_to_parent_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "raw.csv"
+            raw.write_text("value\n1\n", encoding="utf-8")
+            predicate = "embedding_valid"
+            predicate_hash = hashlib.sha256(predicate.encode("utf-8")).hexdigest()
+            evidence = {
+                **self._plan_runtime_metadata(),
+                "status": "complete",
+                "output_rows": 1,
+                "output_sha256": sha256_file(raw),
+                "query_contract": {
+                    "candidate_validity_predicate": predicate,
+                    "candidate_validity_predicate_sha256": predicate_hash,
+                },
+                "checks": [
+                    {
+                        "passed": True,
+                        "expected_index_access_method": "hnsw",
+                        "expected_index": predicate,
+                        "expected_index_oid": 1,
+                        "expected_index_predicate": predicate,
+                        "expected_index_predicate_sha256": predicate_hash,
+                        "expected_index_is_partial": True,
+                        "catalog_index_oid": 1,
+                        "catalog_index_predicate": predicate,
+                        "catalog_index_predicate_sha256": predicate_hash,
+                        "catalog_index_is_partial": True,
+                        "catalog_index_predicate_matches": True,
+                        "candidate_validity_predicate": predicate,
+                        "candidate_validity_predicate_sha256": predicate_hash,
+                    }
+                ],
+            }
+            evidence_path = plan_evidence_path(raw)
+            evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+
+            self.assertEqual(
+                require_plan_evidence(raw, predicate)["status"],
+                "complete",
+            )
+            parent_fingerprint = {
+                "relations": {
+                    predicate: {"oid": 1, "indpred": predicate, "is_partial": True}
+                }
+            }
+            self.assertEqual(
+                require_plan_evidence(raw, predicate, parent_fingerprint)["status"],
+                "complete",
+            )
+            parent_fingerprint["relations"][predicate]["indpred"] = None
+            with self.assertRaisesRegex(RuntimeError, "parent database fingerprint"):
+                require_plan_evidence(raw, predicate, parent_fingerprint)
+            with self.assertRaisesRegex(RuntimeError, "query contract mismatch"):
+                require_plan_evidence(raw, "embedding_valid AND public")
+
+            evidence["checks"][0]["candidate_validity_predicate_sha256"] = "0" * 64
+            evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "plan evidence mismatch"):
+                require_plan_evidence(raw, predicate)
 
     def test_plan_evidence_requires_valid_same_graph_proof_for_d2(self):
         with tempfile.TemporaryDirectory() as tmp:

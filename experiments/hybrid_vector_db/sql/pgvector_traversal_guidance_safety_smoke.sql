@@ -81,18 +81,47 @@ FROM (
     LIMIT 10
 ) AS stock;
 
+-- Independent exact SQL-valid truth for safety comparisons.  Guided HNSW may
+-- improve an approximate result, so byte-identical stock IDs are not required.
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SET enable_seqscan = on;
+SET enable_sort = on;
+INSERT INTO traversal_guidance_safety_results (method, ids)
+SELECT 'exact_eligible', array_agg(id ORDER BY distance, id)
+FROM (
+    SELECT id, embedding <-> '[500,500]'::vector AS distance
+    FROM traversal_guidance_safety_smoke
+    WHERE eligible
+    ORDER BY embedding <-> '[500,500]'::vector
+    LIMIT 20
+) AS exact;
+INSERT INTO traversal_guidance_safety_results (method, ids)
+SELECT 'exact_residual', array_agg(id ORDER BY distance, id)
+FROM (
+    SELECT id, embedding <-> '[500,500]'::vector AS distance
+    FROM traversal_guidance_safety_smoke
+    WHERE eligible AND category = 1
+    ORDER BY embedding <-> '[500,500]'::vector
+    LIMIT 10
+) AS exact;
+SET enable_indexscan = on;
+SET enable_bitmapscan = on;
+SET enable_seqscan = off;
+SET enable_sort = off;
+
 SELECT vector_hnsw_guidance_activate(
     'traversal_guidance_safety_smoke_hnsw'::regclass,
     ARRAY['sql:eligible'],
     'exact'
 );
 
--- actual => guide is true, but guide => actual is false because category is a
--- residual predicate.  Hard traversal pruning must bypass before graph checks.
+-- The guide is a safe superset of the actual residual predicate.  Candidate
+-- admission may use it because nonmatching guide TIDs still reach PostgreSQL.
 SET hnsw.filter_strategy = traversal_guided;
 SELECT vector_hnsw_reset_scan_profile();
 INSERT INTO traversal_guidance_safety_results (method, ids)
-SELECT 'strict_superset_bypass', array_agg(id ORDER BY distance, id)
+SELECT 'candidate_admission_residual', array_agg(id ORDER BY distance, id)
 FROM (
     SELECT id, embedding <-> '[500,500]'::vector AS distance
     FROM traversal_guidance_safety_smoke
@@ -108,27 +137,44 @@ FROM (
 ) AS bypass;
 UPDATE traversal_guidance_safety_results
 SET profile = vector_hnsw_last_scan_profile()::jsonb
-WHERE method = 'strict_superset_bypass';
+WHERE method = 'candidate_admission_residual';
 
 DO $$
 DECLARE
     stock_ids integer[];
-    bypass_ids integer[];
+    exact_ids integer[];
+    guided_ids integer[];
+    stock_hits integer;
+    guided_hits integer;
+    invalid_result boolean;
     profile jsonb;
 BEGIN
     SELECT ids INTO stock_ids FROM traversal_guidance_safety_results
     WHERE method = 'stock_residual';
-    SELECT ids, traversal_guidance_safety_results.profile INTO bypass_ids, profile
+    SELECT ids INTO exact_ids FROM traversal_guidance_safety_results
+    WHERE method = 'exact_residual';
+    SELECT ids, traversal_guidance_safety_results.profile INTO guided_ids, profile
     FROM traversal_guidance_safety_results
-    WHERE method = 'strict_superset_bypass';
+    WHERE method = 'candidate_admission_residual';
 
-    IF bypass_ids IS DISTINCT FROM stock_ids OR
-       profile->>'final_path' <> 'stock_bypass' OR
-       profile->>'stock_bypass_reason' <> 'no_proven_guide' OR
-       profile->>'planner_proof_bypass_reason' <> 'predicate_not_implied' OR
-       (profile->>'planner_proof_succeeded')::boolean OR
-       (profile->>'pre_distance_membership_checks')::bigint <> 0 THEN
-        RAISE EXCEPTION 'strict-superset guide did not fail closed: %', profile;
+    SELECT count(*) INTO stock_hits
+    FROM unnest(stock_ids) AS result(id) WHERE id = ANY(exact_ids);
+    SELECT count(*) INTO guided_hits
+    FROM unnest(guided_ids) AS result(id) WHERE id = ANY(exact_ids);
+    SELECT EXISTS (
+        SELECT 1 FROM traversal_guidance_safety_smoke
+        WHERE id = ANY(guided_ids) AND NOT (eligible AND category = 1)
+    ) INTO invalid_result;
+
+    IF cardinality(guided_ids) <> 10 OR invalid_result OR
+       guided_hits < stock_hits OR
+       profile->>'final_path' <> 'guided' OR
+       NOT (profile->>'planner_proof_succeeded')::boolean OR
+       (profile->>'pre_distance_membership_checks')::bigint <> 0 OR
+       (profile->>'traversal_guided_admissions')::bigint <= 0 OR
+       (profile->>'traversal_guided_suppressions')::bigint <= 0 THEN
+        RAISE EXCEPTION 'candidate-admission residual proof failed: stock hits %, guided hits %, profile %',
+            stock_hits, guided_hits, profile;
     END IF;
 END
 $$;
@@ -267,13 +313,13 @@ BEGIN
 END
 $$;
 
--- Join plan quals can live above the IndexScan, so traversal guidance refuses
--- the entire join-shaped statement even when the local scan qual looks exact.
+-- Join quals above the IndexScan may narrow the safe guide.  The target-local
+-- scan qual still proves actual => guide, and PostgreSQL validates the join.
 CREATE TEMP TABLE traversal_guidance_join_key (category integer PRIMARY KEY);
 INSERT INTO traversal_guidance_join_key VALUES (1);
 SELECT vector_hnsw_reset_scan_profile();
 INSERT INTO traversal_guidance_safety_results (method, ids)
-SELECT 'join_bypass', array_agg(id ORDER BY distance, id)
+SELECT 'join_guided', array_agg(id ORDER BY distance, id)
 FROM (
     SELECT source.id, source.embedding <-> '[500,500]'::vector AS distance
     FROM traversal_guidance_safety_smoke AS source
@@ -290,25 +336,43 @@ FROM (
 ) AS joined;
 UPDATE traversal_guidance_safety_results
 SET profile = vector_hnsw_last_scan_profile()::jsonb
-WHERE method = 'join_bypass';
+WHERE method = 'join_guided';
 
 DO $$
 DECLARE
     stock_ids integer[];
+    exact_ids integer[];
     join_ids integer[];
+    stock_hits integer;
+    join_hits integer;
+    invalid_result boolean;
     profile jsonb;
 BEGIN
     SELECT ids INTO stock_ids FROM traversal_guidance_safety_results
     WHERE method = 'stock_residual';
+    SELECT ids INTO exact_ids FROM traversal_guidance_safety_results
+    WHERE method = 'exact_residual';
     SELECT ids, traversal_guidance_safety_results.profile INTO join_ids, profile
-    FROM traversal_guidance_safety_results WHERE method = 'join_bypass';
+    FROM traversal_guidance_safety_results WHERE method = 'join_guided';
 
-    IF join_ids IS DISTINCT FROM stock_ids OR
-       profile->>'final_path' <> 'stock_bypass' OR
-       profile->>'planner_proof_bypass_reason' <> 'non_target_var' OR
-       (profile->>'pre_distance_membership_checks')::bigint <> 0 THEN
-        RAISE EXCEPTION 'join-shaped traversal proof did not fail closed: %',
-            profile;
+    SELECT count(*) INTO stock_hits
+    FROM unnest(stock_ids) AS result(id) WHERE id = ANY(exact_ids);
+    SELECT count(*) INTO join_hits
+    FROM unnest(join_ids) AS result(id) WHERE id = ANY(exact_ids);
+    SELECT EXISTS (
+        SELECT 1 FROM traversal_guidance_safety_smoke
+        WHERE id = ANY(join_ids) AND NOT (eligible AND category = 1)
+    ) INTO invalid_result;
+
+    IF cardinality(join_ids) <> 10 OR invalid_result OR
+       join_hits < stock_hits OR
+       profile->>'final_path' <> 'guided' OR
+       NOT (profile->>'planner_proof_succeeded')::boolean OR
+       (profile->>'pre_distance_membership_checks')::bigint <> 0 OR
+       (profile->>'traversal_guided_admissions')::bigint <= 0 OR
+       (profile->>'traversal_guided_suppressions')::bigint <= 0 THEN
+        RAISE EXCEPTION 'join-shaped candidate admission was not proven: stock hits %, join hits %, profile %',
+            stock_hits, join_hits, profile;
     END IF;
 END
 $$;
@@ -393,12 +457,176 @@ BEGIN
 
     IF result_ids[1] IS DISTINCT FROM 4001 OR 4002 = ANY(result_ids) OR
        profile->>'final_path' <> 'guided' OR
-       (profile->>'traversal_heap_tids_suppressed')::bigint < 1 THEN
+	   (profile->>'bridge_pending_at_termination')::bigint <> 0 OR
+	   (profile->>'traversal_heap_tids_suppressed')::bigint < 1 THEN
         RAISE EXCEPTION 'duplicate-element TID validation failed: ids %, profile %',
             result_ids, profile;
     END IF;
 END
 $$;
+
+-- Candidate-admission guidance does not prune distance-ordered graph
+-- expansion.  Legacy bridge budgets therefore cannot change its result or
+-- create an attempted-work/fallback phase.
+SET hnsw.traversal_guided_max_bridge_work = 1;
+SELECT vector_hnsw_reset_scan_profile();
+INSERT INTO traversal_guidance_safety_results (method, ids)
+SELECT 'admission_legacy_budget_independent', array_agg(id ORDER BY distance, id)
+FROM (
+    SELECT id, embedding <-> '[500,500]'::vector AS distance
+    FROM traversal_guidance_safety_smoke
+    WHERE (SELECT vector_hnsw_guidance_bind(
+               'traversal_guidance_safety_smoke_hnsw'::regclass,
+               ARRAY['sql:eligible'],
+               'exact'
+           ) OFFSET 0)
+      AND eligible
+    ORDER BY embedding <-> '[500,500]'::vector
+    LIMIT 20
+) AS fallback;
+UPDATE traversal_guidance_safety_results
+SET profile = vector_hnsw_last_scan_profile()::jsonb
+WHERE method = 'admission_legacy_budget_independent';
+
+DO $$
+DECLARE
+    stock_ids integer[];
+    admission_ids integer[];
+    profile jsonb;
+BEGIN
+    SELECT ids INTO stock_ids FROM traversal_guidance_safety_results
+    WHERE method = 'stock_eligible';
+    SELECT ids, traversal_guidance_safety_results.profile
+    INTO admission_ids, profile
+    FROM traversal_guidance_safety_results
+    WHERE method = 'admission_legacy_budget_independent';
+
+    IF admission_ids IS DISTINCT FROM stock_ids OR
+	   profile->>'final_path' <> 'guided' OR
+	   profile->>'fallback_reason' <> 'none' OR
+	   (profile->>'fallback_requests')::bigint <> 0 OR
+	   (profile->>'bridge_pending_at_termination')::bigint <> 0 OR
+	   (profile->>'pre_distance_membership_checks')::bigint <> 0 OR
+	   (profile->>'distance_computations_avoided_attempted')::bigint <> 0 OR
+	   (profile->>'distance_computations_avoided')::bigint <> 0 OR
+	   (profile->>'traversal_guided_admissions')::bigint <= 0 OR
+	   (profile->>'traversal_guided_suppressions')::bigint <= 0 OR
+	   (profile->>'net_distance_saved_available')::boolean OR
+	   (profile->>'net_distance_saved')::bigint <> 0 OR
+	   profile->>'traversal_guidance_scope' <>
+	       'candidate_admission_and_validation' OR
+	   (profile->>'graph_expansion_pruned')::boolean OR
+	   (profile->>'distance_computations_pruned')::boolean OR
+	   profile->>'iterative_scan' <> 'off' OR
+	   profile->>'filter_strategy' <> 'traversal_guided' THEN
+		RAISE EXCEPTION 'candidate admission depended on a legacy bridge budget: ids %, profile %',
+			admission_ids, profile;
+    END IF;
+END
+$$;
+SET hnsw.traversal_guided_max_bridge_work = 20000;
+
+-- A parameterized LATERAL inner scan reuses and rescans one IndexScanDesc.
+-- Rescan must not resurrect the retired pre-distance traversal phase.
+SELECT vector_hnsw_reset_scan_profile();
+SET enable_material = off;
+SET enable_memoize = off;
+SET join_collapse_limit = 1;
+CREATE TEMP TABLE traversal_guidance_rescan_result AS
+SELECT count(*)::integer AS returned
+FROM generate_series(0, 2) AS query(shift)
+LEFT JOIN LATERAL (
+    SELECT id
+    FROM traversal_guidance_safety_smoke
+    WHERE (SELECT vector_hnsw_guidance_bind(
+               'traversal_guidance_safety_smoke_hnsw'::regclass,
+               ARRAY['sql:eligible'],
+               'exact'
+           ) OFFSET 0)
+      AND eligible
+    ORDER BY embedding <-> ARRAY[
+        (500 + query.shift)::real,
+        (500 + query.shift)::real
+    ]::vector
+    LIMIT 20
+    OFFSET 0
+) AS guided ON true;
+
+DO $$
+DECLARE
+    returned integer;
+    profile jsonb := vector_hnsw_last_scan_profile()::jsonb;
+BEGIN
+    SELECT traversal_guidance_rescan_result.returned INTO returned
+    FROM traversal_guidance_rescan_result;
+
+    IF returned <> 60 OR
+       profile->>'final_path' <> 'guided' OR
+       (profile->>'pre_distance_membership_checks')::bigint <> 0 OR
+       (profile->>'distance_computations_avoided_attempted')::bigint <> 0 OR
+       (profile->>'fallback_requests')::bigint <> 0 OR
+       (profile->>'traversal_guided_admissions')::bigint <= 0 OR
+       (profile->>'traversal_guided_suppressions')::bigint <= 0 THEN
+        RAISE EXCEPTION 'rescan resurrected non-native traversal: returned %, profile %',
+            returned, profile;
+    END IF;
+END
+$$;
+RESET enable_material;
+RESET enable_memoize;
+RESET join_collapse_limit;
+
+-- Iterative traversal is deliberately outside the hard-guided proof.  The
+-- profile must make the stock bypass and captured mode independently visible.
+SET hnsw.iterative_scan = strict_order;
+SELECT vector_hnsw_reset_scan_profile();
+INSERT INTO traversal_guidance_safety_results (method, ids)
+SELECT 'iterative_stock_bypass', array_agg(id ORDER BY distance, id)
+FROM (
+    SELECT id, embedding <-> '[500,500]'::vector AS distance
+    FROM traversal_guidance_safety_smoke
+    WHERE (SELECT vector_hnsw_guidance_bind(
+               'traversal_guidance_safety_smoke_hnsw'::regclass,
+               ARRAY['sql:eligible'],
+               'exact'
+           ) OFFSET 0)
+      AND eligible
+    ORDER BY embedding <-> '[500,500]'::vector
+    LIMIT 20
+) AS bypass;
+UPDATE traversal_guidance_safety_results
+SET profile = vector_hnsw_last_scan_profile()::jsonb
+WHERE method = 'iterative_stock_bypass';
+
+DO $$
+DECLARE
+    stock_ids integer[];
+    bypass_ids integer[];
+    profile jsonb;
+BEGIN
+    SELECT ids INTO stock_ids FROM traversal_guidance_safety_results
+    WHERE method = 'stock_eligible';
+    SELECT ids, traversal_guidance_safety_results.profile
+    INTO bypass_ids, profile
+    FROM traversal_guidance_safety_results
+    WHERE method = 'iterative_stock_bypass';
+
+    IF bypass_ids IS DISTINCT FROM stock_ids OR
+       profile->>'final_path' <> 'stock_bypass' OR
+       profile->>'stock_bypass_reason' <> 'iterative_scan' OR
+       profile->>'iterative_scan' <> 'strict_order' OR
+       profile->>'filter_strategy' <> 'traversal_guided' OR
+       (profile->>'guided_attempt_distance_computations')::bigint <> 0 OR
+       (profile->>'fallback_requests')::bigint <> 0 OR
+       (profile->>'pre_distance_membership_checks')::bigint <> 0 OR
+       NOT (profile->>'net_distance_saved_available')::boolean OR
+       (profile->>'net_distance_saved')::bigint <> 0 THEN
+        RAISE EXCEPTION 'iterative traversal bypass was not profile-provable: %',
+            profile;
+    END IF;
+END
+$$;
+SET hnsw.iterative_scan = off;
 
 -- All public page modes must preserve the HNSW distance order.  Internally,
 -- traversal_guided maps reorder to the order-preserving prefetch path.
@@ -473,7 +701,17 @@ BEGIN
 
     FOR row_data IN SELECT * FROM traversal_guidance_page_results LOOP
         IF row_data.ids IS DISTINCT FROM off_ids OR cardinality(row_data.ids) <> 20 OR
-           row_data.profile->>'final_path' <> 'guided' THEN
+           row_data.profile->>'final_path' NOT IN
+               ('guided', 'fresh_stock_fallback') OR
+           (row_data.profile->>'final_path' = 'guided' AND
+            (row_data.profile->>'bridge_pending_at_termination')::bigint <> 0) OR
+           (row_data.profile->>'final_path' = 'guided' AND
+            ((row_data.profile->>'net_distance_saved_available')::boolean OR
+             (row_data.profile->>'net_distance_saved')::bigint <> 0)) OR
+           (row_data.profile->>'final_path' = 'fresh_stock_fallback' AND
+            (NOT (row_data.profile->>'net_distance_saved_available')::boolean OR
+             (row_data.profile->>'net_distance_saved')::bigint <>
+               -(row_data.profile->>'guided_attempt_distance_computations')::bigint)) THEN
             RAISE EXCEPTION 'page mode changed guided IDs/order: %', row_data;
         END IF;
         IF row_data.mode = 'off' AND

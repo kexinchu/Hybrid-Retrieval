@@ -615,10 +615,10 @@ _PG_init(void)
 								 false, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable("hnsw.guidance_require_epoch",
-								 "Requires relation-epoch tracking before guidance can hard-prune HNSW candidates",
-								 "Disable only for read-only compatibility experiments; tracked epochs are required for update-safe pruning.",
+								 "Requires relation-epoch tracking for standalone guidance cache operations",
+								 "Hard and pre-distance guidance always require a valid invalidation trigger, even when this setting is off.",
 								 &hnsw_guidance_require_epoch,
-								 true, PGC_USERSET, 0, NULL, NULL, NULL);
+								 true, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable("hnsw.d3_probe_requests",
 							"Sets the number of stock scans recorded before adaptive fragment admission",
@@ -708,12 +708,64 @@ HnswTraversalFallbackReasonName(HnswTraversalFallbackReason reason)
 	return "unknown";
 }
 
+static const char *
+HnswIterativeScanModeName(HnswIterativeScanMode mode)
+{
+	switch (mode)
+	{
+		case HNSW_ITERATIVE_SCAN_OFF:
+			return "off";
+		case HNSW_ITERATIVE_SCAN_RELAXED:
+			return "relaxed_order";
+		case HNSW_ITERATIVE_SCAN_STRICT:
+			return "strict_order";
+	}
+	return "unknown";
+}
+
+static const char *
+HnswFilterStrategyModeName(HnswFilterStrategyMode mode)
+{
+	switch (mode)
+	{
+		case HNSW_FILTER_STRATEGY_OFF:
+			return "off";
+		case HNSW_FILTER_STRATEGY_ACORN1:
+			return "acorn1";
+		case HNSW_FILTER_STRATEGY_GUIDED_COLLECT:
+			return "guided_collect";
+		case HNSW_FILTER_STRATEGY_TRAVERSAL_GUIDED:
+			return "traversal_guided";
+		case HNSW_FILTER_STRATEGY_SAFE_GUIDED:
+			return "safe_guided";
+	}
+	return "unknown";
+}
+
+static bool
+HnswTraversalNetDistanceSavedAvailable(HnswTraversalFinalPath path)
+{
+	return path == HNSW_TRAVERSAL_PATH_STOCK ||
+		path == HNSW_TRAVERSAL_PATH_VALIDATION_ONLY ||
+		path == HNSW_TRAVERSAL_PATH_STOCK_BYPASS ||
+		path == HNSW_TRAVERSAL_PATH_FRESH_STOCK_FALLBACK;
+}
+
+static int64
+HnswTraversalNetDistanceSaved(const HnswScanProfile *profile)
+{
+	if (profile->traversalFinalPath ==
+		HNSW_TRAVERSAL_PATH_FRESH_STOCK_FALLBACK)
+		return -profile->traversal.guidedPhaseDistanceComputations;
+	return 0;
+}
+
 static void
 VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 {
 	appendStringInfo(output,
 					"{\"valid\":%s,"
-					"\"profile_semantics_version\":4,"
+					"\"profile_semantics_version\":6,"
 					"\"total_scan_ms\":%.6f,"
 					"\"hnsw_search_ms\":%.6f,"
 					"\"heap_fetch_ms\":%.6f,"
@@ -861,23 +913,34 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 						",\"pre_distance_membership_matches\":" INT64_FORMAT
 						",\"pre_distance_membership_misses\":" INT64_FORMAT
 						",\"distance_computations_avoided_attempted\":" INT64_FORMAT
-						",\"distance_computations_avoided\":" INT64_FORMAT
-					",\"miss_bridge_nodes\":" INT64_FORMAT
-					",\"miss_bridge_edges\":" INT64_FORMAT
-					",\"miss_bridge_max_hops\":" INT64_FORMAT
-					",\"guided_expanded_nodes\":" INT64_FORMAT
-					",\"guided_phase_distance_computations\":" INT64_FORMAT
-					",\"stock_phase_expanded_nodes\":" INT64_FORMAT
+							",\"distance_computations_avoided\":" INT64_FORMAT
+							",\"distance_computations_avoided_scope\":\"guided_path_local_only\""
+						",\"miss_bridge_nodes\":" INT64_FORMAT
+						",\"miss_bridge_edges\":" INT64_FORMAT
+						",\"miss_bridge_max_hops\":" INT64_FORMAT
+						",\"bridge_pending_at_termination\":" INT64_FORMAT
+						",\"guided_expanded_nodes\":" INT64_FORMAT
+						",\"guided_attempt_expanded_nodes\":" INT64_FORMAT
+						",\"guided_phase_distance_computations\":" INT64_FORMAT
+						",\"guided_attempt_distance_computations\":" INT64_FORMAT
+						",\"stock_phase_expanded_nodes\":" INT64_FORMAT
 					",\"stock_phase_distance_computations\":" INT64_FORMAT
 					",\"stock_bypass_requests\":" INT64_FORMAT
 					",\"stock_bypass_reason\":\"%s\""
 					",\"fallback_requests\":" INT64_FORMAT
 					",\"fallback_reason\":\"%s\""
-					",\"fallback_stock_expanded_nodes\":" INT64_FORMAT
-					",\"fallback_stock_distance_computations\":" INT64_FORMAT
-					",\"traversal_estimated_skip_rate_valid\":%s"
-					",\"traversal_estimated_skip_rate\":%.6f"
-					",\"final_path\":\"%s\""
+						",\"fallback_stock_expanded_nodes\":" INT64_FORMAT
+						",\"fallback_stock_distance_computations\":" INT64_FORMAT
+						",\"net_distance_saved_available\":%s"
+						",\"net_distance_saved\":" INT64_FORMAT
+						",\"traversal_estimated_skip_rate_valid\":%s"
+						",\"traversal_estimated_skip_rate\":%.6f"
+						",\"iterative_scan\":\"%s\""
+						",\"filter_strategy\":\"%s\""
+						",\"traversal_guidance_scope\":\"candidate_admission_and_validation\""
+						",\"graph_expansion_pruned\":false"
+						",\"distance_computations_pruned\":false"
+						",\"final_path\":\"%s\""
 					",\"planner_proof_attempted\":%s"
 					",\"planner_proof_succeeded\":%s"
 					",\"planner_proof_bypass_reason\":\"%s\""
@@ -895,14 +958,17 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 						profile->traversal.preDistanceChecks,
 						profile->traversal.preDistanceMatches,
 						profile->traversal.preDistanceMisses,
-						profile->traversal.preDistanceMisses,
-						profile->traversal.distanceComputationsAvoided,
-					profile->traversal.missBridgeNodes,
-					profile->traversal.missBridgeEdges,
-					profile->traversal.maxMissBridgeHops,
-					profile->traversal.guidedExpandedNodes,
-					profile->traversal.guidedPhaseDistanceComputations,
-					profile->traversal.stockPhaseExpandedNodes,
+							profile->traversal.attemptedDistanceComputationsAvoided,
+							profile->traversal.distanceComputationsAvoided,
+						profile->traversal.missBridgeNodes,
+						profile->traversal.missBridgeEdges,
+						profile->traversal.maxMissBridgeHops,
+						profile->traversal.bridgePendingAtTermination,
+						profile->traversal.guidedExpandedNodes,
+						profile->traversal.guidedExpandedNodes,
+						profile->traversal.guidedPhaseDistanceComputations,
+						profile->traversal.guidedPhaseDistanceComputations,
+						profile->traversal.stockPhaseExpandedNodes,
 					profile->traversal.stockPhaseDistanceComputations,
 					profile->traversal.stockBypassRequests,
 					HnswTraversalStockBypassReasonName(
@@ -910,11 +976,16 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 					profile->traversal.fallbackRequests,
 					HnswTraversalFallbackReasonName(
 						profile->traversalFallbackReason),
-					profile->traversal.fallbackStockExpandedNodes,
-					profile->traversal.fallbackStockDistanceComputations,
-					profile->traversalEstimatedSkipRateValid ? "true" : "false",
-					profile->traversalEstimatedSkipRate,
-					HnswTraversalFinalPathName(profile->traversalFinalPath),
+						profile->traversal.fallbackStockExpandedNodes,
+						profile->traversal.fallbackStockDistanceComputations,
+						HnswTraversalNetDistanceSavedAvailable(
+							profile->traversalFinalPath) ? "true" : "false",
+						HnswTraversalNetDistanceSaved(profile),
+						profile->traversalEstimatedSkipRateValid ? "true" : "false",
+						profile->traversalEstimatedSkipRate,
+						HnswIterativeScanModeName(profile->iterativeScan),
+						HnswFilterStrategyModeName(profile->filterStrategy),
+						HnswTraversalFinalPathName(profile->traversalFinalPath),
 					profile->plannerProof.attempted ? "true" : "false",
 					profile->plannerProof.succeeded ? "true" : "false",
 					HnswPlannerProofBypassReasonName(profile->plannerProof.bypassReason),
@@ -1799,6 +1870,8 @@ HnswMetadataGetRelationVersion(Oid heapOid, int64 *epoch, Oid *relFileNode)
 	char		nulls[1] = {' '};
 	bool		isnull;
 	bool		relFileNodeIsNull;
+	bool		triggerIsNull;
+	bool		validTrigger = false;
 	bool		tracked = false;
 
 	*epoch = 0;
@@ -1810,8 +1883,19 @@ HnswMetadataGetRelationVersion(Oid heapOid, int64 *epoch, Oid *relFileNode)
 		elog(ERROR, "SPI_connect failed: %d", spiStatus);
 
 	spiStatus = SPI_execute_with_args(
-			"SELECT e.epoch, pg_catalog.pg_relation_filenode($1) "
-			"FROM (SELECT 1) AS singleton "
+				"SELECT e.epoch, pg_catalog.pg_relation_filenode($1), "
+				"EXISTS (SELECT 1 FROM pg_catalog.pg_trigger AS t "
+				"WHERE t.tgrelid = $1 "
+				"AND t.tgname = 'pgvector_hnsw_fragment_epoch' "
+				"AND NOT t.tgisinternal "
+				"AND t.tgenabled IN ('O', 'A') "
+				"AND t.tgfoid = pg_catalog.to_regprocedure("
+				"'public.vector_hnsw_fragment_epoch_bump_trigger()') "
+				"AND t.tgnargs = 0 "
+				"AND t.tgqual IS NULL "
+				"AND t.tgattr::text = '' "
+				"AND t.tgtype = 60) "
+				"FROM (SELECT 1) AS singleton "
 			"LEFT JOIN public.pgvector_hnsw_fragment_epoch AS e ON e.heap_oid = $1",
 			1, argTypes, values, nulls, true, 1);
 	if (spiStatus != SPI_OK_SELECT)
@@ -1821,8 +1905,11 @@ HnswMetadataGetRelationVersion(Oid heapOid, int64 *epoch, Oid *relFileNode)
 	{
 		Datum		epochDatum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
 		Datum		relFileNodeDatum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &relFileNodeIsNull);
+		Datum		triggerDatum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3, &triggerIsNull);
 
-		if (!isnull)
+		if (!triggerIsNull)
+			validTrigger = DatumGetBool(triggerDatum);
+		if (!isnull && validTrigger)
 		{
 			*epoch = DatumGetInt64(epochDatum);
 				tracked = true;
@@ -1884,6 +1971,7 @@ vector_hnsw_fragment_tracking_enable(PG_FUNCTION_ARGS)
 	char		nulls[1] = {' '};
 	int			spiStatus;
 	bool		hasTrigger = false;
+	bool		validTrigger = false;
 	char	   *relName;
 	char	   *namespaceName;
 	char	   *qualifiedName;
@@ -1926,16 +2014,60 @@ vector_hnsw_fragment_tracking_enable(PG_FUNCTION_ARGS)
 		elog(ERROR, "fragment epoch is null for relation %u", heapOid);
 
 	spiStatus = SPI_execute_with_args(
-		"SELECT 1 FROM pg_catalog.pg_trigger "
-		"WHERE tgrelid = $1 AND tgname = 'pgvector_hnsw_fragment_epoch' AND NOT tgisinternal",
-		1, argTypes, values, nulls, true, 1);
+			"SELECT "
+			"EXISTS (SELECT 1 FROM pg_catalog.pg_trigger AS t "
+			"WHERE t.tgrelid = $1 "
+			"AND t.tgname = 'pgvector_hnsw_fragment_epoch' "
+			"AND NOT t.tgisinternal), "
+			"EXISTS (SELECT 1 FROM pg_catalog.pg_trigger AS t "
+			"WHERE t.tgrelid = $1 "
+			"AND t.tgname = 'pgvector_hnsw_fragment_epoch' "
+			"AND NOT t.tgisinternal "
+			"AND t.tgenabled IN ('O', 'A') "
+			"AND t.tgfoid = pg_catalog.to_regprocedure("
+			"'public.vector_hnsw_fragment_epoch_bump_trigger()') "
+			"AND t.tgnargs = 0 "
+			"AND t.tgqual IS NULL "
+			"AND t.tgattr::text = '' "
+			"AND t.tgtype = 60)",
+			1, argTypes, values, nulls, true, 1);
 	if (spiStatus != SPI_OK_SELECT)
 		elog(ERROR, "SPI_execute_with_args failed: %d", spiStatus);
-	hasTrigger = SPI_processed == 1;
+	if (SPI_processed == 1)
+	{
+		Datum		hasTriggerDatum;
+		Datum		validTriggerDatum;
+		bool		hasTriggerIsNull;
+		bool		validTriggerIsNull;
+
+		hasTriggerDatum = SPI_getbinval(SPI_tuptable->vals[0],
+			SPI_tuptable->tupdesc, 1, &hasTriggerIsNull);
+		validTriggerDatum = SPI_getbinval(SPI_tuptable->vals[0],
+			SPI_tuptable->tupdesc, 2, &validTriggerIsNull);
+		hasTrigger = !hasTriggerIsNull && DatumGetBool(hasTriggerDatum);
+		validTrigger = !validTriggerIsNull && DatumGetBool(validTriggerDatum);
+	}
 	SPI_finish();
 
-	if (!hasTrigger)
+	if (!validTrigger)
 	{
+		if (hasTrigger)
+		{
+			initStringInfo(&sql);
+			appendStringInfo(&sql,
+				"DROP TRIGGER pgvector_hnsw_fragment_epoch ON %s",
+				qualifiedName);
+			spiStatus = SPI_connect();
+			if (spiStatus != SPI_OK_CONNECT)
+				elog(ERROR, "SPI_connect failed: %d", spiStatus);
+			spiStatus = SPI_execute(sql.data, false, 0);
+			if (spiStatus != SPI_OK_UTILITY)
+				elog(ERROR, "SPI_execute failed: %d", spiStatus);
+			SPI_finish();
+			pfree(sql.data);
+			CommandCounterIncrement();
+		}
+
 		initStringInfo(&sql);
 		appendStringInfo(&sql,
 						 "CREATE TRIGGER pgvector_hnsw_fragment_epoch "
@@ -1950,6 +2082,24 @@ vector_hnsw_fragment_tracking_enable(PG_FUNCTION_ARGS)
 			elog(ERROR, "SPI_execute failed: %d", spiStatus);
 		SPI_finish();
 		pfree(sql.data);
+		CommandCounterIncrement();
+
+		/* Writes may have escaped invalidation while the trigger was unsafe. */
+		spiStatus = SPI_connect();
+		if (spiStatus != SPI_OK_CONNECT)
+			elog(ERROR, "SPI_connect failed: %d", spiStatus);
+		spiStatus = SPI_execute_with_args(
+			"UPDATE public.pgvector_hnsw_fragment_epoch "
+			"SET epoch = epoch + 1, updated_at = now() "
+			"WHERE heap_oid = $1 RETURNING epoch",
+			1, argTypes, values, nulls, false, 1);
+		if (spiStatus != SPI_OK_UPDATE_RETURNING || SPI_processed != 1)
+			elog(ERROR, "SPI_execute_with_args failed: %d", spiStatus);
+		epoch = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+			SPI_tuptable->tupdesc, 1, &isnull));
+		if (isnull)
+			elog(ERROR, "fragment epoch is null for relation %u", heapOid);
+		SPI_finish();
 	}
 
 	CommandCounterIncrement();
@@ -1975,9 +2125,9 @@ HnswMetadataCurrentCacheVersion(Oid heapOid, bool *tracked, int64 *epoch, Oid *r
 	*tracked = HnswMetadataGetRelationVersion(heapOid, epoch, relFileNode);
 	if (hnsw_guidance_require_epoch && !*tracked)
 		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("fragment epoch tracking is not enabled for relation %u", heapOid),
-				 errhint("Call vector_hnsw_fragment_tracking_enable(%u::regclass) before activating guidance.", heapOid)));
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("valid fragment epoch tracking is not enabled for relation %u", heapOid),
+					 errhint("Call vector_hnsw_fragment_tracking_enable(%u::regclass) before activating guidance.", heapOid)));
 }
 
 static bool
@@ -3559,18 +3709,6 @@ HnswGuidanceStructuralSubset(List *predicateClauses, List *actualClauses)
 }
 
 static bool
-HnswGuidancePlanHasJoin(PlanState *planState, void *context)
-{
-	if (planState == NULL)
-		return false;
-	if (IsA(planState, NestLoopState) || IsA(planState, MergeJoinState) ||
-		IsA(planState, HashJoinState))
-		return true;
-
-	return planstate_tree_walker(planState, HnswGuidancePlanHasJoin, context);
-}
-
-static bool
 HnswGuidanceEstimateSkipRate(HnswActiveGuidance *guide, double totalRows,
 							 double *skipRate)
 {
@@ -3724,11 +3862,6 @@ HnswGuidancePrepareForScan(IndexScanDesc scan, void *planBinding,
 		return HnswGuidanceProofFailure(scan, binding, proof, HNSW_PROOF_BYPASS_LATE_GENERATION);
 	if (binding->precheckReason != HNSW_PROOF_BYPASS_NONE)
 		return HnswGuidanceProofFailure(scan, binding, proof, binding->precheckReason);
-	if (hnsw_filter_strategy == HNSW_FILTER_STRATEGY_TRAVERSAL_GUIDED &&
-		HnswGuidancePlanHasJoin(binding->queryDesc->planstate, NULL))
-		return HnswGuidanceProofFailure(scan, binding, proof,
-			HNSW_PROOF_BYPASS_NON_TARGET_VAR);
-
 	frame = HnswExecutorBindingFindFrame(binding->frameId, binding->queryDesc);
 	if (frame == NULL || !frame->bindingSeen || !frame->bindingMatched)
 		return HnswGuidanceProofFailure(scan, binding, proof, HNSW_PROOF_BYPASS_NO_STATEMENT_BINDING);
@@ -3743,8 +3876,7 @@ HnswGuidancePrepareForScan(IndexScanDesc scan, void *planBinding,
 		return HnswGuidanceProofFailure(scan, binding, proof, HNSW_PROOF_BYPASS_PREDICATE_UNAVAILABLE);
 
 	tracked = HnswMetadataGetRelationVersion(binding->heapOid, &epoch, &relFileNode);
-	if ((hnsw_guidance_require_epoch && !tracked) ||
-		tracked != hnsw_active_guidance.epochTracked ||
+	if (!tracked || !hnsw_active_guidance.epochTracked ||
 		(tracked && epoch != hnsw_active_guidance.relationEpoch) ||
 		relFileNode != hnsw_active_guidance.relationRelFileNode)
 	{
@@ -3809,21 +3941,13 @@ HnswGuidancePrepareForScan(IndexScanDesc scan, void *planBinding,
 		implied = HnswGuidanceStructuralSubset(predicateClauses, actualClauses);
 	if (!implied)
 		return HnswGuidanceProofFailure(scan, binding, proof, HNSW_PROOF_BYPASS_PREDICATE_NOT_IMPLIED);
-	if (hnsw_filter_strategy == HNSW_FILTER_STRATEGY_TRAVERSAL_GUIDED)
-	{
-		/*
-		 * Hard pruning needs equivalence, not merely actual => guide.  Reuse
-		 * predicate_not_implied for the reverse failure because the public
-		 * proof-reason enum intentionally remains unchanged.
-		 */
-		implied = predicate_implied_by(actualClauses, predicateClauses, false);
-		if (!implied)
-			implied = HnswGuidanceStructuralSubset(actualClauses,
-				predicateClauses);
-		if (!implied)
-			return HnswGuidanceProofFailure(scan, binding, proof,
-				HNSW_PROOF_BYPASS_PREDICATE_NOT_IMPLIED);
-	}
+	/*
+	 * Candidate admission needs actual => guide, not equivalence.  A tuple
+	 * outside the guide cannot satisfy the SQL predicate, while its HNSW node
+	 * remains on the native expansion frontier.  Excluding it from W can only
+	 * defer the stock termination threshold; residual and join quals continue
+	 * to run in the PostgreSQL executor.
+	 */
 
 	guidance = (HnswScanGuidance *) MemoryContextAllocZero(
 		MemoryContextGetParent(((HnswScanOpaque) scan->opaque)->tmpCtx),
@@ -4094,6 +4218,13 @@ vector_hnsw_guidance_activate(PG_FUNCTION_ARGS)
 	guidancePredicate = HnswGuidanceBuildPredicate(heapOid, filterDatums,
 												 filterNulls, filterCount, kind);
 	HnswMetadataCurrentCacheVersion(heapOid, &epochTracked, &relationEpoch, &relationRelFileNode);
+	if (!epochTracked)
+		ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("valid fragment epoch tracking is required for HNSW guidance on relation %u",
+							heapOid),
+					 errhint("Call vector_hnsw_fragment_tracking_enable(%u::regclass) before activating guidance.",
+							heapOid)));
 
 	InitHnswGuidanceDescriptors();
 	MemSet(&descriptorKey, 0, sizeof(descriptorKey));

@@ -21,19 +21,27 @@ import psycopg
 try:
     from .common_pg import pg_config_from_env
     from .pgvector_design1_design2_design3_selectivity_benchmark import (
+        candidate_validity_index_predicate_matches,
+        candidate_validity_sha256,
+        effective_candidate_validity_predicate,
         ensure_functions,
         normalize_cpu_list,
         require_d2_graph_proof,
         stable_d2_graph_proof,
+        validate_candidate_validity_predicate,
         validate_d2_graph_proof,
     )
 except ImportError:
     from common_pg import pg_config_from_env
     from pgvector_design1_design2_design3_selectivity_benchmark import (
+        candidate_validity_index_predicate_matches,
+        candidate_validity_sha256,
+        effective_candidate_validity_predicate,
         ensure_functions,
         normalize_cpu_list,
         require_d2_graph_proof,
         stable_d2_graph_proof,
+        validate_candidate_validity_predicate,
         validate_d2_graph_proof,
     )
 
@@ -72,7 +80,7 @@ DENSE_12_EF_SEARCH = "250,500,750,1000,1500,2000,3000,4000,5000,7000,8500,10000"
 FORMAL_TARGETS = (0.90, 0.95, 0.99)
 TIE_AWARE_RECALL_CONTRACT = "distance_squared_threshold_tie_aware_v1"
 SQLENS_V11_BUILD_PREFIX = "sqlens-v11-"
-SQLENS_MIN_PROFILE_SEMANTICS = 4.0
+SQLENS_MIN_PROFILE_SEMANTICS = 6.0
 SQLENS_PROFILE_REQUIRED_FIELDS = (
     "graph_elements_visited",
     "raw_index_tids_returned",
@@ -83,11 +91,17 @@ SQLENS_TRAVERSAL_PROFILE_REQUIRED_FIELDS = (
     "final_path",
     "planner_proof_attempted",
     "planner_proof_succeeded",
+    "traversal_guidance_scope",
+    "graph_expansion_pruned",
+    "distance_computations_pruned",
     "pre_distance_membership_checks",
     "pre_distance_membership_matches",
     "pre_distance_membership_misses",
     "distance_computations_avoided",
     "neighbor_expansion_guidance_checks",
+    "traversal_guided_admissions",
+    "traversal_guided_suppressions",
+    "traversal_heap_tids_suppressed",
     "guided_expanded_nodes",
     "guided_phase_distance_computations",
     "stock_bypass_requests",
@@ -420,6 +434,26 @@ def validate_tie_aware_raw_row(
                 raise ValueError("formal traversal raw row used stock bypass")
             if int(row.get("fallback_requests") or 0) != 0:
                 raise ValueError("formal traversal raw row used fresh-stock fallback")
+            if row.get("traversal_guidance_scope") != "candidate_admission_and_validation":
+                raise ValueError("formal traversal raw row has the wrong guidance scope")
+            if csv_bool(row.get("graph_expansion_pruned", "")):
+                raise ValueError("formal candidate admission claimed graph-expansion pruning")
+            if csv_bool(row.get("distance_computations_pruned", "")):
+                raise ValueError("formal candidate admission claimed distance pruning")
+            if int(row.get("pre_distance_membership_checks") or 0) != 0:
+                raise ValueError("formal candidate admission recorded pre-distance checks")
+            if int(row.get("distance_computations_avoided") or 0) != 0:
+                raise ValueError("formal candidate admission recorded avoided distance work")
+            neighbor_checks = int(row.get("neighbor_expansion_guidance_checks") or 0)
+            guided_admissions = int(row.get("traversal_guided_admissions") or 0)
+            guided_suppressions = int(row.get("traversal_guided_suppressions") or 0)
+            heap_suppressions = int(row.get("traversal_heap_tids_suppressed") or 0)
+            if neighbor_checks <= 0 or guided_admissions <= 0 or guided_suppressions <= 0:
+                raise ValueError("formal candidate admission has empty traversal evidence")
+            if heap_suppressions < guided_suppressions:
+                raise ValueError(
+                    "formal heap-TID suppression count is smaller than suppressed HNSW elements"
+                )
             if not csv_bool(row.get("traversal_estimated_skip_rate_valid", "")):
                 raise ValueError("formal traversal raw row lacks a valid skip-rate estimate")
             estimated_skip_rate = float(row.get("traversal_estimated_skip_rate") or -1)
@@ -642,7 +676,11 @@ def plan_evidence_path(raw: Path) -> Path:
     return raw.with_suffix(raw.suffix + ".plan.json")
 
 
-def require_plan_evidence(raw: Path) -> dict[str, object]:
+def require_plan_evidence(
+    raw: Path,
+    expected_candidate_validity_predicate: str | None = None,
+    expected_database_fingerprint: dict[str, object] | None = None,
+) -> dict[str, object]:
     path = plan_evidence_path(raw)
     if not path.is_file():
         raise RuntimeError(f"missing HNSW plan evidence: {path}")
@@ -655,6 +693,67 @@ def require_plan_evidence(raw: Path) -> dict[str, object]:
         raise RuntimeError(f"incomplete HNSW plan evidence: {path}")
     if not all(isinstance(check, dict) and check.get("passed") is True for check in checks):
         raise RuntimeError(f"failed HNSW plan check in {path}")
+    query_contract = payload.get("query_contract")
+    contract_predicate = (
+        query_contract.get("candidate_validity_predicate")
+        if isinstance(query_contract, dict)
+        else None
+    )
+    if expected_candidate_validity_predicate is not None or contract_predicate is not None:
+        expected_validity = effective_candidate_validity_predicate(
+            expected_candidate_validity_predicate
+            if expected_candidate_validity_predicate is not None
+            else contract_predicate
+        )
+        expected_validity_sha = candidate_validity_sha256(expected_validity)
+        expected_is_partial = not candidate_validity_index_predicate_matches(
+            None, expected_validity
+        )
+        if (
+            not isinstance(query_contract, dict)
+            or query_contract.get("candidate_validity_predicate") != expected_validity
+            or query_contract.get("candidate_validity_predicate_sha256")
+            != expected_validity_sha
+        ):
+            raise RuntimeError(f"candidate validity query contract mismatch in {path}")
+        if any(
+            check.get("candidate_validity_predicate") != expected_validity
+            or check.get("candidate_validity_predicate_sha256") != expected_validity_sha
+            or check.get("expected_index_predicate") != expected_validity
+            or check.get("expected_index_predicate_sha256") != expected_validity_sha
+            or check.get("expected_index_is_partial") is not expected_is_partial
+            or check.get("catalog_index_predicate_matches") is not True
+            or check.get("catalog_index_is_partial") is not expected_is_partial
+            or check.get("catalog_index_predicate_sha256")
+            != candidate_validity_sha256(
+                check.get("catalog_index_predicate")
+                if check.get("catalog_index_predicate") is not None
+                else "TRUE"
+            )
+            for check in checks
+        ):
+            raise RuntimeError(f"candidate validity plan evidence mismatch in {path}")
+        if expected_database_fingerprint is not None:
+            relations = expected_database_fingerprint.get("relations")
+            if not isinstance(relations, dict):
+                raise RuntimeError(f"missing database relation fingerprint in {path}")
+            for check in checks:
+                relation_name = str(check.get("expected_index") or "")
+                fingerprint = relations.get(relation_name)
+                if not isinstance(fingerprint, dict):
+                    raise RuntimeError(
+                        f"plan evidence index is absent from parent database fingerprint: {relation_name}"
+                    )
+                if (
+                    check.get("expected_index_oid") != fingerprint.get("oid")
+                    or check.get("catalog_index_predicate")
+                    != fingerprint.get("indpred")
+                    or check.get("catalog_index_is_partial")
+                    is not fingerprint.get("is_partial")
+                ):
+                    raise RuntimeError(
+                        f"plan evidence does not match parent database fingerprint for {relation_name}"
+                    )
     identities = [
         payload.get("sqlens_runtime_identity_startup"),
         payload.get("sqlens_runtime_identity_final"),
@@ -766,8 +865,16 @@ def require_plan_evidence(raw: Path) -> dict[str, object]:
     return payload
 
 
-def plan_evidence_manifest_entry(raw: Path) -> dict[str, object]:
-    payload = require_plan_evidence(raw)
+def plan_evidence_manifest_entry(
+    raw: Path,
+    expected_candidate_validity_predicate: str | None = None,
+    expected_database_fingerprint: dict[str, object] | None = None,
+) -> dict[str, object]:
+    payload = require_plan_evidence(
+        raw,
+        expected_candidate_validity_predicate,
+        expected_database_fingerprint,
+    )
     path = plan_evidence_path(raw)
     return {
         "path": str(path),
@@ -798,6 +905,8 @@ def plan_evidence_manifest_entry(raw: Path) -> dict[str, object]:
                     "query_table",
                     "query_id_column",
                     "query_vector_column",
+                    "candidate_validity_predicate",
+                    "candidate_validity_predicate_sha256",
                     "self_excluded",
                     "self_exclusion_contract",
                     "scan_limit",
@@ -805,6 +914,14 @@ def plan_evidence_manifest_entry(raw: Path) -> dict[str, object]:
                     "expected_index_identity",
                     "expected_index_oid",
                     "expected_index_access_method",
+                    "expected_index_predicate",
+                    "expected_index_predicate_sha256",
+                    "expected_index_is_partial",
+                    "catalog_index_oid",
+                    "catalog_index_predicate",
+                    "catalog_index_predicate_sha256",
+                    "catalog_index_is_partial",
+                    "catalog_index_predicate_matches",
                     "expected_table_identity",
                     "observed_index_nodes",
                     "matched_index_nodes",
@@ -921,7 +1038,18 @@ def database_fingerprint(args: argparse.Namespace, sqlens_build_id: str) -> dict
         args.bfs_table,
         args.bfs_index,
     ]
-    out: dict[str, object] = {"relations": {}}
+    validity = effective_candidate_validity_predicate(
+        getattr(args, "candidate_validity_predicate", "")
+    )
+    out: dict[str, object] = {
+        "relations": {},
+        "candidate_validity_predicate": validity,
+        "candidate_validity_predicate_sha256": candidate_validity_sha256(validity),
+        "candidate_validity_predicate_explicit": bool(
+            getattr(args, "candidate_validity_predicate_explicit", False)
+        ),
+    }
+    index_relations = {str(args.insertion_index), str(args.bfs_index)}
     with psycopg.connect(pg_config_from_env().conninfo, autocommit=True) as conn:
         cur = conn.cursor()
         cur.execute(
@@ -933,7 +1061,8 @@ def database_fingerprint(args: argparse.Namespace, sqlens_build_id: str) -> dict
         for relation in dict.fromkeys(relations):
             cur.execute(
                 "SELECT c.oid::bigint, c.relfilenode::bigint, c.reltuples::bigint, "
-                "pg_relation_size(c.oid), COALESCE(i.indisvalid, true), COALESCE(i.indisready, true) "
+                "pg_relation_size(c.oid), COALESCE(i.indisvalid, true), "
+                "COALESCE(i.indisready, true), pg_get_expr(i.indpred, i.indrelid) "
                 "FROM pg_class c LEFT JOIN pg_index i ON i.indexrelid=c.oid "
                 "WHERE c.oid=to_regclass(%s)",
                 (relation,),
@@ -941,6 +1070,13 @@ def database_fingerprint(args: argparse.Namespace, sqlens_build_id: str) -> dict
             row = cur.fetchone()
             if row is None:
                 raise RuntimeError(f"benchmark relation does not exist: {relation}")
+            indpred = row[6] if len(row) > 6 else None
+            is_index = relation in index_relations
+            predicate_matches = (
+                candidate_validity_index_predicate_matches(indpred, validity)
+                if is_index
+                else None
+            )
             out["relations"][relation] = {
                 "oid": row[0],
                 "relfilenode": row[1],
@@ -948,7 +1084,19 @@ def database_fingerprint(args: argparse.Namespace, sqlens_build_id: str) -> dict
                 "bytes": row[3],
                 "valid": row[4],
                 "ready": row[5],
+                "indpred": indpred,
+                "is_partial": indpred is not None,
+                "candidate_validity_predicate": validity if is_index else None,
+                "candidate_validity_predicate_sha256": (
+                    candidate_validity_sha256(validity) if is_index else None
+                ),
+                "candidate_validity_predicate_matches": predicate_matches,
             }
+            if is_index and predicate_matches is not True:
+                raise RuntimeError(
+                    "candidate validity database fingerprint mismatch for "
+                    f"{relation}: catalog indpred={indpred!r}, expected={validity!r}"
+                )
         out["query_table"] = query_relation_provenance(
             cur, str(getattr(args, "query_table", None) or args.insertion_table)
         )
@@ -992,7 +1140,11 @@ def query_relation_provenance(cur: psycopg.Cursor, table: str) -> dict[str, obje
     }
 
 
-def truth_query_ids(path: Path, expected_self_excluded: bool = True) -> dict[int, int]:
+def truth_query_ids(
+    path: Path,
+    expected_self_excluded: bool = True,
+    expected_candidate_validity_predicate: str | None = None,
+) -> dict[int, int]:
     query_ids: dict[int, int] = {}
     with path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -1005,6 +1157,14 @@ def truth_query_ids(path: Path, expected_self_excluded: bool = True) -> dict[int
         missing = required - set(reader.fieldnames or ())
         if missing:
             raise RuntimeError(f"truth CSV is missing tie-aware fields: {sorted(missing)}")
+        if (
+            expected_candidate_validity_predicate is not None
+            and "candidate_validity_predicate" not in set(reader.fieldnames or ())
+        ):
+            raise RuntimeError(
+                "truth CSV is missing candidate_validity_predicate required by the "
+                "explicit candidate-validity contract"
+            )
         for row in reader:
             if row.get("method") != "pre_filter_exact":
                 continue
@@ -1012,6 +1172,19 @@ def truth_query_ids(path: Path, expected_self_excluded: bool = True) -> dict[int
                 raise RuntimeError(
                     "truth CSV self_excluded value does not match the expected query contract"
                 )
+            if expected_candidate_validity_predicate is not None:
+                expected_validity = effective_candidate_validity_predicate(
+                    expected_candidate_validity_predicate
+                )
+                observed_validity = effective_candidate_validity_predicate(
+                    row.get("candidate_validity_predicate", "")
+                )
+                if observed_validity != expected_validity:
+                    raise RuntimeError(
+                        "truth CSV candidate_validity_predicate does not match the expected "
+                        f"candidate contract: observed={observed_validity!r}, "
+                        f"expected={expected_validity!r}"
+                    )
             filtered_rows = int(row["filtered_rows"])
             if filtered_rows < 0:
                 raise RuntimeError("truth CSV contains a negative filtered_rows value")
@@ -1046,6 +1219,20 @@ def normalized_args(args: argparse.Namespace) -> dict[str, object]:
         for key, value in sorted(vars(args).items())
         if key not in {"resume", "skip_final", "run_spec_hash", "d2_graph_proof"}
     }
+
+
+def explicit_candidate_validity_predicate(
+    args: argparse.Namespace,
+) -> str | None:
+    predicate = str(getattr(args, "candidate_validity_predicate", "") or "").strip()
+    explicit = getattr(args, "candidate_validity_predicate_explicit", None)
+    if explicit is None:
+        # Namespaces made by older callers have no marker; preserve their non-empty
+        # predicate behavior while treating an omitted value as legacy truth.
+        explicit = bool(predicate)
+    if not explicit:
+        return None
+    return effective_candidate_validity_predicate(predicate)
 
 
 def formal_run_uses_d2(args: argparse.Namespace) -> bool:
@@ -1124,6 +1311,7 @@ def build_run_spec(args: argparse.Namespace) -> dict[str, object]:
     query_ids = truth_query_ids(
         args.truth_csv,
         expected_self_excluded=args.expected_truth_self_excluded,
+        expected_candidate_validity_predicate=explicit_candidate_validity_predicate(args),
     )
     sqlens_runtime = sqlens_runtime_provenance()
     d2_proof = d2_graph_proof_from_env(args)
@@ -1144,10 +1332,22 @@ def build_run_spec(args: argparse.Namespace) -> dict[str, object]:
             "query_id_column": args.query_id_column,
             "query_vector_column": args.query_vector_column,
             "self_excluded": args.expected_truth_self_excluded,
+            "candidate_validity_predicate": effective_candidate_validity_predicate(
+                getattr(args, "candidate_validity_predicate", "")
+            ),
+            "candidate_validity_predicate_sha256": candidate_validity_sha256(
+                getattr(args, "candidate_validity_predicate", "")
+            ),
+            "candidate_validity_predicate_explicit": bool(
+                getattr(args, "candidate_validity_predicate_explicit", False)
+            ),
+            "candidate_validity_contract": (
+                "planner_partial_index_predicate_and_sql_candidate_qual_not_guidance_atom"
+            ),
             "predicate_contract": (
-                "exact_activated_predicate_no_residual_scan_qual"
+                "exact_activated_workload_predicate_plus_candidate_validity_sql_qual"
                 if args.guidance_filter_strategy == "traversal_guided"
-                else "diagnostic_sql_self_exclusion_residual"
+                else "diagnostic_workload_plus_candidate_validity_sql_quals"
             ),
             "self_exclusion": (
                 "limit_k_plus_1_client_remove_query_id"
@@ -1303,6 +1503,16 @@ def run_d123(
     append_option(cmd, "--query-table", getattr(args, "query_table", None))
     append_option(cmd, "--query-id-column", getattr(args, "query_id_column", "id"))
     append_option(cmd, "--query-vector-column", getattr(args, "query_vector_column", "embedding"))
+    if getattr(
+        args,
+        "candidate_validity_predicate_explicit",
+        bool(getattr(args, "candidate_validity_predicate", "").strip()),
+    ):
+        append_option(
+            cmd,
+            "--candidate-validity-predicate",
+            args.candidate_validity_predicate,
+        )
     if not getattr(args, "expected_truth_self_excluded", True):
         cmd.append("--no-expected-truth-self-excluded")
     append_option(cmd, "--backend-cpu-list", getattr(args, "backend_cpu_list", None))
@@ -1393,6 +1603,16 @@ def run_d123_interleaved(
     append_option(cmd, "--query-table", getattr(args, "query_table", None))
     append_option(cmd, "--query-id-column", getattr(args, "query_id_column", "id"))
     append_option(cmd, "--query-vector-column", getattr(args, "query_vector_column", "embedding"))
+    if getattr(
+        args,
+        "candidate_validity_predicate_explicit",
+        bool(getattr(args, "candidate_validity_predicate", "").strip()),
+    ):
+        append_option(
+            cmd,
+            "--candidate-validity-predicate",
+            args.candidate_validity_predicate,
+        )
     if not getattr(args, "expected_truth_self_excluded", True):
         cmd.append("--no-expected-truth-self-excluded")
     append_option(cmd, "--backend-cpu-list", getattr(args, "backend_cpu_list", None))
@@ -1601,7 +1821,11 @@ def calibrate_mode_filter(
                 ) if args.resume else None
                 if summary is not None:
                     try:
-                        require_plan_evidence(out)
+                        require_plan_evidence(
+                            out,
+                            explicit_candidate_validity_predicate(args),
+                            getattr(args, "database_fingerprint", None),
+                        )
                     except RuntimeError:
                         summary = None
                 if summary is None:
@@ -1640,7 +1864,11 @@ def calibrate_mode_filter(
                         f"calibration query split is incomplete in {out}: "
                         f"expected {args.calibration_queries}, got {summary[0]['queries']}"
                     )
-                plan_evidence = plan_evidence_manifest_entry(out)
+                plan_evidence = plan_evidence_manifest_entry(
+                    out,
+                    explicit_candidate_validity_predicate(args),
+                    getattr(args, "database_fingerprint", None),
+                )
                 row = {
                     "filter_name": filter_name,
                     "mode": mode,
@@ -2006,7 +2234,11 @@ def run_final_interleaved(
                     args.final_repeats,
                     getattr(args, "expected_truth_self_excluded", True),
                 )
-                require_plan_evidence(raw)
+                require_plan_evidence(
+                    raw,
+                    explicit_candidate_validity_predicate(args),
+                    getattr(args, "database_fingerprint", None),
+                )
                 if {str(row["mode"]) for row in candidate} == set(modes):
                     summary = candidate
             except (KeyError, TypeError, ValueError, csv.Error, RuntimeError):
@@ -2032,7 +2264,11 @@ def run_final_interleaved(
             elapsed_ms = 0.0
             print(f"reusing {raw}", flush=True)
 
-        plan_evidence = plan_evidence_manifest_entry(raw)
+        plan_evidence = plan_evidence_manifest_entry(
+            raw,
+            explicit_candidate_validity_predicate(args),
+            getattr(args, "database_fingerprint", None),
+        )
         summaries = {str(row["mode"]): row for row in summary}
         if set(summaries) != set(modes):
             raise RuntimeError(f"expected modes {modes} in {raw}, got {sorted(summaries)}")
@@ -2092,7 +2328,11 @@ def run_final_unique(
         ) if args.resume else None
         if summary is not None:
             try:
-                require_plan_evidence(raw)
+                require_plan_evidence(
+                    raw,
+                    explicit_candidate_validity_predicate(args),
+                    getattr(args, "database_fingerprint", None),
+                )
             except RuntimeError:
                 summary = None
         if summary is None:
@@ -2125,7 +2365,11 @@ def run_final_unique(
                 f"final query split is incomplete in {raw}: "
                 f"expected {args.final_queries}, got {summary[0]['queries']}"
             )
-        plan_evidence = plan_evidence_manifest_entry(raw)
+        plan_evidence = plan_evidence_manifest_entry(
+            raw,
+            explicit_candidate_validity_predicate(args),
+            getattr(args, "database_fingerprint", None),
+        )
         results[key] = {
             **summary[0],
             "target_recall": target_recall,
@@ -2354,6 +2598,15 @@ def main() -> None:
     parser.add_argument("--query-id-column", default="id")
     parser.add_argument("--query-vector-column", default="embedding")
     parser.add_argument(
+        "--candidate-validity-predicate",
+        type=validate_candidate_validity_predicate,
+        default="",
+        help=(
+            "Global partial-index candidate predicate (for example embedding_valid). "
+            "It is forwarded as a SQL/planner qual and never as a D1 guidance atom."
+        ),
+    )
+    parser.add_argument(
         "--expected-truth-self-excluded",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -2411,6 +2664,9 @@ def main() -> None:
     parser.add_argument("--bootstrap-samples", type=int, default=10000)
     parser.add_argument("--bootstrap-seed", type=int, default=20260718)
     args = parser.parse_args()
+    args.candidate_validity_predicate_explicit = (
+        "--candidate-validity-predicate" in sys.argv
+    )
 
     if args.guidance_filter_strategy == "safe_guided":
         print("safe_guided preserves stock termination; guided_collect_target is fixed to 1 and ignored", flush=True)
@@ -2453,6 +2709,7 @@ def main() -> None:
         run_spec = build_run_spec(args)
         args.d2_graph_proof = run_spec["d2_graph_proof"]
         args.sqlens_runtime_provenance = run_spec["sqlens_runtime_provenance"]
+        args.database_fingerprint = run_spec["database"]
         args.run_spec_hash = str(run_spec["run_spec_hash"])
         run_prefix = f"{args.run_spec_hash[:12]}_{args.tag}"
         manifest_out = RESULTS / f"sigmod_matched_recall_manifest_{run_prefix}.json"
@@ -2530,7 +2787,12 @@ def main() -> None:
         }
         calibration_raws = sorted({Path(str(row["raw"])) for row in calibration_rows})
         manifest["plan_evidence"] = [
-            plan_evidence_manifest_entry(path) for path in calibration_raws
+            plan_evidence_manifest_entry(
+                path,
+                explicit_candidate_validity_predicate(args),
+                getattr(args, "database_fingerprint", None),
+            )
+            for path in calibration_raws
         ]
         write_json_atomic(manifest_out, manifest)
 
@@ -2556,7 +2818,11 @@ def main() -> None:
                 {Path(str(result["final_raw"])) for result in final_results.values()}
             )
             manifest["plan_evidence"] = [
-                plan_evidence_manifest_entry(path)
+                plan_evidence_manifest_entry(
+                    path,
+                    explicit_candidate_validity_predicate(args),
+                    getattr(args, "database_fingerprint", None),
+                )
                 for path in sorted(set(calibration_raws + final_raws))
             ]
 

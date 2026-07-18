@@ -16,7 +16,7 @@
 #include "utils/sampling.h"
 #include "vector.h"
 
-#define SQLENS_BUILD_ID "sqlens-v11-formal-graph-proof-20260718-r2"
+#define SQLENS_BUILD_ID "sqlens-v11-admission-join-safe-20260718-r6"
 
 #if PG_VERSION_NUM >= 190000
 typedef Pointer Item;
@@ -321,6 +321,9 @@ typedef struct HnswTraversalGuidanceState
 	bool		memoryLimitReached;
 	bool		invalidNeighbor;
 	int			guidedResultCount;
+	int			bridgePendingAtTermination;
+	HnswIterativeScanMode iterativeScan;
+	HnswFilterStrategyMode filterStrategy;
 	HnswTraversalFinalPath finalPath;
 	HnswTraversalStockBypassReason stockBypassReason;
 	HnswTraversalFallbackReason fallbackReason;
@@ -339,10 +342,12 @@ typedef struct HnswTraversalProfile
 	int64		preDistanceChecks;
 	int64		preDistanceMatches;
 	int64		preDistanceMisses;
+	int64		attemptedDistanceComputationsAvoided;
 	int64		distanceComputationsAvoided;
 	int64		missBridgeNodes;
 	int64		missBridgeEdges;
 	int64		maxMissBridgeHops;
+	int64		bridgePendingAtTermination;
 	int64		guidedExpandedNodes;
 	int64		guidedPhaseDistanceComputations;
 	int64		stockPhaseExpandedNodes;
@@ -412,6 +417,8 @@ typedef struct HnswScanProfile
 	HnswTraversalFallbackReason traversalFallbackReason;
 	bool		traversalEstimatedSkipRateValid;
 	double		traversalEstimatedSkipRate;
+	HnswIterativeScanMode iterativeScan;
+	HnswFilterStrategyMode filterStrategy;
 	int			plannerProofCount;
 	bool		plannerProofsTruncated;
 	HnswPlannerProofOutcome plannerProofs[HNSW_PROFILE_MAX_PROOFS];

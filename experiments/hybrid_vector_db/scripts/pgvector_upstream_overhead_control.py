@@ -32,6 +32,7 @@ DEFAULT_OUT_DIR = ROOT / "results/hybrid_vector_db"
 DEFAULT_TABLE = "public.amazon_grocery_reviews_10m_pgvector"
 DEFAULT_INDEX = "public.amazon_grocery_reviews_10m_pgvector_embedding_hnsw_idx"
 UPSTREAM_MAX_EF_SEARCH = 1000
+EVALUATION_MAX_EF_SEARCH = 10000
 DEFAULT_EF_VALUES = (250, 500, 750, UPSTREAM_MAX_EF_SEARCH)
 DEFAULT_BUDGET_RUNGS = (
     (1, 100_000, 1.0),
@@ -41,6 +42,7 @@ DEFAULT_BUDGET_RUNGS = (
 OFF_REPRESENTATIVE_MAX_SCAN = 100_000
 OFF_REPRESENTATIVE_SCAN_MEM = 1.0
 OFFICIAL_UPSTREAM_VECTOR_SO_SHA256 = "812292e3e7553c3dbe6a4187b528430a7f9c25693f4876b8d22f88829592a778"
+UPSTREAM_EF10000_PATCH_SHA256 = "d63b8d75015cffb90d9bd7f04d0c8f572502f0b84f77f59f581d224db7601bcf"
 DEFAULT_SQLENS_BUILD_PREFIX = "sqlens-v11-"
 DEFAULT_SQLENS_PROFILE_SEMANTICS = 4.0
 FORMAL_TARGET_RECALLS = (0.90, 0.95, 0.99)
@@ -323,6 +325,78 @@ def source_tree_provenance(path: Path, expected_commit: str) -> dict[str, Any]:
     }
 
 
+def upstream_parameter_ceiling_provenance(
+    source_repo: Path,
+    patch_path: Path | None,
+    max_ef_search: int,
+) -> dict[str, Any]:
+    if max_ef_search == UPSTREAM_MAX_EF_SEARCH:
+        if patch_path is not None:
+            raise ProvenanceGateError(
+                "the release-limit official arm must not declare an evaluation patch"
+            )
+        return {
+            "mode": "unmodified_upstream_release_binary",
+            "max_ef_search": UPSTREAM_MAX_EF_SEARCH,
+            "patch_applied": False,
+        }
+    if max_ef_search != EVALUATION_MAX_EF_SEARCH or patch_path is None:
+        raise ProvenanceGateError(
+            "the evaluation arm supports only max_ef_search=10000 with an explicit patch"
+        )
+    if not patch_path.is_file():
+        raise ProvenanceGateError(f"upstream evaluation patch is missing: {patch_path}")
+    patch_bytes = patch_path.read_bytes()
+    patch_sha256 = hashlib.sha256(patch_bytes).hexdigest()
+    if patch_sha256 != UPSTREAM_EF10000_PATCH_SHA256:
+        raise ProvenanceGateError(
+            "upstream evaluation patch does not match the canonical ef_search-only patch"
+        )
+    diff = subprocess.run(
+        ["git", "diff", "--no-ext-diff", "HEAD", "--", "src/hnsw.c", "src/hnsw.h"],
+        cwd=str(source_repo),
+        capture_output=True,
+        check=False,
+    )
+    names = subprocess.run(
+        ["git", "diff", "--name-only", "HEAD", "--"],
+        cwd=str(source_repo),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    untracked = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=str(source_repo),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if diff.returncode or names.returncode or untracked.returncode:
+        raise ProvenanceGateError("could not audit the upstream evaluation source diff")
+    changed_files = sorted(item for item in names.stdout.splitlines() if item)
+    untracked_files = sorted(item for item in untracked.stdout.splitlines() if item)
+    if diff.stdout != patch_bytes or changed_files != ["src/hnsw.c", "src/hnsw.h"]:
+        raise ProvenanceGateError(
+            "upstream evaluation source differs from the canonical two-file ceiling patch"
+        )
+    if untracked_files:
+        raise ProvenanceGateError(
+            "upstream evaluation source contains untracked files: "
+            + ", ".join(untracked_files)
+        )
+    return {
+        "mode": "upstream_algorithm_evaluation_only_guc_ceiling_extension",
+        "max_ef_search": EVALUATION_MAX_EF_SEARCH,
+        "patch_applied": True,
+        "patch_path": str(patch_path.resolve()),
+        "patch_sha256": patch_sha256,
+        "changed_files": changed_files,
+        "semantic_change": "HNSW_MAX_EF_SEARCH and its GUC help text only",
+        "algorithm_change": False,
+    }
+
+
 def atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent), text=True)
@@ -410,6 +484,7 @@ def load_truth(
     query_nos: Iterable[int],
     filter_names: set[str],
     k: int,
+    candidate_validity_predicate: str = "",
 ) -> dict[tuple[str, int], TruthEntry]:
     wanted = set(query_nos)
     rows = read_csv(path)
@@ -425,6 +500,18 @@ def load_truth(
     if not rows or not required.issubset(rows[0]):
         missing = required - set(rows[0]) if rows else required
         raise ValueError(f"tie-aware exact truth is missing {sorted(missing)}")
+    if candidate_validity_predicate:
+        if "candidate_validity_predicate" not in rows[0]:
+            raise ValueError(
+                "tie-aware exact truth is missing candidate_validity_predicate"
+            )
+        observed_validity = {
+            row.get("candidate_validity_predicate", "").strip() for row in rows
+        }
+        if observed_validity != {candidate_validity_predicate.strip()}:
+            raise ValueError(
+                "tie-aware exact truth candidate-validity contract does not match the run"
+            )
     result: dict[tuple[str, int], TruthEntry] = {}
     ids_by_query: dict[int, int] = {}
     for row in rows:
@@ -495,7 +582,9 @@ def default_config_ladder() -> list[Config]:
     return configs
 
 
-def config_from_mapping(row: Mapping[str, Any]) -> Config:
+def config_from_mapping(
+    row: Mapping[str, Any], max_ef_search: int = UPSTREAM_MAX_EF_SEARCH
+) -> Config:
     iterative = str(row["iterative_scan"])
     if iterative not in {"off", "strict_order", "relaxed_order"}:
         raise ValueError(f"invalid iterative_scan {iterative!r}")
@@ -508,10 +597,10 @@ def config_from_mapping(row: Mapping[str, Any]) -> Config:
     )
     if config.ef_search <= 0 or config.max_scan_tuples <= 0:
         raise ValueError("ef_search and max_scan_tuples must be positive")
-    if config.ef_search > UPSTREAM_MAX_EF_SEARCH:
+    if config.ef_search > max_ef_search:
         raise ValueError(
-            "binary overhead control must stay inside official pgvector's "
-            f"hnsw.ef_search range (<= {UPSTREAM_MAX_EF_SEARCH})"
+            "binary overhead control must stay inside the provenance-gated official pgvector "
+            f"hnsw.ef_search range (<= {max_ef_search})"
         )
     if not math.isfinite(config.scan_mem_multiplier) or config.scan_mem_multiplier <= 0:
         raise ValueError("scan_mem_multiplier must be finite and positive")
@@ -520,7 +609,9 @@ def config_from_mapping(row: Mapping[str, Any]) -> Config:
     return config
 
 
-def load_config_ladder(path: Path | None) -> list[Config]:
+def load_config_ladder(
+    path: Path | None, max_ef_search: int = UPSTREAM_MAX_EF_SEARCH
+) -> list[Config]:
     if path is None:
         return default_config_ladder()
     if path.suffix.lower() == ".json":
@@ -528,9 +619,9 @@ def load_config_ladder(path: Path | None) -> list[Config]:
         rows = payload.get("configs") if isinstance(payload, dict) else payload
         if not isinstance(rows, list):
             raise ValueError("config ladder JSON must be a list or {'configs': [...]} object")
-        return [config_from_mapping(row) for row in rows]
+        return [config_from_mapping(row, max_ef_search) for row in rows]
     if path.suffix.lower() == ".csv":
-        return [config_from_mapping(row) for row in read_csv(path)]
+        return [config_from_mapping(row, max_ef_search) for row in read_csv(path)]
     raise ValueError("--config-ladder must be a .json or .csv file")
 
 
@@ -645,14 +736,33 @@ def default_query_count_bounds(
     }
 
 
-def build_hybrid_sql(table: str, predicate: str, k: int) -> str:
+def safe_predicate(value: str, name: str) -> str:
+    normalized = value.strip()
+    if any(marker in normalized.lower() for marker in (";", "--", "/*", "*/")):
+        raise ValueError(f"invalid {name}")
+    return normalized
+
+
+def build_hybrid_sql(
+    table: str,
+    predicate: str,
+    k: int,
+    candidate_validity_predicate: str = "",
+) -> str:
     validate_identifier(table)
-    if k <= 0 or any(marker in predicate.lower() for marker in (";", "--", "/*", "*/")):
+    predicate = safe_predicate(predicate, "hybrid predicate")
+    validity = safe_predicate(
+        candidate_validity_predicate, "candidate-validity predicate"
+    )
+    if k <= 0:
         raise ValueError("invalid hybrid SQL inputs")
+    combined = f"({predicate})"
+    if validity:
+        combined += f" AND ({validity})"
     sql = (
         f"SELECT id, embedding <-> %s::vector AS distance "
         f"FROM {table} "
-        f"WHERE ({predicate}) AND id <> %s "
+        f"WHERE {combined} AND id <> %s "
         f"ORDER BY embedding <-> %s::vector LIMIT {int(k)}"
     )
     lowered = sql.lower()
@@ -917,6 +1027,13 @@ def server_vector_binary_provenance(
 
 
 def validate_runtime_args(args: argparse.Namespace) -> None:
+    args.max_ef_search = getattr(args, "max_ef_search", UPSTREAM_MAX_EF_SEARCH)
+    args.upstream_evaluation_patch = getattr(
+        args, "upstream_evaluation_patch", None
+    )
+    args.candidate_validity_predicate = getattr(
+        args, "candidate_validity_predicate", ""
+    )
     if not args.server_container:
         raise ProvenanceGateError("formal runs require explicit --server-container")
     if not args.vector_source_tag or not args.vector_source_commit:
@@ -935,6 +1052,21 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
         raise ProvenanceGateError("formal target recalls must be exactly 0.90,0.95,0.99")
     if getattr(args, "formal_family", "") not in FORMAL_FAMILIES:
         raise ProvenanceGateError("formal family must be off or strict_order")
+    safe_predicate(
+        getattr(args, "candidate_validity_predicate", ""),
+        "candidate-validity predicate",
+    )
+    if getattr(args, "max_ef_search", 0) not in {
+        UPSTREAM_MAX_EF_SEARCH,
+        EVALUATION_MAX_EF_SEARCH,
+    }:
+        raise ProvenanceGateError(
+            "formal max_ef_search must be the release limit 1000 or audited evaluation limit 10000"
+        )
+    if args.max_ef_search > UPSTREAM_MAX_EF_SEARCH and args.config_ladder is None:
+        raise ProvenanceGateError(
+            "the evaluation ceiling requires an explicit, hashed config ladder"
+        )
     if getattr(args, "final_repeats", 0) <= 0 or args.final_repeats % 2:
         raise ProvenanceGateError("formal --final-repeats must be positive and even")
     if getattr(args, "execution_stage", "") == "final" and getattr(args, "final_block", None) not in {0, 1}:
@@ -969,9 +1101,24 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
             raise ProvenanceGateError(
                 "official formal mode requires --expected-vector-so-sha256"
             )
-        if args.expected_vector_so_sha256 != OFFICIAL_UPSTREAM_VECTOR_SO_SHA256:
+        ceiling = upstream_parameter_ceiling_provenance(
+            args.vector_source_repo,
+            args.upstream_evaluation_patch,
+            args.max_ef_search,
+        )
+        if (
+            args.max_ef_search == UPSTREAM_MAX_EF_SEARCH
+            and args.expected_vector_so_sha256 != OFFICIAL_UPSTREAM_VECTOR_SO_SHA256
+        ):
             raise ProvenanceGateError(
                 "official expected digest does not equal the pinned upstream vector.so digest"
+            )
+        if (
+            ceiling["patch_applied"] is True
+            and args.expected_vector_so_sha256 == OFFICIAL_UPSTREAM_VECTOR_SO_SHA256
+        ):
+            raise ProvenanceGateError(
+                "the evaluation ceiling patch must produce a distinct binary digest"
             )
 
 
@@ -1597,7 +1744,12 @@ def normalized_args(args: argparse.Namespace) -> dict[str, Any]:
 def source_hashes(args: argparse.Namespace, filters: Sequence[Mapping[str, str]]) -> dict[str, Any]:
     sql_hashes = {
         row["filter_name"]: hashlib.sha256(
-            build_hybrid_sql(args.table, row["predicate"], args.k).encode("utf-8")
+            build_hybrid_sql(
+                args.table,
+                row["predicate"],
+                args.k,
+                args.candidate_validity_predicate,
+            ).encode("utf-8")
         ).hexdigest()
         for row in filters
     }
@@ -1606,7 +1758,14 @@ def source_hashes(args: argparse.Namespace, filters: Sequence[Mapping[str, str]]
         "filters_sha256": sha256_file(args.filters_csv),
         "truth_sha256": sha256_file(args.truth_csv),
         "hybrid_sql_sha256_by_filter": sql_hashes,
+        "candidate_validity_predicate_sha256": hashlib.sha256(
+            args.candidate_validity_predicate.encode("utf-8")
+        ).hexdigest(),
     }
+    if args.upstream_evaluation_patch:
+        result["upstream_evaluation_patch_sha256"] = sha256_file(
+            args.upstream_evaluation_patch
+        )
     if args.config_ladder:
         result["config_ladder_sha256"] = sha256_file(args.config_ladder)
     else:
@@ -1908,7 +2067,12 @@ def run_stage_blocks(
         block = (phase, name)
         if not configs or block in completed:
             continue
-        sql = build_hybrid_sql(args.table, filter_spec["predicate"], args.k)
+        sql = build_hybrid_sql(
+            args.table,
+            filter_spec["predicate"],
+            args.k,
+            args.candidate_validity_predicate,
+        )
         block_rows: list[dict[str, Any]] = []
         # Re-enumerate at every atomic boundary so newly introduced extension
         # knobs cannot silently escape the stock allowlist.
@@ -2065,7 +2229,12 @@ def warmup_spec(
         "config": asdict(config) | {"label": config.label},
         "sql_sha256_by_filter": {
             row["filter_name"]: hashlib.sha256(
-                build_hybrid_sql(args.table, row["predicate"], args.k).encode("utf-8")
+                build_hybrid_sql(
+                    args.table,
+                    row["predicate"],
+                    args.k,
+                    args.candidate_validity_predicate,
+                ).encode("utf-8")
             ).hexdigest()
             for row in filters
         },
@@ -2086,7 +2255,12 @@ def deterministic_warmup(
     rows_fetched = 0
     for filter_spec in filters:
         configure_stock(cur, config)
-        sql = build_hybrid_sql(args.table, filter_spec["predicate"], args.k)
+        sql = build_hybrid_sql(
+            args.table,
+            filter_spec["predicate"],
+            args.k,
+            args.candidate_validity_predicate,
+        )
         for query_no in spec["query_nos"]:
             entry = truth[(filter_spec["filter_name"], int(query_no))]
             cur.execute(sql, (vectors[entry.query_id], entry.query_id, vectors[entry.query_id]))
@@ -2237,7 +2411,12 @@ def _legacy_monolithic_run(args: argparse.Namespace) -> dict[str, Path]:
                 raise RuntimeError("database query-vector mapping is incomplete")
             explain_audit: dict[str, Any] = {}
             for filter_spec in filters:
-                sql = build_hybrid_sql(args.table, filter_spec["predicate"], args.k)
+                sql = build_hybrid_sql(
+                    args.table,
+                    filter_spec["predicate"],
+                    args.k,
+                    args.candidate_validity_predicate,
+                )
                 explain_audit[filter_spec["filter_name"]] = explain_hybrid(
                     cur, sql, vectors[query_ids[0]], query_ids[0], args.index
                 )
@@ -2623,15 +2802,25 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
     split_contract = validate_split_contract()
     filters = load_filters(args.filters_csv, set(args.filter_names) or None)
     formal_design = validate_formal_design(filters, args.target_recalls, args.formal_family)
-    input_configs = load_config_ladder(args.config_ladder)
+    input_configs = load_config_ladder(args.config_ladder, args.max_ef_search)
     all_configs, dedup_proof = effective_config_grid(input_configs)
     configs = [config for config in all_configs if config.family == args.formal_family]
     if not configs:
         raise ValueError(f"config ladder has no configs for formal family {args.formal_family}")
+    if max(config.ef_search for config in configs) != args.max_ef_search:
+        raise ProvenanceGateError(
+            "formal config ladder does not exercise the declared max_ef_search ceiling"
+        )
 
     filter_names = {row["filter_name"] for row in filters}
     all_query_nos = SCREEN_QUERY_NOS + VERIFICATION_QUERY_NOS + FINAL_QUERY_NOS
-    truth = load_truth(args.truth_csv, all_query_nos, filter_names, args.k)
+    truth = load_truth(
+        args.truth_csv,
+        all_query_nos,
+        filter_names,
+        args.k,
+        args.candidate_validity_predicate,
+    )
     query_ids: dict[int, int] = {}
     for query_no in all_query_nos:
         ids = {truth[(name, query_no)].query_id for name in filter_names}
@@ -2646,6 +2835,19 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
     hashes = source_hashes(args, filters)
     dirty = source_tree_provenance(
         args.vector_source_repo, args.vector_source_commit
+    )
+    ceiling_provenance = (
+        upstream_parameter_ceiling_provenance(
+            args.vector_source_repo,
+            args.upstream_evaluation_patch,
+            args.max_ef_search,
+        )
+        if args.implementation == "official"
+        else {
+            "mode": "sqlens_disabled_binary_native_parameter_range",
+            "max_ef_search": args.max_ef_search,
+            "patch_applied": False,
+        }
     )
     selected_config_records = [
         asdict(config) | {"label": config.label} for config in configs
@@ -2679,6 +2881,8 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             {"filter_name": row["filter_name"], "predicate": row["predicate"]}
             for row in filters
         ],
+        "candidate_validity_predicate": args.candidate_validity_predicate,
+        "parameter_ceiling_provenance": ceiling_provenance,
         "query_ids": query_ids,
         "query_splits": split_contract,
         "schedule_contract": schedule_contract,
@@ -2702,6 +2906,7 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         "source_tree": dirty["source_tree"],
         "git_revision": git_revision(),
         "server_image_id": binary["server_image_id"],
+        "parameter_ceiling_provenance": ceiling_provenance,
     }
 
     try:
@@ -2848,7 +3053,12 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                 raise RuntimeError("database query-vector mapping is incomplete")
             explain_audit: dict[str, Any] = {}
             for filter_spec in filters:
-                sql = build_hybrid_sql(args.table, filter_spec["predicate"], args.k)
+                sql = build_hybrid_sql(
+                    args.table,
+                    filter_spec["predicate"],
+                    args.k,
+                    args.candidate_validity_predicate,
+                )
                 explain_audit[filter_spec["filter_name"]] = explain_hybrid(
                     cur, sql, vectors[query_ids[0]], query_ids[0], args.index
                 )
@@ -3309,6 +3519,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--filters-csv", type=Path, default=DEFAULT_FILTERS)
     parser.add_argument("--truth-csv", type=Path, default=DEFAULT_TRUTH)
     parser.add_argument("--config-ladder", type=Path)
+    parser.add_argument(
+        "--max-ef-search",
+        type=positive_int,
+        default=UPSTREAM_MAX_EF_SEARCH,
+        help="Provenance-gated binary ceiling; formal values are 1000 or 10000.",
+    )
+    parser.add_argument(
+        "--upstream-evaluation-patch",
+        type=Path,
+        help="Canonical two-line upstream patch required for official max_ef_search=10000.",
+    )
+    parser.add_argument(
+        "--candidate-validity-predicate",
+        default="",
+        help="Global SQL predicate implied by the partial HNSW index and exact truth.",
+    )
     parser.add_argument("--table", type=validate_identifier, default=DEFAULT_TABLE)
     parser.add_argument("--index", type=validate_identifier, default=DEFAULT_INDEX)
     parser.add_argument("--source-index", type=validate_identifier, default=DEFAULT_INDEX)
@@ -3382,6 +3608,13 @@ def dry_run_payload(args: argparse.Namespace) -> dict[str, Any]:
         "warmup_queries_per_filter_per_invocation": args.warmup_queries,
         "resume": args.resume,
         "config_ladder": str(args.config_ladder) if args.config_ladder else "deterministic_default",
+        "declared_max_ef_search": args.max_ef_search,
+        "upstream_evaluation_patch": (
+            str(args.upstream_evaluation_patch)
+            if args.upstream_evaluation_patch
+            else None
+        ),
+        "candidate_validity_predicate": args.candidate_validity_predicate,
         "default_effective_config_count": len(default_configs),
         "formal_family_effective_config_count": len(formal_configs),
         "default_dropped_equivalent_configs": proof["dropped_equivalent_configs"],

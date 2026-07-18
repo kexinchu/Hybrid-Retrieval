@@ -6,7 +6,9 @@ import hashlib
 import json
 import math
 import random
+import re
 import statistics
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -54,7 +56,7 @@ MODE_CONFIG_FIELDS = (
 )
 ITERATIVE_SCAN_VALUES = {"off", "strict_order", "relaxed_order"}
 SQLENS_V11_BUILD_PREFIX = "sqlens-v11-"
-SQLENS_MIN_PROFILE_SEMANTICS = 4.0
+SQLENS_MIN_PROFILE_SEMANTICS = 6.0
 SQLENS_PROFILE_FIELDS = (
     "graph_elements_visited",
     "raw_index_tids_returned",
@@ -66,6 +68,9 @@ SQLENS_TRAVERSAL_PROFILE_FIELDS = (
     "planner_proof_attempted",
     "planner_proof_succeeded",
     "planner_proof_bypass_reason",
+    "traversal_guidance_scope",
+    "graph_expansion_pruned",
+    "distance_computations_pruned",
     "pre_distance_membership_checks",
     "pre_distance_membership_matches",
     "pre_distance_membership_misses",
@@ -74,6 +79,9 @@ SQLENS_TRAVERSAL_PROFILE_FIELDS = (
     "neighbor_expansion_guidance_checks",
     "neighbor_expansion_guidance_matches",
     "neighbor_expansion_guidance_misses",
+    "traversal_guided_admissions",
+    "traversal_guided_suppressions",
+    "traversal_heap_tids_suppressed",
     "guided_expanded_nodes",
     "guided_phase_distance_computations",
     "stock_phase_expanded_nodes",
@@ -144,6 +152,88 @@ def parse_bool(value: object) -> bool:
     if text in {"0", "false", "no"}:
         return False
     raise ValueError(f"invalid boolean value: {value!r}")
+
+
+def validate_candidate_validity_predicate(value: str) -> str:
+    """Accept one SQL expression, not a statement or comment-bearing fragment."""
+    predicate = str(value or "").strip()
+    forbidden = (";", "--", "/*", "*/", "\x00")
+    token = next((token for token in forbidden if token in predicate), None)
+    if token is not None:
+        raise argparse.ArgumentTypeError(
+            "candidate validity predicate must be a single comment-free SQL expression; "
+            f"found forbidden token {token!r}"
+        )
+    return predicate
+
+
+def effective_candidate_validity_predicate(value: object = "") -> str:
+    predicate = validate_candidate_validity_predicate(str(value or ""))
+    return predicate or "TRUE"
+
+
+def candidate_validity_sha256(value: object = "") -> str:
+    return hashlib.sha256(
+        effective_candidate_validity_predicate(value).encode("utf-8")
+    ).hexdigest()
+
+
+def normalized_sql_predicate(value: object = "") -> str:
+    """Normalize catalog-rendered SQL enough for a fail-closed predicate bind."""
+    text = re.sub(r"\s+", " ", str(value or "").strip()).lower()
+    while text.startswith("(") and text.endswith(")"):
+        depth = 0
+        balanced = True
+        for position, char in enumerate(text):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth < 0 or (depth == 0 and position != len(text) - 1):
+                    balanced = False
+                    break
+        if balanced and depth == 0:
+            text = text[1:-1].strip()
+        else:
+            break
+    return text
+
+
+def candidate_validity_index_predicate_matches(
+    catalog_predicate: object,
+    candidate_validity_predicate: object = "",
+) -> bool:
+    """Bind TRUE to a full index and every other value to its exact partial qual."""
+    expected = normalized_sql_predicate(
+        effective_candidate_validity_predicate(candidate_validity_predicate)
+    )
+    observed = normalized_sql_predicate(catalog_predicate)
+    if expected == "true":
+        return not observed
+    return bool(observed) and observed == expected
+
+
+def validate_guidance_atoms(
+    atoms: list[str],
+    candidate_validity_predicate: object = "",
+) -> list[str]:
+    """Reject global candidate validity quals from the D1 atom channel."""
+    validity = normalized_sql_predicate(
+        effective_candidate_validity_predicate(candidate_validity_predicate)
+    )
+    if not validity:
+        return atoms
+    pattern = re.compile(
+        r"(?<![a-z0-9_$])" + re.escape(validity) + r"(?![a-z0-9_$])",
+        re.IGNORECASE,
+    )
+    invalid = [atom for atom in atoms if pattern.search(normalized_sql_predicate(atom))]
+    if invalid:
+        raise ValueError(
+            "D1 guidance atoms must not contain the global candidate validity predicate; "
+            f"invalid atoms={invalid!r}, predicate={validity!r}"
+        )
+    return atoms
 
 
 def _cpu_set(value: str) -> set[int]:
@@ -238,6 +328,7 @@ def load_tie_aware_truth(
     path: Path,
     method: str = "pre_filter_exact",
     expected_self_excluded: bool = True,
+    expected_candidate_validity_predicate: str | None = None,
 ) -> tuple[dict[tuple[str, int], TruthEntry], dict[int, int]]:
     truth: dict[tuple[str, int], TruthEntry] = {}
     query_by_no: dict[int, int] = {}
@@ -252,6 +343,14 @@ def load_tie_aware_truth(
         missing = required - set(reader.fieldnames or ())
         if missing:
             raise ValueError(f"truth CSV is missing tie-aware fields: {sorted(missing)}")
+        if (
+            expected_candidate_validity_predicate is not None
+            and "candidate_validity_predicate" not in set(reader.fieldnames or ())
+        ):
+            raise ValueError(
+                "truth CSV is missing candidate_validity_predicate required by the "
+                "explicit candidate-validity contract"
+            )
         for row in reader:
             if row.get("method") != method:
                 continue
@@ -266,6 +365,18 @@ def load_tie_aware_truth(
                     f"truth row {(row['filter_name'], query_no)} self_excluded="
                     f"{self_excluded!r} does not match expected {expected_self_excluded!r}"
                 )
+            if expected_candidate_validity_predicate is not None:
+                expected_validity = effective_candidate_validity_predicate(
+                    expected_candidate_validity_predicate
+                )
+                observed_validity = effective_candidate_validity_predicate(
+                    row.get("candidate_validity_predicate", "")
+                )
+                if observed_validity != expected_validity:
+                    raise ValueError(
+                        f"truth row {(row['filter_name'], query_no)} candidate_validity_predicate="
+                        f"{observed_validity!r} does not match expected {expected_validity!r}"
+                    )
             filtered_rows = int(row["filtered_rows"])
             kth_distance_sq = (
                 float(row["kth_distance_sq"]) if row["kth_distance_sq"].strip() else None
@@ -1009,6 +1120,7 @@ def search_query_sql(
     bind_guidance: bool = False,
     client_self_exclusion: bool = False,
     *,
+    candidate_validity_predicate: str = "",
     query_table: str | None = None,
     query_id_column: str = "id",
     query_vector_column: str = "embedding",
@@ -1022,6 +1134,9 @@ def search_query_sql(
     source_table = query_table or table
     query_id = quoted_column(query_id_column)
     query_vector = quoted_column(query_vector_column)
+    validity_predicate = effective_candidate_validity_predicate(
+        candidate_validity_predicate
+    )
     self_qual = "" if client_self_exclusion or not self_exclusion else " AND id <> %s"
     scan_limit = int(k) + 1 if client_self_exclusion else int(k)
     return f"""
@@ -1032,7 +1147,7 @@ def search_query_sql(
                    WHERE q.{query_id} = %s
                ) AS distance
         FROM {table}
-        WHERE {binding}({predicate}){self_qual}
+        WHERE {binding}({predicate}) AND ({validity_predicate}){self_qual}
         ORDER BY distance
         LIMIT {scan_limit}
     """
@@ -1066,6 +1181,7 @@ def explain_hnsw_plan(
     binding: tuple[str, list[str], str] | None = None,
     client_self_exclusion: bool = False,
     *,
+    candidate_validity_predicate: str = "",
     query_table: str | None = None,
     query_id_column: str = "id",
     query_vector_column: str = "embedding",
@@ -1074,6 +1190,7 @@ def explain_hnsw_plan(
     cur.execute(
         "SELECT idx.oid::bigint, idx.relname, idx_ns.nspname, am.amname, "
         "tbl.oid::bigint, tbl.relname, tbl_ns.nspname "
+        ", pg_get_expr(ix.indpred, ix.indrelid) "
         "FROM pg_class idx "
         "JOIN pg_namespace idx_ns ON idx_ns.oid = idx.relnamespace "
         "JOIN pg_am am ON am.oid = idx.relam "
@@ -1093,13 +1210,25 @@ def explain_hnsw_plan(
             "observed_index_nodes": [],
         }
 
-    index_oid, index_name, index_schema, access_method, table_oid, table_name, table_schema = metadata
+    if len(metadata) < 8:
+        raise RuntimeError("index catalog metadata is missing pg_index.indpred")
+    (
+        index_oid,
+        index_name,
+        index_schema,
+        access_method,
+        table_oid,
+        table_name,
+        table_schema,
+        catalog_predicate,
+    ) = metadata
     sql = search_query_sql(
         table,
         predicate,
         k,
         binding is not None,
         client_self_exclusion,
+        candidate_validity_predicate=candidate_validity_predicate,
         query_table=query_table,
         query_id_column=query_id_column,
         query_vector_column=query_vector_column,
@@ -1123,13 +1252,43 @@ def explain_hnsw_plan(
         and node.get("Relation Name") == table_name
         and node.get("Schema") == table_schema
     ]
-    passed = access_method == "hnsw" and bool(matched)
+    expected_predicate = effective_candidate_validity_predicate(
+        candidate_validity_predicate
+    )
+    expected_is_partial = not candidate_validity_index_predicate_matches(
+        None, expected_predicate
+    )
+    predicate_matches = candidate_validity_index_predicate_matches(
+        catalog_predicate, expected_predicate
+    )
+    passed = access_method == "hnsw" and bool(matched) and predicate_matches
+    if access_method != "hnsw" or not matched:
+        failure = "EXPLAIN did not use the expected HNSW index"
+    elif not predicate_matches:
+        failure = (
+            "expected index pg_index.indpred does not match candidate validity predicate: "
+            f"catalog={catalog_predicate!r}, expected={expected_predicate!r}"
+        )
+    else:
+        failure = ""
     return {
         "passed": passed,
         "expected_index": expected_index,
         "expected_index_oid": index_oid,
         "expected_index_identity": f"{index_schema}.{index_name}",
         "expected_index_access_method": access_method,
+        "expected_index_predicate": expected_predicate,
+        "expected_index_predicate_sha256": candidate_validity_sha256(expected_predicate),
+        "expected_index_is_partial": expected_is_partial,
+        "catalog_index_oid": index_oid,
+        "catalog_index_predicate": catalog_predicate,
+        "catalog_index_predicate_sha256": (
+            candidate_validity_sha256(catalog_predicate)
+            if catalog_predicate is not None
+            else candidate_validity_sha256("TRUE")
+        ),
+        "catalog_index_is_partial": catalog_predicate is not None,
+        "catalog_index_predicate_matches": predicate_matches,
         "expected_table": table,
         "expected_table_oid": table_oid,
         "expected_table_identity": f"{table_schema}.{table_name}",
@@ -1145,11 +1304,17 @@ def explain_hnsw_plan(
         ),
         "scan_limit": int(k) + 1 if client_self_exclusion else int(k),
         "residual_self_qual_present": self_exclusion and not client_self_exclusion,
+        "candidate_validity_predicate": effective_candidate_validity_predicate(
+            candidate_validity_predicate
+        ),
+        "candidate_validity_predicate_sha256": candidate_validity_sha256(
+            candidate_validity_predicate
+        ),
         "statement_binding_present": binding is not None,
         "observed_index_nodes": observed,
         "matched_index_nodes": matched,
         "plan": explain_value,
-        "failure": "" if passed else "EXPLAIN did not use the expected HNSW index",
+        "failure": failure,
     }
 
 
@@ -1191,10 +1356,22 @@ def write_plan_evidence(
             "query_id_column": args.query_id_column,
             "query_vector_column": args.query_vector_column,
             "self_excluded": args.expected_truth_self_excluded,
+            "candidate_validity_predicate": effective_candidate_validity_predicate(
+                getattr(args, "candidate_validity_predicate", "")
+            ),
+            "candidate_validity_predicate_explicit": bool(
+                getattr(args, "candidate_validity_predicate_explicit", False)
+            ),
+            "candidate_validity_predicate_sha256": candidate_validity_sha256(
+                getattr(args, "candidate_validity_predicate", "")
+            ),
+            "candidate_validity_contract": (
+                "planner_partial_index_predicate_and_sql_candidate_qual_not_guidance_atom"
+            ),
             "predicate_contract": (
-                "exact_activated_predicate_no_residual_scan_qual"
+                "exact_activated_workload_predicate_plus_candidate_validity_sql_qual"
                 if uses_exact_predicate_scan_contract(args.guidance_filter_strategy)
-                else "diagnostic_sql_self_exclusion_residual"
+                else "diagnostic_workload_plus_candidate_validity_sql_quals"
             ),
             "self_exclusion": (
                 "limit_k_plus_1_client_remove_query_id"
@@ -1294,13 +1471,20 @@ def activate(
     if not enabled:
         cur.execute("SET hnsw.filter_strategy = off")
         return {"table": table, "index": index, "guidance_enabled": False, "guidance_route": route}
+    atoms = args.filter_atoms[filter_name]
+    validate_guidance_atoms(
+        atoms, getattr(args, "candidate_validity_predicate", "")
+    )
     cur.execute(f"SET hnsw.filter_strategy = {args.guidance_filter_strategy}")
     if args.reset_cache_per_query and mode in {"design1_bloom", "design1_bloom_bfs_layout"}:
         cur.execute("SELECT vector_hnsw_metadata_cache_reset()")
     kind = "adaptive" if mode == "design1_bloom_bfs_layout_d3" else "bloom"
+    # These atoms are only the workload predicate from filters CSV. A broad
+    # partial-index predicate (for example embedding_valid) is enforced by the
+    # planner/index and SQL candidate qual, and must never become D1 guidance.
     cur.execute(
         "SELECT vector_hnsw_guidance_activate(%s::regclass, %s::text[], %s)",
-        (index, args.filter_atoms[filter_name], kind),
+        (index, atoms, kind),
     )
     activation_row = cur.fetchone()
     activated_atoms = int(activation_row[0]) if activation_row and activation_row[0] is not None else 0
@@ -1340,6 +1524,7 @@ def run_query(
     binding: tuple[str, list[str], str] | None = None,
     client_self_exclusion: bool = False,
     *,
+    candidate_validity_predicate: str = "",
     query_table: str | None = None,
     query_id_column: str = "id",
     query_vector_column: str = "embedding",
@@ -1361,6 +1546,7 @@ def run_query(
             k,
             binding is not None,
             client_self_exclusion,
+            candidate_validity_predicate=candidate_validity_predicate,
             query_table=query_table,
             query_id_column=query_id_column,
             query_vector_column=query_vector_column,
@@ -1418,6 +1604,9 @@ def gate_runtime_plans(
                     args.k,
                     binding,
                     client_self_exclusion,
+                    candidate_validity_predicate=getattr(
+                        args, "candidate_validity_predicate", ""
+                    ),
                     query_table=query_table,
                     query_id_column=getattr(args, "query_id_column", "id"),
                     query_vector_column=getattr(args, "query_vector_column", "embedding"),
@@ -1433,6 +1622,12 @@ def gate_runtime_plans(
                     "query_id": query_id,
                     "query_table": query_table,
                     "self_excluded": self_exclusion,
+                    "candidate_validity_predicate": effective_candidate_validity_predicate(
+                        getattr(args, "candidate_validity_predicate", "")
+                    ),
+                    "candidate_validity_predicate_sha256": candidate_validity_sha256(
+                        getattr(args, "candidate_validity_predicate", "")
+                    ),
                     "failure": f"{exc.__class__.__name__}: {exc}",
                 }
                 args.plan_evidence.append(evidence)
@@ -1456,6 +1651,12 @@ def gate_runtime_plans(
                     "preferred_index_current_setting": runtime.preferred_index_current_setting,
                     "backend_cpu_provenance": runtime.backend_cpu_provenance,
                     "sqlens_runtime_identity": runtime.sqlens_runtime_identity,
+                    "candidate_validity_predicate": effective_candidate_validity_predicate(
+                        getattr(args, "candidate_validity_predicate", "")
+                    ),
+                    "candidate_validity_predicate_sha256": candidate_validity_sha256(
+                        getattr(args, "candidate_validity_predicate", "")
+                    ),
                 }
             )
             args.plan_evidence.append(evidence)
@@ -1593,6 +1794,9 @@ def run_warmup(
             args.k,
             binding,
             uses_exact_predicate_scan_contract(args.guidance_filter_strategy) and self_exclusion,
+            candidate_validity_predicate=getattr(
+                args, "candidate_validity_predicate", ""
+            ),
             query_table=query_table_for_candidate(args, candidate_table),
             query_id_column=getattr(args, "query_id_column", "id"),
             query_vector_column=getattr(args, "query_vector_column", "embedding"),
@@ -1651,11 +1855,15 @@ def guidance_scan_contract_failure(
         ):
             if int(scan_profile.get(field, 0) or 0) != 0:
                 return f"guided final path contains stock work ({field}={scan_profile.get(field)})"
-        checks = int(scan_profile.get("pre_distance_membership_checks", 0) or 0)
-        matches = int(scan_profile.get("pre_distance_membership_matches", 0) or 0)
-        misses = int(scan_profile.get("pre_distance_membership_misses", 0) or 0)
+        pre_distance_checks = int(scan_profile.get("pre_distance_membership_checks", 0) or 0)
+        attempted_avoided = int(scan_profile.get("distance_computations_avoided_attempted", 0) or 0)
         avoided = int(scan_profile.get("distance_computations_avoided", 0) or 0)
         neighbor_checks = int(scan_profile.get("neighbor_expansion_guidance_checks", 0) or 0)
+        neighbor_matches = int(scan_profile.get("neighbor_expansion_guidance_matches", 0) or 0)
+        neighbor_misses = int(scan_profile.get("neighbor_expansion_guidance_misses", 0) or 0)
+        guided_admissions = int(scan_profile.get("traversal_guided_admissions", 0) or 0)
+        guided_suppressions = int(scan_profile.get("traversal_guided_suppressions", 0) or 0)
+        heap_tids_suppressed = int(scan_profile.get("traversal_heap_tids_suppressed", 0) or 0)
         expanded = int(scan_profile.get("guided_expanded_nodes", 0) or 0)
         distance_calls = int(scan_profile.get("guided_phase_distance_computations", 0) or 0)
         total_distance_calls = int(scan_profile.get("distance_compute_count", 0) or 0)
@@ -1668,12 +1876,20 @@ def guidance_scan_contract_failure(
             return "traversal skip-rate estimate was not valid for formal admission"
         if not math.isfinite(estimated_skip_rate) or not 0.0 <= estimated_skip_rate <= 1.0:
             return "traversal skip-rate estimate is outside [0, 1]"
-        if checks <= 0 or checks != matches + misses:
-            return "invalid or empty pre-distance membership accounting"
-        if neighbor_checks < checks:
-            return "neighbor-expansion guidance accounting is smaller than pre-distance checks"
-        if avoided != misses:
-            return "successful guided path did not preserve pre-distance skip accounting"
+        if scan_profile.get("traversal_guidance_scope") != "candidate_admission_and_validation":
+            return "traversal guidance scope is not candidate admission/validation"
+        if scan_profile.get("graph_expansion_pruned") is not False:
+            return "formal candidate admission must not claim graph-expansion pruning"
+        if scan_profile.get("distance_computations_pruned") is not False:
+            return "formal candidate admission must not claim distance pruning"
+        if pre_distance_checks != 0 or attempted_avoided != 0 or avoided != 0:
+            return "candidate admission unexpectedly recorded pre-distance pruning"
+        if neighbor_checks <= 0 or neighbor_checks != neighbor_matches + neighbor_misses:
+            return "invalid or empty neighbor-expansion membership accounting"
+        if guided_admissions <= 0 or guided_suppressions <= 0:
+            return "candidate admission recorded no guided admissions or suppressions"
+        if heap_tids_suppressed < guided_suppressions:
+            return "heap-TID suppression count is smaller than suppressed HNSW elements"
         if expanded <= 0 or distance_calls <= 0:
             return "guided path recorded no expansions or no distance calls"
         if total_expanded < expanded or total_distance_calls < distance_calls:
@@ -1848,6 +2064,9 @@ def run_measured_query(
             args.k,
             binding,
             client_self_exclusion,
+            candidate_validity_predicate=getattr(
+                args, "candidate_validity_predicate", ""
+            ),
             query_table=query_table,
             query_id_column=getattr(args, "query_id_column", "id"),
             query_vector_column=getattr(args, "query_vector_column", "embedding"),
@@ -1918,6 +2137,12 @@ def run_measured_query(
         "query_table": query_table,
         "query_id_column": getattr(args, "query_id_column", "id"),
         "query_vector_column": getattr(args, "query_vector_column", "embedding"),
+        "candidate_validity_predicate": effective_candidate_validity_predicate(
+            getattr(args, "candidate_validity_predicate", "")
+        ),
+        "candidate_validity_predicate_sha256": candidate_validity_sha256(
+            getattr(args, "candidate_validity_predicate", "")
+        ),
         "d2_page_access": args.d2_page_access if mode_uses_d2(mode) else "off",
         "d2_index_page_access": args.d2_index_page_access if mode_uses_d2(mode) else "off",
         "preferred_index_guc": getattr(args, "preferred_index_guc", "hnsw.preferred_index"),
@@ -1966,6 +2191,12 @@ def run_measured_query(
         "truth_strict_closer_count": truth_entry.strict_closer_count,
         "truth_boundary_tied": truth_entry.boundary_tied,
         "truth_self_excluded": truth_entry.self_excluded,
+        "truth_candidate_validity_predicate": effective_candidate_validity_predicate(
+            getattr(args, "candidate_validity_predicate", "")
+        ),
+        "truth_candidate_validity_predicate_sha256": candidate_validity_sha256(
+            getattr(args, "candidate_validity_predicate", "")
+        ),
         "activation_ms": activation_ms,
         "query_latency_ms": query_ms,
         "end_to_end_ms": end_to_end_ms,
@@ -2042,6 +2273,9 @@ def run_measured_query(
         "fallback_stock_distance_computations": scan_profile.get("fallback_stock_distance_computations", 0),
         "traversal_estimated_skip_rate_valid": scan_profile.get("traversal_estimated_skip_rate_valid", False),
         "traversal_estimated_skip_rate": scan_profile.get("traversal_estimated_skip_rate", 0.0),
+        "traversal_guidance_scope": scan_profile.get("traversal_guidance_scope", ""),
+        "graph_expansion_pruned": scan_profile.get("graph_expansion_pruned", False),
+        "distance_computations_pruned": scan_profile.get("distance_computations_pruned", False),
         "final_path": scan_profile.get("final_path", ""),
         "planner_proof_attempted": scan_profile.get("planner_proof_attempted", False),
         "planner_proof_succeeded": scan_profile.get("planner_proof_succeeded", False),
@@ -2459,6 +2693,15 @@ def main() -> None:
     parser.add_argument("--query-id-column", default="id")
     parser.add_argument("--query-vector-column", default="embedding")
     parser.add_argument(
+        "--candidate-validity-predicate",
+        type=validate_candidate_validity_predicate,
+        default="",
+        help=(
+            "Global candidate validity expression implied by a partial HNSW index, such as "
+            "embedding_valid. It is a SQL/planner qual and is never added to guidance atoms."
+        ),
+    )
+    parser.add_argument(
         "--expected-truth-self-excluded",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -2565,6 +2808,12 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    args.candidate_validity_predicate_explicit = (
+        "--candidate-validity-predicate" in sys.argv
+    )
+    args.candidate_validity_predicate = effective_candidate_validity_predicate(
+        args.candidate_validity_predicate
+    )
     args.plan_started_at = utc_now()
     args.plan_evidence_out = args.out.with_suffix(args.out.suffix + ".plan.json")
     args.plan_evidence = []
@@ -2604,6 +2853,11 @@ def main() -> None:
         truth, query_by_no = load_tie_aware_truth(
             args.truth_csv,
             expected_self_excluded=args.expected_truth_self_excluded,
+            expected_candidate_validity_predicate=(
+                args.candidate_validity_predicate
+                if args.candidate_validity_predicate_explicit
+                else None
+            ),
         )
         query_nos = sorted(query_by_no)[args.query_offset : args.query_offset + args.queries]
         if len(query_nos) != args.queries:

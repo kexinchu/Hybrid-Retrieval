@@ -18,7 +18,7 @@ class SqlensVariantBindingTests(unittest.TestCase):
     def _gate_cursor(build_id="sqlens-v11-test", profile=None):
         cursor = mock.MagicMock()
         profile = profile or {
-            "profile_semantics_version": 4,
+            "profile_semantics_version": 6,
             "graph_elements_visited": 1,
             "raw_index_tids_returned": 1,
             "hnsw_am_callback_ms": 0.1,
@@ -33,7 +33,7 @@ class SqlensVariantBindingTests(unittest.TestCase):
             with self.subTest(runner=runner.__name__):
                 build_id, profile = runner.require_sqlens_provenance(self._gate_cursor())
                 self.assertTrue(build_id.startswith("sqlens-v11-"))
-                self.assertEqual(profile["profile_semantics_version"], 4)
+                self.assertEqual(profile["profile_semantics_version"], 6)
 
     def test_sqlens_v11_gate_rejects_old_build(self):
         for runner in (yfcc, laion):
@@ -50,7 +50,7 @@ class SqlensVariantBindingTests(unittest.TestCase):
 
     def test_sqlens_v9_gate_rejects_missing_profile_fields(self):
         profile = {
-            "profile_semantics_version": 4,
+            "profile_semantics_version": 6,
             "graph_elements_visited": 1,
             "raw_index_tids_returned": 1,
             "hnsw_am_callback_ms": 0.1,
@@ -70,6 +70,42 @@ class SqlensVariantBindingTests(unittest.TestCase):
                         "guided_collect",
                     )
                 )
+
+    def test_traversal_guided_requires_candidate_admission_contract(self):
+        valid = {
+            "guidance_checks": 10,
+            "final_path": "guided",
+            "planner_proof_succeeded": True,
+            "traversal_guidance_scope": "candidate_admission_and_validation",
+            "graph_expansion_pruned": False,
+            "distance_computations_pruned": False,
+            "pre_distance_membership_checks": 0,
+            "distance_computations_avoided": 0,
+            "neighbor_expansion_guidance_checks": 10,
+            "traversal_guided_admissions": 4,
+            "traversal_guided_suppressions": 6,
+            "stock_bypass_requests": 0,
+            "fallback_requests": 0,
+        }
+        for runner in (yfcc, laion):
+            with self.subTest(runner=runner.__name__):
+                self.assertTrue(
+                    runner.guidance_scan_contract_satisfied(valid, "traversal_guided")
+                )
+                for key, bad_value in (
+                    ("graph_expansion_pruned", True),
+                    ("distance_computations_avoided", 1),
+                    ("traversal_guided_suppressions", 0),
+                    ("fallback_requests", 1),
+                ):
+                    invalid = dict(valid)
+                    invalid[key] = bad_value
+                    self.assertFalse(
+                        runner.guidance_scan_contract_satisfied(
+                            invalid, "traversal_guided"
+                        ),
+                        key,
+                    )
                 self.assertTrue(
                     runner.guidance_scan_contract_satisfied(
                         {"guidance_checks": 2, "traversal_guidance_checks": 7},
@@ -220,6 +256,7 @@ class SqlensVariantBindingTests(unittest.TestCase):
             "statement_timeout_ms": 1000,
             "ef_search": 100,
             "iterative_scan": "strict_order",
+            "guidance_iterative_scan": "off",
             "max_scan_tuples": 1000,
             "scan_mem_multiplier": 1.0,
             "guided_collect_target": 10,

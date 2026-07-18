@@ -53,7 +53,7 @@ BEGIN
     IF (profile->>'guidance_checks')::bigint <> 0 THEN
         RAISE EXCEPTION 'unbound guidance affected a scan: %', profile;
     END IF;
-    IF (profile->>'profile_semantics_version')::int <> 4 OR
+    IF (profile->>'profile_semantics_version')::int <> 6 OR
        NOT (profile->>'planner_proof_attempted')::boolean OR
        (profile->>'planner_proof_succeeded')::boolean OR
        profile->>'planner_proof_bypass_reason' <> 'no_statement_binding' THEN

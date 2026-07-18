@@ -59,7 +59,7 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
     @staticmethod
     def _sqlens_profile() -> dict[str, object]:
         profile = {
-            "profile_semantics_version": 4,
+            "profile_semantics_version": 6,
             "graph_elements_visited": 11,
             "raw_index_tids_returned": 7,
             "hnsw_am_callback_ms": 1.25,
@@ -89,14 +89,20 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
             "planner_proof_attempted": True,
             "planner_proof_succeeded": True,
             "planner_proof_bypass_reason": "none",
-            "pre_distance_membership_checks": 5,
-            "pre_distance_membership_matches": 3,
-            "pre_distance_membership_misses": 2,
-            "distance_computations_avoided_attempted": 2,
-            "distance_computations_avoided": 2,
+            "traversal_guidance_scope": "candidate_admission_and_validation",
+            "graph_expansion_pruned": False,
+            "distance_computations_pruned": False,
+            "pre_distance_membership_checks": 0,
+            "pre_distance_membership_matches": 0,
+            "pre_distance_membership_misses": 0,
+            "distance_computations_avoided_attempted": 0,
+            "distance_computations_avoided": 0,
             "neighbor_expansion_guidance_checks": 5,
             "neighbor_expansion_guidance_matches": 3,
             "neighbor_expansion_guidance_misses": 2,
+            "traversal_guided_admissions": 3,
+            "traversal_guided_suppressions": 2,
+            "traversal_heap_tids_suppressed": 2,
             "guided_expanded_nodes": 4,
             "guided_phase_distance_computations": 8,
             "stock_phase_expanded_nodes": 0,
@@ -121,7 +127,7 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
         build_id, profile = benchmark.require_sqlens_provenance(cursor)
 
         self.assertEqual(build_id, "sqlens-v11-amazon-build")
-        self.assertEqual(profile["profile_semantics_version"], 4)
+        self.assertEqual(profile["profile_semantics_version"], 6)
         self.assertEqual(
             [call.args[0] for call in cursor.execute.call_args_list],
             [
@@ -363,6 +369,119 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
         self.assertTrue(truth[("f", 2)].boundary_tied)
         self.assertTrue(truth[("f", 2)].self_excluded)
 
+    def test_truth_loader_fail_closes_on_explicit_candidate_validity_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "truth.csv"
+            path.write_text(
+                "method,filter_name,query_no,query_id,filtered_rows,kth_distance_sq,"
+                "tie_tolerance,self_excluded,candidate_validity_predicate\n"
+                "pre_filter_exact,f,2,99,12,0.5625,1e-12,true,embedding_valid\n",
+                encoding="utf-8",
+            )
+
+            truth, _ = benchmark.load_tie_aware_truth(
+                path,
+                expected_candidate_validity_predicate="embedding_valid",
+            )
+            self.assertIn(("f", 2), truth)
+            with self.assertRaisesRegex(ValueError, "does not match expected"):
+                benchmark.load_tie_aware_truth(
+                    path,
+                    expected_candidate_validity_predicate="embedding_valid AND public",
+                )
+
+            missing = Path(tmpdir) / "missing.csv"
+            missing.write_text(
+                "method,filter_name,query_no,query_id,filtered_rows,kth_distance_sq,"
+                "tie_tolerance,self_excluded\n"
+                "pre_filter_exact,f,2,99,12,0.5625,1e-12,true\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "missing candidate_validity_predicate"):
+                benchmark.load_tie_aware_truth(
+                    missing,
+                    expected_candidate_validity_predicate="embedding_valid",
+                )
+
+            # An omitted CLI remains backward compatible with existing exact-truth files.
+            legacy_truth, _ = benchmark.load_tie_aware_truth(missing)
+            self.assertIn(("f", 2), legacy_truth)
+
+    def test_candidate_validity_predicate_rejects_statement_and_comment_tokens(self):
+        self.assertEqual(
+            benchmark.effective_candidate_validity_predicate(""),
+            "TRUE",
+        )
+        self.assertEqual(
+            benchmark.validate_candidate_validity_predicate(" embedding_valid "),
+            "embedding_valid",
+        )
+        for predicate in (
+            "embedding_valid; DROP TABLE items",
+            "embedding_valid -- bypass",
+            "embedding_valid /* bypass */",
+            "embedding_valid\x00",
+        ):
+            with self.subTest(predicate=predicate), self.assertRaises(
+                argparse.ArgumentTypeError
+            ):
+                benchmark.validate_candidate_validity_predicate(predicate)
+
+    def test_candidate_validity_binds_full_and_partial_indexes(self):
+        self.assertTrue(
+            benchmark.candidate_validity_index_predicate_matches(None, "TRUE")
+        )
+        self.assertFalse(
+            benchmark.candidate_validity_index_predicate_matches(
+                "embedding_valid", "TRUE"
+            )
+        )
+        self.assertTrue(
+            benchmark.candidate_validity_index_predicate_matches(
+                "(embedding_valid)", "embedding_valid"
+            )
+        )
+        self.assertFalse(
+            benchmark.candidate_validity_index_predicate_matches(
+                "embedding_valid IS TRUE", "embedding_valid"
+            )
+        )
+
+    def test_d1_atoms_reject_global_candidate_validity_predicate(self):
+        for atoms in (
+            ["embedding_valid"],
+            ["rating = 5 AND embedding_valid"],
+            ["(embedding_valid)"],
+        ):
+            with self.assertRaisesRegex(ValueError, "must not contain"):
+                benchmark.validate_guidance_atoms(atoms, "embedding_valid")
+        self.assertEqual(
+            benchmark.validate_guidance_atoms(["rating = 5"], "embedding_valid"),
+            ["rating = 5"],
+        )
+
+    def test_activate_enforces_d1_atom_contract_before_activation(self):
+        cursor = SimpleNamespace(execute=mock.Mock(), fetchone=mock.Mock())
+        args = argparse.Namespace(
+            bfs_table="bfs_table",
+            bfs_index="bfs_index",
+            insertion_table="insertion_table",
+            insertion_index="insertion_index",
+            filter_selectivity_by_name={"filter_a": 1.0},
+            filter_atoms={"filter_a": ["embedding_valid"]},
+            guidance_selectivity_max_pct=10.0,
+            guidance_max_atoms=64,
+            guidance_filter_strategy="guided_collect",
+            reset_cache_per_query=False,
+            candidate_validity_predicate="embedding_valid",
+        )
+        with self.assertRaisesRegex(ValueError, "must not contain"):
+            benchmark.activate(cursor, args, "design1_bloom", "filter_a")
+        self.assertFalse(
+            any("vector_hnsw_guidance_activate" in call.args[0]
+                for call in cursor.execute.call_args_list)
+        )
+
     def test_shuffled_modes_is_seeded_and_balanced(self):
         modes = benchmark.MODES[:3]
         first_rng = random.Random(20260718)
@@ -408,6 +527,7 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
             guidance_max_atoms=64,
             guidance_filter_strategy="guided_collect",
             reset_cache_per_query=False,
+            candidate_validity_predicate="embedding_valid",
         )
 
         first = benchmark.activate(cursor, args, "design1_bloom_bfs_layout_d3", "filter_a")
@@ -426,6 +546,10 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
         ]
         self.assertEqual(len(activation_calls), 3)
         self.assertTrue(all(call.args[1][-1] == "adaptive" for call in activation_calls))
+        self.assertTrue(all(call.args[1][1] == ["a = 1"] for call in activation_calls))
+        self.assertFalse(
+            any("embedding_valid" in call.args[1][1] for call in activation_calls)
+        )
 
     def test_d3_measurements_preserve_admission_and_prove_warm_reuse(self):
         cursor = SimpleNamespace(execute=mock.Mock(), fetchone=mock.Mock(return_value=("{}",)))
@@ -772,7 +896,7 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
             },
         )
         query_sql, query_params = cursor.execute.call_args_list[1].args
-        self.assertIn("WHERE (rating = 5) AND id <> %s", query_sql)
+        self.assertIn("WHERE (rating = 5) AND (TRUE) AND id <> %s", query_sql)
         self.assertEqual(query_params, (99, 99))
 
     def test_formal_traversal_query_has_no_residual_self_qual_and_client_excludes(self):
@@ -846,6 +970,26 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
         self.assertEqual(ids, [99, 10])
         _, query_params = cursor.execute.call_args_list[1].args
         self.assertEqual(query_params, (99,))
+
+    def test_candidate_validity_is_a_separate_sql_qual_for_all_modes(self):
+        stock_sql = benchmark.search_query_sql(
+            "public.items",
+            "rating = 5",
+            10,
+            candidate_validity_predicate="embedding_valid",
+        )
+        guided_sql = benchmark.search_query_sql(
+            "public.items",
+            "rating = 5",
+            10,
+            bind_guidance=True,
+            candidate_validity_predicate="embedding_valid",
+        )
+
+        expected = "(rating = 5) AND (embedding_valid)"
+        self.assertIn(expected, stock_sql)
+        self.assertIn(expected, guided_sql)
+        self.assertNotIn("embedding_valid", ["rating = 5"])
 
     def test_d2_graph_proof_gate_requires_same_logical_graph_but_new_layout(self):
         valid = self._d2_proof()
@@ -1046,7 +1190,16 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
 
     def test_explain_gate_requires_actual_expected_hnsw_index_node(self):
         cursor = mock.Mock()
-        metadata = (42, "items_embedding_hnsw", "public", "hnsw", 7, "items", "public")
+        metadata = (
+            42,
+            "items_embedding_hnsw",
+            "public",
+            "hnsw",
+            7,
+            "items",
+            "public",
+            "embedding_valid",
+        )
         matching_plan = [
             {
                 "Plan": {
@@ -1071,13 +1224,39 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
             "rating = 5",
             99,
             10,
+            candidate_validity_predicate="embedding_valid",
         )
 
         self.assertTrue(evidence["passed"])
         explain_sql, explain_params = cursor.execute.call_args_list[1].args
         self.assertIn("EXPLAIN (FORMAT JSON, VERBOSE)", explain_sql)
         self.assertIn("id <> %s", explain_sql)
+        self.assertIn("(rating = 5) AND (embedding_valid)", explain_sql)
         self.assertEqual(explain_params, (99, 99))
+        self.assertEqual(evidence["candidate_validity_predicate"], "embedding_valid")
+        self.assertEqual(
+            evidence["candidate_validity_predicate_sha256"],
+            benchmark.candidate_validity_sha256("embedding_valid"),
+        )
+        self.assertTrue(evidence["catalog_index_predicate_matches"])
+        self.assertEqual(evidence["catalog_index_predicate"], "embedding_valid")
+
+        full_cursor = mock.Mock()
+        full_cursor.fetchone.side_effect = [
+            (*metadata[:7], None),
+            (matching_plan,),
+        ]
+        full_rejected = benchmark.explain_hnsw_plan(
+            full_cursor,
+            "public.items",
+            "public.items_embedding_hnsw",
+            "rating = 5",
+            99,
+            10,
+            candidate_validity_predicate="embedding_valid",
+        )
+        self.assertFalse(full_rejected["passed"])
+        self.assertFalse(full_rejected["catalog_index_is_partial"])
 
         cursor = mock.Mock()
         wrong_plan = [

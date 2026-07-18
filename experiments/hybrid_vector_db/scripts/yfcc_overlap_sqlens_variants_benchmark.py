@@ -19,7 +19,7 @@ from yfcc_pgvector_filtered_benchmark import parse_int_array, recall_at_k
 
 METHODS = ["stock", "d1", "d1_d2", "d1_d2_d3"]
 SQLENS_V11_BUILD_PREFIX = "sqlens-v11-"
-SQLENS_MIN_PROFILE_SEMANTICS = 4.0
+SQLENS_MIN_PROFILE_SEMANTICS = 6.0
 SQLENS_PROFILE_FIELDS = (
     "graph_elements_visited",
     "raw_index_tids_returned",
@@ -227,7 +227,8 @@ def configure(cur: psycopg.Cursor, args: argparse.Namespace, method: str) -> Non
     cur.execute("SET jit = off")
     cur.execute(f"SET statement_timeout = {int(args.statement_timeout_ms)}")
     cur.execute(f"SET hnsw.ef_search = {int(args.ef_search)}")
-    cur.execute(f"SET hnsw.iterative_scan = {args.iterative_scan}")
+    iterative_scan = args.iterative_scan if method == "stock" else args.guidance_iterative_scan
+    cur.execute(f"SET hnsw.iterative_scan = {iterative_scan}")
     cur.execute(f"SET hnsw.max_scan_tuples = {int(args.max_scan_tuples)}")
     cur.execute(f"SET hnsw.scan_mem_multiplier = {float(args.scan_mem_multiplier)}")
     cur.execute(f"SET hnsw.guided_collect_target = {int(args.guided_collect_target)}")
@@ -257,8 +258,10 @@ def activate_guidance(cur: psycopg.Cursor, args: argparse.Namespace, method: str
     enabled, route = (True, "enabled") if method == "d1_d2_d3" else should_enable_guidance(args, row, method)
     if not enabled:
         cur.execute("SET hnsw.filter_strategy = off")
+        cur.execute(f"SET hnsw.iterative_scan = {args.iterative_scan}")
         return {"guidance_enabled": False, "guidance_route": route, "table": table, "index": index}, 0.0
     cur.execute(f"SET hnsw.filter_strategy = {args.guidance_filter_strategy}")
+    cur.execute(f"SET hnsw.iterative_scan = {args.guidance_iterative_scan}")
     atoms = tag_atoms(row["tags_list"])
 
     def run():
@@ -274,6 +277,7 @@ def activate_guidance(cur: psycopg.Cursor, args: argparse.Namespace, method: str
     profile["activation_atom_count"] = activated_atoms
     if method == "d1_d2_d3" and (activated_atoms <= 0 or not bool(profile.get("active", False))):
         cur.execute("SET hnsw.filter_strategy = off")
+        cur.execute(f"SET hnsw.iterative_scan = {args.iterative_scan}")
         profile["guidance_enabled"] = False
         profile["guidance_route"] = "d3_probe"
     else:
@@ -353,6 +357,22 @@ def build_hybrid_query(
 def guidance_scan_contract_satisfied(profile: dict[str, Any], strategy: str) -> bool:
     if int(profile.get("guidance_checks", 0) or 0) <= 0:
         return False
+    if strategy == "traversal_guided":
+        return (
+            profile.get("final_path") == "guided"
+            and profile.get("planner_proof_succeeded") is True
+            and profile.get("traversal_guidance_scope")
+            == "candidate_admission_and_validation"
+            and profile.get("graph_expansion_pruned") is False
+            and profile.get("distance_computations_pruned") is False
+            and int(profile.get("pre_distance_membership_checks", 0) or 0) == 0
+            and int(profile.get("distance_computations_avoided", 0) or 0) == 0
+            and int(profile.get("neighbor_expansion_guidance_checks", 0) or 0) > 0
+            and int(profile.get("traversal_guided_admissions", 0) or 0) > 0
+            and int(profile.get("traversal_guided_suppressions", 0) or 0) > 0
+            and int(profile.get("stock_bypass_requests", 0) or 0) == 0
+            and int(profile.get("fallback_requests", 0) or 0) == 0
+        )
     return strategy != "guided_collect" or int(
         profile.get("traversal_guidance_checks", 0) or 0
     ) > 0
@@ -478,6 +498,7 @@ def main() -> None:
     parser.add_argument("--k", type=int, default=10)
     parser.add_argument("--ef-search", type=int, default=1000)
     parser.add_argument("--iterative-scan", default="strict_order", choices=["off", "strict_order", "relaxed_order"])
+    parser.add_argument("--guidance-iterative-scan", default="off", choices=["off", "strict_order", "relaxed_order"])
     parser.add_argument("--max-scan-tuples", type=int, default=500000)
     parser.add_argument("--guided-collect-target", type=int, default=100)
     parser.add_argument("--scan-mem-multiplier", type=float, default=8.0)
@@ -489,7 +510,7 @@ def main() -> None:
     parser.add_argument("--d1-cache-mb", type=int, default=4096)
     parser.add_argument("--d3-cache-mb", type=int, default=4096)
     parser.add_argument("--guidance-kind", default="exact", choices=["exact", "page", "bloom"])
-    parser.add_argument("--guidance-filter-strategy", default="guided_collect", choices=["safe_guided", "guided_collect", "acorn1"])
+    parser.add_argument("--guidance-filter-strategy", default="traversal_guided", choices=["safe_guided", "guided_collect", "acorn1", "traversal_guided"])
     parser.add_argument(
         "--d3-reuse-active-guidance",
         action=argparse.BooleanOptionalAction,
@@ -505,7 +526,7 @@ def main() -> None:
     parser.add_argument(
         "--guidance-max-atoms",
         type=int,
-        default=1,
+        default=64,
         help="Disable D1/D2 predicate guidance when a query decomposes into more atoms than this.",
     )
     parser.add_argument(
@@ -556,6 +577,7 @@ def main() -> None:
                 "qid",
                 "tags",
                 "ef_search",
+                "iterative_scan",
                 "max_scan_tuples",
                 "guided_collect_target",
                 "scan_mem_multiplier",
@@ -606,6 +628,12 @@ def main() -> None:
                 "guidance_checks",
                 "guidance_skips",
                 "guidance_skip_rate",
+                "traversal_guidance_scope",
+                "graph_expansion_pruned",
+                "distance_computations_pruned",
+                "pre_distance_membership_checks",
+                "distance_computations_avoided",
+                "neighbor_expansion_guidance_checks",
                 "traversal_expanded_nodes",
                 "traversal_neighbors_examined",
                 "traversal_guidance_checks",
@@ -680,6 +708,11 @@ def main() -> None:
                             "qid": int(query["qid"]),
                             "tags": query["tags"],
                             "ef_search": int(args.ef_search),
+                            "iterative_scan": (
+                                args.guidance_iterative_scan
+                                if bool(activation_profile.get("guidance_enabled", False))
+                                else args.iterative_scan
+                            ),
                             "max_scan_tuples": int(args.max_scan_tuples),
                             "guided_collect_target": int(args.guided_collect_target),
                             "scan_mem_multiplier": float(args.scan_mem_multiplier),
@@ -733,6 +766,12 @@ def main() -> None:
                             "guidance_checks": checks,
                             "guidance_skips": skips,
                             "guidance_skip_rate": skips / checks if checks else 0.0,
+                            "traversal_guidance_scope": str(scan_profile.get("traversal_guidance_scope", "")),
+                            "graph_expansion_pruned": bool(scan_profile.get("graph_expansion_pruned", False)),
+                            "distance_computations_pruned": bool(scan_profile.get("distance_computations_pruned", False)),
+                            "pre_distance_membership_checks": float(scan_profile.get("pre_distance_membership_checks", 0) or 0),
+                            "distance_computations_avoided": float(scan_profile.get("distance_computations_avoided", 0) or 0),
+                            "neighbor_expansion_guidance_checks": float(scan_profile.get("neighbor_expansion_guidance_checks", 0) or 0),
                             "traversal_expanded_nodes": float(scan_profile.get("traversal_expanded_nodes", 0) or 0),
                             "traversal_neighbors_examined": float(scan_profile.get("traversal_neighbors_examined", 0) or 0),
                             "traversal_guidance_checks": float(scan_profile.get("traversal_guidance_checks", 0) or 0),

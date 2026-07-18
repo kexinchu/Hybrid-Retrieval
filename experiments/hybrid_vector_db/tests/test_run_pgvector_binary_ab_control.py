@@ -32,6 +32,13 @@ def controller_args(temporary: str) -> object:
         }),
         encoding="utf-8",
     )
+    filters = Path(temporary) / "filters.csv"
+    with filters.open("w", encoding="utf-8", newline="") as target:
+        writer = csv.DictWriter(target, fieldnames=["filter_name", "predicate"])
+        writer.writeheader()
+        for index in range(14):
+            writer.writerow({"filter_name": f"f{index:02d}", "predicate": "id >= 0"})
+    Path(temporary, "truth.csv").write_text("truth\n", encoding="utf-8")
     args = controller.build_parser().parse_args([
         "--server-container", "pgvector",
         "--official-vector-so", f"{temporary}/official-vector.so",
@@ -66,6 +73,28 @@ def controller_args(temporary: str) -> object:
 
 
 class RunPgvectorBinaryAbControlTests(unittest.TestCase):
+    def test_high_ef_controller_forwards_audited_ceiling_and_validity_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            args = controller_args(temporary)
+            patch = Path(temporary) / "ceiling.patch"
+            patch.write_bytes(
+                Path("patches/pgvector-v0.8.2-ef-search-10000.patch").read_bytes()
+            )
+            args.max_ef_search = 10_000
+            args.upstream_evaluation_patch = patch
+            args.config_ladder = Path(temporary) / "ladder.csv"
+            args.candidate_validity_predicate = "embedding_valid"
+            args.official_vector_so_sha256 = "b" * 64
+
+            argv = controller.build_runner_argv(args, "official")
+
+            self.assertIn("--max-ef-search", argv)
+            self.assertIn("10000", argv)
+            self.assertIn("--upstream-evaluation-patch", argv)
+            self.assertIn("--candidate-validity-predicate", argv)
+            self.assertIn("embedding_valid", argv)
+            self.assertIn("b" * 64, argv)
+
     def test_seeded_final_schedule_is_audited_ab_ba_and_balanced(self) -> None:
         schedule, audit = controller.counterbalanced_final_schedule("run-123", 17)
 
@@ -98,6 +127,14 @@ class RunPgvectorBinaryAbControlTests(unittest.TestCase):
             root = Path(temporary)
             filters = [f"f{i:02d}" for i in range(14)]
             targets = [0.90, 0.95, 0.99]
+            filters_path = root / "filters.csv"
+            with filters_path.open("w", encoding="utf-8", newline="") as target:
+                writer = csv.DictWriter(target, fieldnames=["filter_name", "predicate"])
+                writer.writeheader()
+                for name in filters:
+                    writer.writerow({"filter_name": name, "predicate": "id >= 0"})
+            (root / "truth.csv").write_text("truth\n", encoding="utf-8")
+            (root / "graph-identity.json").write_text("{}\n", encoding="utf-8")
             shared = {
                 "run_uuid": "run-123",
                 "status": "arm_ready",
@@ -106,15 +143,14 @@ class RunPgvectorBinaryAbControlTests(unittest.TestCase):
                     "formal_family": "off",
                     "filters": filters,
                     "target_recalls": targets,
+                    "cell_keys": [
+                        f"{name}|{format(target, 'g')}"
+                        for name in filters
+                        for target in targets
+                    ],
                     "cell_count": 42,
                 },
-                "source_hashes": {
-                    "runner_sha256": "1" * 64,
-                    "filters_sha256": "2" * 64,
-                    "truth_sha256": "3" * 64,
-                    "graph_identity_sha256": "9" * 64,
-                    "hybrid_sql_sha256_by_filter": {name: "4" * 64 for name in filters},
-                },
+                "source_hashes": {},
                 "database_fingerprint": {
                     "system_identifier": "cluster",
                     "database_oid": 7,
@@ -137,8 +173,15 @@ class RunPgvectorBinaryAbControlTests(unittest.TestCase):
                 },
                 "schedule_contract": {
                     "schedule_seed": 19,
+                    "screen_query_nos": list(range(0, 20)),
+                    "verification_query_nos": list(range(20, 100)),
                     "final_query_nos": list(range(100, 200)),
+                    "screen_repeats": 2,
+                    "verification_repeats": 3,
                     "final_repeats": 2,
+                    "final_blocks": 2,
+                    "final_repeat_partition": "contiguous equal halves",
+                    "balanced_config_order": "seeded cyclic rotation per query/repeat block",
                     "warmup_spec_sha256": "6" * 64,
                 },
                 "warmup_invocations": [
@@ -184,6 +227,49 @@ class RunPgvectorBinaryAbControlTests(unittest.TestCase):
                     for name in filters
                 },
             }
+            controller_spec = {
+                "run_uuid": "run-123",
+                "implementations": ["official", "sqlens_disabled"],
+                "binary_sources": {
+                    "official": {
+                        "expected_digest": controller.OFFICIAL_VECTOR_SO_SHA256,
+                        "source_tag": "official-tag",
+                        "source_commit": "official-commit",
+                        "build_recipe": "make",
+                        "compiler_flags": "-O3",
+                        "source_repo": str(root),
+                    },
+                    "sqlens_disabled": {
+                        "expected_digest": SQLENS_DIGEST,
+                        "source_tag": "sqlens_disabled-tag",
+                        "source_commit": "sqlens_disabled-commit",
+                        "build_recipe": "make",
+                        "compiler_flags": "-O3",
+                        "source_repo": str(root),
+                        "required_sqlens_build_prefix": "sqlens-v11-",
+                        "minimum_sqlens_profile_semantics": 4.0,
+                    },
+                },
+                "formal_family": "off",
+                "max_ef_search": 1000,
+                "candidate_validity_predicate": "",
+                "upstream_evaluation_patch": None,
+                "config_ladder": None,
+                "data_epoch": "amazon10m-v1",
+                "filters_csv": str(root / "filters.csv"),
+                "truth_csv": str(root / "truth.csv"),
+                "graph_identity_json": str(root / "graph-identity.json"),
+                "formal_design_filters": filters,
+                "table": "public.items",
+                "index": "public.items_idx",
+                "source_index": "public.items_idx",
+                "clone_index": "public.items_clone_idx",
+                "k": 10,
+                "target_recalls": targets,
+                "repeats": {"screen": 2, "verification": 3, "final": 2},
+                "schedule_seed": 19,
+            }
+            shared["source_hashes"] = controller._controller_spec_source_hashes(controller_spec)
             manifests = []
             for implementation, latency, digest in (
                 ("official", 20.0, controller.OFFICIAL_VECTOR_SO_SHA256),
@@ -242,6 +328,39 @@ class RunPgvectorBinaryAbControlTests(unittest.TestCase):
                         "dirty_diff_sha256": "7" * 64,
                         "source_tree": f"/src/{implementation}",
                     },
+                    "args": {
+                        "filters_csv": str(root / "filters.csv"),
+                        "truth_csv": str(root / "truth.csv"),
+                        "graph_identity_json": str(root / "graph-identity.json"),
+                        "table": "public.items",
+                        "index": "public.items_idx",
+                        "source_index": "public.items_idx",
+                        "clone_index": "public.items_clone_idx",
+                        "data_epoch": "amazon10m-v1",
+                        "candidate_validity_predicate": "",
+                        "formal_family": "off",
+                        "target_recalls": targets,
+                        "k": 10,
+                        "screen_repeats": 2,
+                        "verification_repeats": 3,
+                        "final_repeats": 2,
+                        "schedule_seed": 19,
+                        "max_ef_search": 1000,
+                        "config_ladder": None,
+                        "upstream_evaluation_patch": None,
+                        "expected_vector_so_sha256": digest,
+                        "vector_source_tag": f"{implementation}-tag",
+                        "vector_source_commit": f"{implementation}-commit",
+                        "vector_build_recipe": "make",
+                        "vector_compiler_flags": "-O3",
+                        "vector_source_repo": str(root),
+                        "required_sqlens_build_prefix": "sqlens-v11-",
+                        "minimum_sqlens_profile_semantics": 4.0,
+                    },
+                    "config_ladder": {
+                        "source": "deterministic_default",
+                        "formal_family": "off",
+                    },
                     "outputs": {"raw": str(raw_path)},
                     "output_hashes": {
                         "raw": {
@@ -262,6 +381,12 @@ class RunPgvectorBinaryAbControlTests(unittest.TestCase):
             ]
             controller_manifest = {
                 "run_uuid": "run-123",
+                "controller_run_spec": controller_spec
+                | {
+                    "input_source_hashes": controller._controller_spec_source_hashes(
+                        controller_spec
+                    )
+                },
                 "calibration_order": ["official", "sqlens_disabled"],
                 "final_schedule": final_schedule,
                 "seeded_balance_audit": {
@@ -294,6 +419,9 @@ class RunPgvectorBinaryAbControlTests(unittest.TestCase):
                     ]
                 ],
             }
+            controller_manifest["controller_run_spec_sha256"] = controller.sha256_json(
+                controller_manifest["controller_run_spec"]
+            )
             publish = root / "published" / "run-123.json"
             report = controller.finalize_ab_artifacts(
                 manifests,
@@ -309,6 +437,59 @@ class RunPgvectorBinaryAbControlTests(unittest.TestCase):
             self.assertEqual(len(report["cells"]), 42)
             self.assertEqual(report["cells"][0]["speedup_mean"], 2.0)
             self.assertEqual(report["cells"][0]["speedup_lcb95"], 2.0)
+
+            original_manifests = [json.loads(path.read_text()) for path in manifests]
+            mismatched_sqlens = dict(original_manifests[1])
+            mismatched_sqlens["server_binary_provenance"] = dict(
+                mismatched_sqlens["server_binary_provenance"]
+            )
+            mismatched_sqlens["server_binary_provenance"].update(
+                {
+                    "vector_so_sha256": "b" * 64,
+                    "expected_vector_so_sha256": "b" * 64,
+                }
+            )
+            controller.atomic_write_json(manifests[1], mismatched_sqlens)
+            with self.assertRaisesRegex(controller.FinalizationError, "sqlens-disabled"):
+                controller.finalize_ab_artifacts(
+                    manifests,
+                    root / "published" / "mismatched-sqlens.json",
+                    bootstrap_samples=10,
+                    bootstrap_seed=1,
+                    controller_manifest=controller_manifest,
+                )
+            for path, original in zip(manifests, original_manifests):
+                controller.atomic_write_json(path, original)
+
+            stale_journal = json.loads(json.dumps(controller_manifest))
+            stale_journal["runner_runs"][3]["staging_manifest"][
+                "server_vector_so_sha256"
+            ] = "b" * 64
+            with self.assertRaisesRegex(controller.FinalizationError, "journal"):
+                controller.finalize_ab_artifacts(
+                    manifests,
+                    root / "published" / "stale-journal.json",
+                    bootstrap_samples=10,
+                    bootstrap_seed=1,
+                    controller_manifest=stale_journal,
+                )
+
+            stale_arms = [dict(original) for original in original_manifests]
+            for arm in stale_arms:
+                arm["source_hashes"] = dict(arm["source_hashes"])
+                arm["source_hashes"]["truth_sha256"] = "e" * 64
+            for path, arm in zip(manifests, stale_arms):
+                controller.atomic_write_json(path, arm)
+            with self.assertRaisesRegex(controller.FinalizationError, "source hashes"):
+                controller.finalize_ab_artifacts(
+                    manifests,
+                    root / "published" / "stale-arm.json",
+                    bootstrap_samples=10,
+                    bootstrap_seed=1,
+                    controller_manifest=controller_manifest,
+                )
+            for path, original in zip(manifests, original_manifests):
+                controller.atomic_write_json(path, original)
 
             unconfirmed = json.loads(manifests[1].read_text())
             unconfirmed["target_selection"][filters[0]]["0.9"] = {

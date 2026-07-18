@@ -32,6 +32,9 @@ from typing import Any, Mapping, Sequence
 OFFICIAL_VECTOR_SO_SHA256 = (
     "812292e3e7553c3dbe6a4187b528430a7f9c25693f4876b8d22f88829592a778"
 )
+UPSTREAM_EF10000_PATCH_SHA256 = (
+    "d63b8d75015cffb90d9bd7f04d0c8f572502f0b84f77f59f581d224db7601bcf"
+)
 DEFAULT_SQLENS_BUILD_PREFIX = "sqlens-v11-"
 DEFAULT_SQLENS_PROFILE_SEMANTICS = 4.0
 RUNNER_PATH = Path(__file__).with_name("pgvector_upstream_overhead_control.py")
@@ -91,6 +94,121 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def sha256_json(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _default_config_ladder_sha256() -> str:
+    configs: list[dict[str, Any]] = []
+    for ef_search in (250, 500, 750, 1000):
+        configs.append(
+            {
+                "ef_search": ef_search,
+                "iterative_scan": "off",
+                "max_scan_tuples": 100_000,
+                "scan_mem_multiplier": 1.0,
+                "budget_rank": 0,
+            }
+        )
+        for iterative_scan in ("strict_order", "relaxed_order"):
+            for budget_rank, max_scan_tuples, scan_mem_multiplier in (
+                (1, 100_000, 1.0),
+                (2, 1_000_000, 8.0),
+                (3, 5_000_000, 32.0),
+            ):
+                configs.append(
+                    {
+                        "ef_search": ef_search,
+                        "iterative_scan": iterative_scan,
+                        "max_scan_tuples": max_scan_tuples,
+                        "scan_mem_multiplier": scan_mem_multiplier,
+                        "budget_rank": budget_rank,
+                    }
+                )
+    return sha256_json(configs)
+
+
+def _controller_spec_source_hashes(spec: Mapping[str, Any]) -> dict[str, Any]:
+    def required_path(key: str) -> Path:
+        value = spec.get(key)
+        path = Path(str(value)) if value else Path("")
+        if not value or not path.is_file():
+            raise FinalizationError(
+                f"controller run spec {key} is missing or does not name a file"
+            )
+        return path
+
+    filters_path = required_path("filters_csv")
+    truth_path = required_path("truth_csv")
+    graph_path = required_path("graph_identity_json")
+    filters = _read_csv(filters_path)
+    design_filters = [str(value) for value in spec.get("formal_design_filters", [])]
+    if not design_filters:
+        design_filters = [str(value) for value in spec.get("filters", [])]
+    if [str(row.get("filter_name", "")) for row in filters] != design_filters:
+        raise FinalizationError("controller filters file does not match its formal design")
+    table = str(spec.get("table", ""))
+    candidate = str(spec.get("candidate_validity_predicate", ""))
+    try:
+        validate_identifier(table)
+        k = int(spec["k"])
+        if k <= 0:
+            raise ValueError("k must be positive")
+        if any(
+            marker in candidate.lower() for marker in (";", "--", "/*", "*/")
+        ):
+            raise ValueError("candidate predicate contains an unsafe SQL marker")
+        sql_hashes = {}
+        for row in filters:
+            filter_name = str(row.get("filter_name", ""))
+            predicate = str(row.get("predicate", ""))
+            if not predicate or any(
+                marker in predicate.lower() for marker in (";", "--", "/*", "*/")
+            ):
+                raise ValueError("filter predicate is missing or unsafe")
+            sql = (
+                f"SELECT id, embedding <-> %s::vector AS distance FROM {table} "
+                f"WHERE ({predicate})"
+                + (f" AND ({candidate})" if candidate else "")
+                + f" AND id <> %s ORDER BY embedding <-> %s::vector LIMIT {k}"
+            )
+            sql_hashes[filter_name] = hashlib.sha256(sql.encode("utf-8")).hexdigest()
+    except (KeyError, TypeError, ValueError, argparse.ArgumentTypeError) as exc:
+        raise FinalizationError("controller query/candidate-validity contract is invalid") from exc
+
+    patch = spec.get("upstream_evaluation_patch")
+    config_path = spec.get("config_ladder")
+    if config_path and not Path(str(config_path)).is_file():
+        raise FinalizationError("controller config ladder file is missing")
+    expected: dict[str, Any] = {
+        "runner_sha256": sha256_file(RUNNER_PATH),
+        "filters_sha256": sha256_file(filters_path),
+        "truth_sha256": sha256_file(truth_path),
+        "graph_identity_sha256": sha256_file(graph_path),
+        "hybrid_sql_sha256_by_filter": sql_hashes,
+        "candidate_validity_predicate_sha256": hashlib.sha256(
+            candidate.encode("utf-8")
+        ).hexdigest(),
+        "config_ladder_sha256": (
+            sha256_file(Path(str(config_path)))
+            if config_path
+            else _default_config_ladder_sha256()
+        ),
+    }
+    if patch:
+        if not isinstance(patch, Mapping) or not patch.get("path"):
+            raise FinalizationError("controller evaluation patch contract is invalid")
+        patch_path = Path(str(patch["path"]))
+        if not patch_path.is_file():
+            raise FinalizationError("controller evaluation patch file is missing")
+        patch_sha256 = sha256_file(patch_path)
+        if patch.get("sha256") != patch_sha256:
+            raise FinalizationError("controller evaluation patch hash is stale or mismatched")
+        expected["upstream_evaluation_patch_sha256"] = patch_sha256
+    return expected
 
 
 def validate_sha256(value: str) -> str:
@@ -265,6 +383,16 @@ def audit_controller_execution_journal(manifest: Mapping[str, Any]) -> dict[str,
         for record in successful
     ]
     run_uuid = str(manifest.get("run_uuid", ""))
+    controller_spec = manifest.get("controller_run_spec", {})
+    binary_sources = controller_spec.get("binary_sources", {})
+    expected_digests = {
+        implementation: str(binary_sources.get(implementation, {}).get("expected_digest", ""))
+        for implementation in ("official", "sqlens_disabled")
+    }
+    expected_digests_valid = all(
+        re.fullmatch(r"[0-9a-f]{64}", digest or "")
+        for digest in expected_digests.values()
+    )
     same_run = all(str(record.get("run_uuid")) == run_uuid for record in successful)
     append_only = all(
         record.get("staging_manifest", {})
@@ -274,7 +402,10 @@ def audit_controller_execution_journal(manifest: Mapping[str, Any]) -> dict[str,
         for record in successful
     )
     binary_bound = all(
-        bool(record.get("staging_manifest", {}).get("server_vector_so_sha256"))
+        expected_digests_valid
+        and str(record.get("implementation")) in expected_digests
+        and record.get("staging_manifest", {}).get("server_vector_so_sha256")
+        == expected_digests.get(str(record.get("implementation")))
         for record in successful
     )
     balance = manifest.get("seeded_balance_audit", {})
@@ -284,6 +415,7 @@ def audit_controller_execution_journal(manifest: Mapping[str, Any]) -> dict[str,
         and append_only
         and binary_bound
         and len(expected) == 6
+        and expected_digests_valid
         and balance.get("seeded_balance_verified") is True
         and balance.get("pair_orders") == ["AB", "BA"]
     )
@@ -294,6 +426,7 @@ def audit_controller_execution_journal(manifest: Mapping[str, Any]) -> dict[str,
         "same_run_uuid": same_run,
         "all_stage_resumes_append_only": append_only,
         "all_stages_bound_to_server_binary": binary_bound,
+        "expected_binary_digests": expected_digests,
         "passed": passed,
     }
     if not passed:
@@ -391,6 +524,141 @@ def _recall_lcb95(
     return _percentile(means, 0.05)
 
 
+def _validate_controller_bound_arm(
+    arm: str,
+    manifest: Mapping[str, Any],
+    controller_spec: Mapping[str, Any],
+    expected_source_hashes: Mapping[str, Any],
+    filters: Sequence[str],
+    targets: Sequence[float],
+    expected_splits: Mapping[str, Any],
+) -> None:
+    if manifest.get("source_hashes") != dict(expected_source_hashes):
+        raise FinalizationError(f"arm {arm} source hashes are not bound to controller inputs")
+
+    args = manifest.get("args")
+    if not isinstance(args, Mapping):
+        raise FinalizationError(f"arm {arm} runner args are missing")
+    repeats = controller_spec.get("repeats")
+    if not isinstance(repeats, Mapping):
+        raise FinalizationError("controller repeat contract is missing")
+    patch = controller_spec.get("upstream_evaluation_patch")
+    patch_path = str(patch.get("path")) if isinstance(patch, Mapping) else None
+    common_args = {
+        "filters_csv": str(controller_spec.get("filters_csv", "")),
+        "truth_csv": str(controller_spec.get("truth_csv", "")),
+        "graph_identity_json": str(controller_spec.get("graph_identity_json", "")),
+        "table": controller_spec.get("table"),
+        "index": controller_spec.get("index"),
+        "source_index": controller_spec.get("source_index"),
+        "clone_index": controller_spec.get("clone_index"),
+        "data_epoch": controller_spec.get("data_epoch"),
+        "candidate_validity_predicate": controller_spec.get(
+            "candidate_validity_predicate", ""
+        ),
+        "formal_family": controller_spec.get("formal_family"),
+        "target_recalls": list(controller_spec.get("target_recalls", targets)),
+        "k": controller_spec.get("k"),
+        "screen_repeats": repeats.get("screen"),
+        "verification_repeats": repeats.get("verification"),
+        "final_repeats": repeats.get("final"),
+        "schedule_seed": controller_spec.get("schedule_seed"),
+        "max_ef_search": controller_spec.get("max_ef_search"),
+        "config_ladder": (
+            str(controller_spec["config_ladder"])
+            if controller_spec.get("config_ladder")
+            else None
+        ),
+        "upstream_evaluation_patch": patch_path,
+    }
+    for key, expected in common_args.items():
+        if args.get(key) != expected:
+            raise FinalizationError(f"arm {arm} runner arg {key} is not controller-bound")
+
+    source = controller_spec.get("binary_sources", {}).get(arm, {})
+    source_args = {
+        "expected_vector_so_sha256": source.get("expected_digest"),
+        "vector_source_tag": source.get("source_tag"),
+        "vector_source_commit": source.get("source_commit"),
+        "vector_build_recipe": source.get("build_recipe"),
+        "vector_compiler_flags": source.get("compiler_flags"),
+        "vector_source_repo": source.get("source_repo"),
+    }
+    if arm == "sqlens_disabled":
+        source_args.update(
+            {
+                "required_sqlens_build_prefix": source.get("required_sqlens_build_prefix"),
+                "minimum_sqlens_profile_semantics": source.get(
+                    "minimum_sqlens_profile_semantics"
+                ),
+            }
+        )
+    for key, expected in source_args.items():
+        if args.get(key) != expected:
+            raise FinalizationError(f"arm {arm} source arg {key} is not controller-bound")
+    source_provenance = manifest.get("source_provenance", {})
+    for artifact_key, source_key in (
+        ("source_tag", "source_tag"),
+        ("source_commit", "source_commit"),
+        ("build_recipe", "build_recipe"),
+        ("compiler_flags", "compiler_flags"),
+    ):
+        if source_provenance.get(artifact_key) != source.get(source_key):
+            raise FinalizationError(
+                f"arm {arm} source provenance {artifact_key} is not controller-bound"
+            )
+
+    expected_design = {
+        "formal_family": controller_spec.get("formal_family"),
+        "filters": list(filters),
+        "target_recalls": list(targets),
+        "cell_keys": [
+            f"{name}|{_target_key(target)}" for name in filters for target in targets
+        ],
+        "cell_count": len(filters) * len(targets),
+    }
+    if manifest.get("formal_design") != expected_design:
+        raise FinalizationError(f"arm {arm} formal design is not controller-bound")
+    if manifest.get("query_splits") != dict(expected_splits):
+        raise FinalizationError(f"arm {arm} query split contract is not controller-bound")
+
+    schedule = manifest.get("schedule_contract")
+    if not isinstance(schedule, Mapping):
+        raise FinalizationError(f"arm {arm} schedule contract is missing")
+    expected_schedule = {
+        "schedule_seed": controller_spec.get("schedule_seed"),
+        "screen_query_nos": list(range(0, 20)),
+        "verification_query_nos": list(range(20, 100)),
+        "final_query_nos": list(range(100, 200)),
+        "screen_repeats": repeats.get("screen"),
+        "verification_repeats": repeats.get("verification"),
+        "final_repeats": repeats.get("final"),
+        "final_blocks": 2,
+        "final_repeat_partition": "contiguous equal halves",
+        "balanced_config_order": "seeded cyclic rotation per query/repeat block",
+    }
+    for key, expected in expected_schedule.items():
+        if schedule.get(key) != expected:
+            raise FinalizationError(f"arm {arm} schedule field {key} is not controller-bound")
+
+    config_ladder = manifest.get("config_ladder")
+    expected_config_source = (
+        str(controller_spec["config_ladder"])
+        if controller_spec.get("config_ladder")
+        else "deterministic_default"
+    )
+    if (
+        not isinstance(config_ladder, Mapping)
+        or config_ladder.get("source") != expected_config_source
+        or config_ladder.get("formal_family") != controller_spec.get("formal_family")
+    ):
+        raise FinalizationError(f"arm {arm} config contract is not controller-bound")
+
+    database = manifest.get("database_fingerprint", {})
+    if database.get("data_epoch") != controller_spec.get("data_epoch"):
+        raise FinalizationError(f"arm {arm} data epoch is not controller-bound")
+
+
 def finalize_ab_artifacts(
     arm_manifest_paths: Sequence[Path],
     publish_path: Path,
@@ -420,6 +688,18 @@ def finalize_ab_artifacts(
         raise FinalizationError("finalizer requires the controller execution journal")
     if controller_manifest.get("run_uuid") != official.get("run_uuid"):
         raise FinalizationError("controller and arm run UUIDs differ")
+    controller_spec = controller_manifest.get("controller_run_spec")
+    if not isinstance(controller_spec, Mapping):
+        raise FinalizationError("controller execution journal is missing controller_run_spec")
+    expected_spec_hash = controller_manifest.get("controller_run_spec_sha256")
+    if expected_spec_hash != sha256_json(controller_spec):
+        raise FinalizationError("controller run spec hash is stale or mismatched")
+    try:
+        expected_source_hashes = _controller_spec_source_hashes(controller_spec)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise FinalizationError("controller input file/hash contract cannot be verified") from exc
+    if controller_spec.get("input_source_hashes") != expected_source_hashes:
+        raise FinalizationError("controller input hashes are stale or mismatched")
     try:
         controller_audit = audit_controller_execution_journal(controller_manifest)
     except ControllerError as exc:
@@ -449,6 +729,30 @@ def finalize_ab_artifacts(
     }
     if official.get("query_splits") != expected_splits:
         raise FinalizationError("query split contract is not the fixed q0..q199 formal split")
+    if controller_spec.get("target_recalls") != targets:
+        raise FinalizationError("controller target recall contract is not the fixed formal design")
+    if controller_spec.get("formal_family") != design.get("formal_family"):
+        raise FinalizationError("controller formal family differs from arm formal design")
+    if list(controller_spec.get("formal_design_filters", [])) != filters:
+        raise FinalizationError("controller filters differ from arm formal design")
+    if controller_spec.get("data_epoch") != official.get("database_fingerprint", {}).get("data_epoch"):
+        raise FinalizationError("controller data epoch differs from arm database fingerprint")
+    for arm, manifest in by_arm.items():
+        _validate_controller_bound_arm(
+            arm,
+            manifest,
+            controller_spec,
+            expected_source_hashes,
+            filters,
+            targets,
+            expected_splits,
+        )
+    if official.get("query_splits") != sqlens.get("query_splits"):
+        raise FinalizationError("cross-arm query split contract mismatch")
+    if official.get("schedule_contract") != sqlens.get("schedule_contract"):
+        raise FinalizationError("cross-arm schedule contract mismatch")
+    if official.get("config_ladder") != sqlens.get("config_ladder"):
+        raise FinalizationError("cross-arm config contract mismatch")
     shared_hashes = official.get("source_hashes", {})
     for key in (
         "runner_sha256",
@@ -539,9 +843,57 @@ def finalize_ab_artifacts(
             item.get("warmup_spec_sha256") != expected_warmup_hash for item in warmups
         ):
             raise FinalizationError(f"arm {arm} deterministic warmup evidence is incomplete")
-    if official["server_binary_provenance"].get("vector_so_sha256") != OFFICIAL_VECTOR_SO_SHA256:
-        raise FinalizationError("official arm does not use the pinned upstream binary")
-    if official["server_binary_provenance"].get("vector_so_sha256") == sqlens["server_binary_provenance"].get("vector_so_sha256"):
+    max_ef_search = int(controller_spec.get("max_ef_search", 1000))
+    expected_official_digest = str(
+        controller_spec.get("binary_sources", {})
+        .get("official", {})
+        .get("expected_digest", "")
+    )
+    actual_official_digest = str(
+        official["server_binary_provenance"].get("vector_so_sha256", "")
+    )
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", expected_official_digest)
+        or actual_official_digest != expected_official_digest
+        or official["server_binary_provenance"].get("expected_vector_so_sha256")
+        != expected_official_digest
+    ):
+        raise FinalizationError("official-algorithm arm digest differs from controller provenance")
+    expected_sqlens_digest = str(
+        controller_spec.get("binary_sources", {})
+        .get("sqlens_disabled", {})
+        .get("expected_digest", "")
+    )
+    actual_sqlens_digest = str(
+        sqlens["server_binary_provenance"].get("vector_so_sha256", "")
+    )
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", expected_sqlens_digest)
+        or actual_sqlens_digest != expected_sqlens_digest
+        or sqlens["server_binary_provenance"].get("expected_vector_so_sha256")
+        != expected_sqlens_digest
+    ):
+        raise FinalizationError("sqlens-disabled arm digest differs from controller provenance")
+    ceiling = official.get("source_provenance", {}).get(
+        "parameter_ceiling_provenance", {}
+    )
+    if max_ef_search == 1000:
+        if (
+            actual_official_digest != OFFICIAL_VECTOR_SO_SHA256
+            or controller_spec.get("upstream_evaluation_patch") is not None
+        ):
+            raise FinalizationError("official arm does not use the pinned upstream binary")
+    elif (
+        max_ef_search != 10000
+        or actual_official_digest == OFFICIAL_VECTOR_SO_SHA256
+        or ceiling.get("algorithm_change") is not False
+        or ceiling.get("patch_sha256") != UPSTREAM_EF10000_PATCH_SHA256
+        or ceiling.get("changed_files") != ["src/hnsw.c", "src/hnsw.h"]
+    ):
+        raise FinalizationError(
+            "official-algorithm evaluation arm lacks the audited ef_search-only ceiling proof"
+        )
+    if actual_official_digest == actual_sqlens_digest:
         raise FinalizationError("the two arms resolve to the same binary digest")
 
     raw_by_arm: dict[str, list[dict[str, str]]] = {}
@@ -850,17 +1202,23 @@ def enforce_active_session_gate(args: argparse.Namespace) -> dict[str, Any]:
     return evidence
 
 
-def source_spec(args: argparse.Namespace, implementation: str) -> dict[str, str]:
+def source_spec(args: argparse.Namespace, implementation: str) -> dict[str, Any]:
     if implementation == "official":
         return {
             "implementation": implementation,
             "source_tag": args.official_vector_source_tag,
             "source_commit": args.official_vector_source_commit,
-            "expected_digest": OFFICIAL_VECTOR_SO_SHA256,
+            "expected_digest": getattr(
+                args, "official_vector_so_sha256", OFFICIAL_VECTOR_SO_SHA256
+            ),
             "host_path": str(args.official_vector_so),
             "build_recipe": args.official_vector_build_recipe,
             "compiler_flags": args.official_vector_compiler_flags,
             "source_repo": str(args.official_vector_source_repo),
+            "max_ef_search": getattr(args, "max_ef_search", 1000),
+            "upstream_evaluation_patch": str(
+                getattr(args, "upstream_evaluation_patch", None) or ""
+            ),
         }
     return {
         "implementation": implementation,
@@ -927,11 +1285,17 @@ def shared_runner_args(args: argparse.Namespace, *, resume: bool | None = None) 
         "--bootstrap-seed", str(args.bootstrap_seed),
         "--schedule-seed", str(args.schedule_seed),
         "--statement-timeout-ms", str(args.statement_timeout_ms),
+        "--max-ef-search", str(args.max_ef_search),
+        "--candidate-validity-predicate", args.candidate_validity_predicate,
         "--server-container", args.server_container,
         "--resume" if resume_enabled else "--no-resume",
     ]
     if args.config_ladder:
         argv.extend(["--config-ladder", str(args.config_ladder)])
+    if args.upstream_evaluation_patch:
+        argv.extend(
+            ["--upstream-evaluation-patch", str(args.upstream_evaluation_patch)]
+        )
     if args.filter_names:
         argv.append("--filter-names")
         argv.extend(args.filter_names)
@@ -1173,6 +1537,16 @@ def switch_binary(
 
 
 def validate_runtime_args(args: argparse.Namespace) -> None:
+    args.official_vector_so_sha256 = getattr(
+        args, "official_vector_so_sha256", OFFICIAL_VECTOR_SO_SHA256
+    )
+    args.max_ef_search = getattr(args, "max_ef_search", 1000)
+    args.upstream_evaluation_patch = getattr(
+        args, "upstream_evaluation_patch", None
+    )
+    args.candidate_validity_predicate = getattr(
+        args, "candidate_validity_predicate", ""
+    )
     required = {
         "server container": args.server_container,
         "official binary": args.official_vector_so,
@@ -1201,6 +1575,27 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
         raise ControllerError("formal target recalls must be exactly 0.90,0.95,0.99")
     if args.formal_family not in {"off", "strict_order"}:
         raise ControllerError("formal family must be off or strict_order")
+    if args.max_ef_search not in {1000, 10000}:
+        raise ControllerError("max_ef_search must be 1000 or 10000")
+    if any(
+        marker in args.candidate_validity_predicate.lower()
+        for marker in (";", "--", "/*", "*/")
+    ):
+        raise ControllerError("candidate-validity predicate contains an unsafe SQL marker")
+    if args.max_ef_search == 1000:
+        if args.official_vector_so_sha256 != OFFICIAL_VECTOR_SO_SHA256:
+            raise ControllerError("release-limit official arm requires the pinned binary")
+        if args.upstream_evaluation_patch is not None:
+            raise ControllerError("release-limit official arm must not declare an evaluation patch")
+    else:
+        if args.config_ladder is None:
+            raise ControllerError("max_ef_search=10000 requires an explicit config ladder")
+        if args.official_vector_so_sha256 == OFFICIAL_VECTOR_SO_SHA256:
+            raise ControllerError("ceiling-extended official-algorithm binary must have a new digest")
+        if args.upstream_evaluation_patch is None or not args.upstream_evaluation_patch.is_file():
+            raise ControllerError("max_ef_search=10000 requires the canonical evaluation patch")
+        if sha256_file(args.upstream_evaluation_patch) != UPSTREAM_EF10000_PATCH_SHA256:
+            raise ControllerError("upstream evaluation patch SHA256 is not canonical")
     if args.filter_names:
         raise ControllerError("formal controller runs always use the fixed 14-filter CSV")
     if args.final_repeats % 2:
@@ -1340,13 +1735,29 @@ def run_controller(args: argparse.Namespace) -> dict[str, Any]:
         "binary_sources": sources,
         "database": database_identity(args),
         "formal_family": args.formal_family,
+        "max_ef_search": args.max_ef_search,
+        "candidate_validity_predicate": args.candidate_validity_predicate,
+        "upstream_evaluation_patch": (
+            {
+                "path": str(args.upstream_evaluation_patch),
+                "sha256": sha256_file(args.upstream_evaluation_patch),
+            }
+            if args.upstream_evaluation_patch
+            else None
+        ),
+        "config_ladder": str(args.config_ladder) if args.config_ladder else None,
         "data_epoch": args.data_epoch,
         "filters_csv": str(args.filters_csv),
         "truth_csv": str(args.truth_csv),
+        "formal_design_filters": [
+            str(row.get("filter_name", ""))
+            for row in _read_csv(args.filters_csv)
+        ],
         "table": args.table,
         "index": args.index,
         "source_index": args.source_index,
         "clone_index": args.clone_index,
+        "k": args.k,
         "graph_identity_json": str(args.graph_identity_json),
         "target_recalls": args.target_recalls,
         "repeats": {
@@ -1358,6 +1769,7 @@ def run_controller(args: argparse.Namespace) -> dict[str, Any]:
         "calibration_order": calibration_order,
         "final_schedule": schedule,
     }
+    controller_spec["input_source_hashes"] = _controller_spec_source_hashes(controller_spec)
     controller_spec_hash = hashlib.sha256(
         json.dumps(controller_spec, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -1580,6 +1992,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Recoverable pgvector vector.so binary A/B controller")
     parser.add_argument("--server-container", type=validate_container)
     parser.add_argument("--official-vector-so", "--official-binary", dest="official_vector_so", type=Path)
+    parser.add_argument(
+        "--official-vector-so-sha256",
+        type=validate_sha256,
+        default=OFFICIAL_VECTOR_SO_SHA256,
+    )
     parser.add_argument("--sqlens-vector-so", "--sqlens-binary", dest="sqlens_vector_so", type=Path)
     parser.add_argument("--sqlens-vector-so-sha256", "--sqlens-digest", dest="sqlens_vector_so_sha256", type=validate_sha256)
     parser.add_argument("--official-vector-source-tag", "--official-source-tag", dest="official_vector_source_tag", default="")
@@ -1597,6 +2014,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--filters-csv", type=Path, default=Path("experiments/hybrid_vector_db/configs/amazon10m_selectivity14_filters.csv"))
     parser.add_argument("--truth-csv", type=Path, default=Path("results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_formal.csv"))
     parser.add_argument("--config-ladder", type=Path)
+    parser.add_argument("--max-ef-search", type=positive_int, default=1000)
+    parser.add_argument("--upstream-evaluation-patch", type=Path)
+    parser.add_argument("--candidate-validity-predicate", default="")
     parser.add_argument("--table", type=validate_identifier, default="public.amazon_grocery_reviews_10m_pgvector")
     parser.add_argument("--index", type=validate_identifier, default="public.amazon_grocery_reviews_10m_pgvector_embedding_hnsw_idx")
     parser.add_argument("--source-index", type=validate_identifier, default="public.amazon_grocery_reviews_10m_pgvector_embedding_hnsw_idx")
@@ -1652,6 +2072,14 @@ def dry_run_payload(args: argparse.Namespace) -> dict[str, Any]:
         "server_container": args.server_container,
         "manifest": str(manifest),
         "official_pinned_vector_so_sha256": OFFICIAL_VECTOR_SO_SHA256,
+        "official_requested_vector_so_sha256": args.official_vector_so_sha256,
+        "max_ef_search": args.max_ef_search,
+        "candidate_validity_predicate": args.candidate_validity_predicate,
+        "upstream_evaluation_patch": (
+            str(args.upstream_evaluation_patch)
+            if args.upstream_evaluation_patch
+            else None
+        ),
         "sqlens_vector_so_sha256_supplied": bool(args.sqlens_vector_so_sha256),
         "sqlens_build_prefix": args.required_sqlens_build_prefix,
         "sqlens_profile_semantics": args.minimum_sqlens_profile_semantics,

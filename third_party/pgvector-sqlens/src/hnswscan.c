@@ -129,23 +129,43 @@ static void
 HnswInitializeTraversalGuidance(HnswScanOpaque so)
 {
 	HnswTraversalGuidanceState *state = &so->traversalGuidance;
+	bool		guidanceActive;
 
 	MemSet(state, 0, sizeof(*state));
+	state->iterativeScan = (HnswIterativeScanMode) hnsw_iterative_scan;
+	state->filterStrategy = (HnswFilterStrategyMode) hnsw_filter_strategy;
 	state->finalPath = HNSW_TRAVERSAL_PATH_STOCK;
+	guidanceActive = HnswGuidanceIsActiveForScan(so->guidance);
+
+	if (hnsw_filter_strategy == HNSW_FILTER_STRATEGY_OFF)
+		return;
 
 	if (hnsw_filter_strategy == HNSW_FILTER_STRATEGY_SAFE_GUIDED)
 	{
-		state->finalPath = HNSW_TRAVERSAL_PATH_VALIDATION_ONLY;
+		state->finalPath = guidanceActive ?
+			HNSW_TRAVERSAL_PATH_VALIDATION_ONLY :
+			HNSW_TRAVERSAL_PATH_STOCK_BYPASS;
+		if (!guidanceActive)
+		{
+			state->stockBypassReason = HNSW_TRAVERSAL_BYPASS_NO_PROVEN_GUIDE;
+			so->traversal.stockBypassRequests++;
+		}
 		return;
 	}
 	if (hnsw_filter_strategy == HNSW_FILTER_STRATEGY_ACORN1 ||
 		hnsw_filter_strategy == HNSW_FILTER_STRATEGY_GUIDED_COLLECT)
 	{
-		state->finalPath = HNSW_TRAVERSAL_PATH_LEGACY_GUIDED;
+		state->finalPath = guidanceActive ?
+			HNSW_TRAVERSAL_PATH_LEGACY_GUIDED :
+			HNSW_TRAVERSAL_PATH_STOCK_BYPASS;
+		if (!guidanceActive)
+		{
+			state->stockBypassReason = HNSW_TRAVERSAL_BYPASS_NO_PROVEN_GUIDE;
+			so->traversal.stockBypassRequests++;
+		}
 		return;
 	}
-	if (hnsw_filter_strategy != HNSW_FILTER_STRATEGY_TRAVERSAL_GUIDED)
-		return;
+	Assert(hnsw_filter_strategy == HNSW_FILTER_STRATEGY_TRAVERSAL_GUIDED);
 
 	state->requested = true;
 	/* The GUC is not a SQL LIMIT; never certify less than the layer-0 ef. */
@@ -157,7 +177,7 @@ HnswInitializeTraversalGuidance(HnswScanOpaque so)
 	state->estimatedSkipRateValid = HnswGuidanceGetEstimatedSkipRate(
 		so->guidance, &state->estimatedSkipRate);
 
-	if (!HnswGuidanceIsActiveForScan(so->guidance))
+	if (!guidanceActive)
 		state->stockBypassReason = HNSW_TRAVERSAL_BYPASS_NO_PROVEN_GUIDE;
 	else if (hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF)
 		state->stockBypassReason = HNSW_TRAVERSAL_BYPASS_ITERATIVE_SCAN;
@@ -167,7 +187,13 @@ HnswInitializeTraversalGuidance(HnswScanOpaque so)
 		state->stockBypassReason = HNSW_TRAVERSAL_BYPASS_LOW_ESTIMATED_SKIP_RATE;
 	else
 	{
-		state->phaseEnabled = true;
+		/*
+		 * Guidance participates in the native distance-ordered traversal and
+		 * controls result admission.  It never starts the legacy pre-distance
+		 * pruning phase, whose unresolved bridge frontier cannot be certified
+		 * without degenerating into an all-graph walk.
+		 */
+		state->phaseEnabled = false;
 		state->finalPath = HNSW_TRAVERSAL_PATH_GUIDED;
 		return;
 	}
@@ -206,22 +232,32 @@ GetScanItems(IndexScanDesc scan)
 	{
 		bool		continuingFallback =
 			state->finalPath == HNSW_TRAVERSAL_PATH_FRESH_STOCK_FALLBACK;
+		bool		guidedAdmission =
+			state->finalPath == HNSW_TRAVERSAL_PATH_GUIDED;
 
 		if (continuingFallback)
 			so->traversal.fallbackRequests++;
 		items = RunScanItems(scan, GetScanValue(scan));
 		if (state->requested)
 		{
-			int64		stockDistance = so->distanceComputations - distanceStart;
-			int64		stockExpanded =
+			int64		phaseDistance = so->distanceComputations - distanceStart;
+			int64		phaseExpanded =
 				so->traversal.expandedNodes - expandedStart;
 
-			so->traversal.stockPhaseDistanceComputations += stockDistance;
-			so->traversal.stockPhaseExpandedNodes += stockExpanded;
+			if (guidedAdmission)
+			{
+				so->traversal.guidedPhaseDistanceComputations += phaseDistance;
+				so->traversal.guidedExpandedNodes += phaseExpanded;
+			}
+			else
+			{
+				so->traversal.stockPhaseDistanceComputations += phaseDistance;
+				so->traversal.stockPhaseExpandedNodes += phaseExpanded;
+			}
 			if (continuingFallback)
 			{
-				so->traversal.fallbackStockDistanceComputations += stockDistance;
-				so->traversal.fallbackStockExpandedNodes += stockExpanded;
+				so->traversal.fallbackStockDistanceComputations += phaseDistance;
+				so->traversal.fallbackStockExpandedNodes += phaseExpanded;
 			}
 		}
 		return items;
@@ -242,6 +278,7 @@ GetScanItems(IndexScanDesc scan)
 		so->traversal.guidedPhaseDistanceComputations +=
 			so->distanceComputations - distanceStart;
 		guidedUsable = state->guidedResultCount >= state->target &&
+			state->bridgePendingAtTermination == 0 &&
 			!state->maxScanReached && !state->memoryLimitReached &&
 			!state->invalidNeighbor && !state->workLimitReached &&
 			!state->hopLimitReached;
@@ -369,6 +406,8 @@ HnswResetScanProfile(void)
 	hnsw_last_profile.traversalFallbackReason = HNSW_TRAVERSAL_FALLBACK_NONE;
 	hnsw_last_profile.traversalEstimatedSkipRateValid = false;
 	hnsw_last_profile.traversalEstimatedSkipRate = 0;
+	hnsw_last_profile.iterativeScan = (HnswIterativeScanMode) hnsw_iterative_scan;
+	hnsw_last_profile.filterStrategy = (HnswFilterStrategyMode) hnsw_filter_strategy;
 	hnsw_last_profile.plannerProofCount = 0;
 	hnsw_last_profile.plannerProofsTruncated = false;
 	MemSet(hnsw_last_profile.plannerProofs, 0,
@@ -773,8 +812,9 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	so->traversalGuidance.memoryLimitReached = false;
 	so->traversalGuidance.invalidNeighbor = false;
 	so->traversalGuidance.guidedResultCount = 0;
-	so->traversalGuidance.phaseEnabled =
-		so->traversalGuidance.finalPath == HNSW_TRAVERSAL_PATH_GUIDED;
+	so->traversalGuidance.bridgePendingAtTermination = 0;
+	/* traversal_guided always reuses the native distance-ordered scan. */
+	so->traversalGuidance.phaseEnabled = false;
 	HnswResetScanProfile();
 
 	if (keys && scan->numberOfKeys > 0)
@@ -999,12 +1039,16 @@ hnswendscan(IndexScanDesc scan)
 		hnsw_last_profile.traversal.preDistanceChecks += so->traversal.preDistanceChecks;
 		hnsw_last_profile.traversal.preDistanceMatches += so->traversal.preDistanceMatches;
 		hnsw_last_profile.traversal.preDistanceMisses += so->traversal.preDistanceMisses;
+		hnsw_last_profile.traversal.attemptedDistanceComputationsAvoided +=
+			so->traversal.attemptedDistanceComputationsAvoided;
 		hnsw_last_profile.traversal.distanceComputationsAvoided += so->traversal.distanceComputationsAvoided;
 		hnsw_last_profile.traversal.missBridgeNodes += so->traversal.missBridgeNodes;
 		hnsw_last_profile.traversal.missBridgeEdges += so->traversal.missBridgeEdges;
 		hnsw_last_profile.traversal.maxMissBridgeHops = Max(
 			hnsw_last_profile.traversal.maxMissBridgeHops,
 			so->traversal.maxMissBridgeHops);
+		hnsw_last_profile.traversal.bridgePendingAtTermination +=
+			so->traversal.bridgePendingAtTermination;
 		hnsw_last_profile.traversal.guidedExpandedNodes += so->traversal.guidedExpandedNodes;
 		hnsw_last_profile.traversal.guidedPhaseDistanceComputations += so->traversal.guidedPhaseDistanceComputations;
 		hnsw_last_profile.traversal.stockPhaseExpandedNodes += so->traversal.stockPhaseExpandedNodes;
@@ -1069,6 +1113,8 @@ hnswendscan(IndexScanDesc scan)
 		so->traversalGuidance.estimatedSkipRateValid;
 	hnsw_last_profile.traversalEstimatedSkipRate =
 		so->traversalGuidance.estimatedSkipRate;
+	hnsw_last_profile.iterativeScan = so->traversalGuidance.iterativeScan;
+	hnsw_last_profile.filterStrategy = so->traversalGuidance.filterStrategy;
 	if (hnsw_last_profile.plannerProofCount < HNSW_PROFILE_MAX_PROOFS)
 		hnsw_last_profile.plannerProofs[hnsw_last_profile.plannerProofCount++] =
 			so->plannerProof;

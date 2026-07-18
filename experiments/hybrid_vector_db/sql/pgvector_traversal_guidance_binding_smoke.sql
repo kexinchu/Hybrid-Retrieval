@@ -131,38 +131,43 @@ BEGIN
         RAISE EXCEPTION 'seeded traversal-guided matched-result contract failed: exact %, stock %, guided %',
             exact_ids, stock_ids, guided_ids;
     END IF;
-    IF (guided_profile->>'profile_semantics_version')::int <> 4 OR
+    IF (guided_profile->>'profile_semantics_version')::int <> 6 OR
        NOT (guided_profile->>'planner_proof_succeeded')::boolean OR
        guided_profile->>'final_path' <> 'guided' OR
-       (guided_profile->>'pre_distance_membership_checks')::bigint <= 0 OR
-       (guided_profile->>'pre_distance_membership_misses')::bigint <= 0 OR
-       (guided_profile->>'traversal_guided_admissions')::bigint < 100 OR
-       (guided_profile->>'distance_computations_avoided')::bigint <= 0 OR
-       (guided_profile->>'miss_bridge_nodes')::bigint <= 0 OR
-       (guided_profile->>'miss_bridge_edges')::bigint <= 0 OR
-       (guided_profile->>'fallback_requests')::bigint <> 0 OR
-       (guided_profile->>'stock_bypass_requests')::bigint <> 0 THEN
-        RAISE EXCEPTION 'traversal-guided proof or pre-distance counters failed: %',
-            guided_profile;
-    END IF;
-    IF (guided_profile->>'distance_compute_count')::bigint >=
-           (stock_profile->>'distance_compute_count')::bigint THEN
-        RAISE EXCEPTION 'traversal-guided did not reduce distance work: stock %, guided %',
-            stock_profile, guided_profile;
-    END IF;
-    -- This sparse fixture does not claim fewer layer-0 expansions.  Instead it
-    -- proves the expansion and avoided-distance partitions exactly.
-    IF guided_profile->>'distance_compute_count' IS DISTINCT FROM
-           guided_profile->>'guided_phase_distance_computations' OR
+	   guided_profile->>'traversal_guidance_scope' <>
+	       'candidate_admission_and_validation' OR
+	   (guided_profile->>'graph_expansion_pruned')::boolean OR
+	   (guided_profile->>'distance_computations_pruned')::boolean OR
+	   (guided_profile->>'neighbor_expansion_guidance_checks')::bigint <= 0 OR
+	   (guided_profile->>'neighbor_expansion_guidance_misses')::bigint <= 0 OR
+	   (guided_profile->>'pre_distance_membership_checks')::bigint <> 0 OR
+	   (guided_profile->>'traversal_guided_admissions')::bigint < 100 OR
+	   (guided_profile->>'traversal_guided_suppressions')::bigint <= 0 OR
+	   guided_profile->>'traversal_guided_suppressions' IS DISTINCT FROM
+	       guided_profile->>'traversal_heap_tids_suppressed' OR
+	   (guided_profile->>'distance_computations_avoided')::bigint <> 0 OR
+	   (guided_profile->>'miss_bridge_nodes')::bigint <= 0 OR
+	   (guided_profile->>'miss_bridge_edges')::bigint <= 0 OR
+	   (guided_profile->>'fallback_requests')::bigint <> 0 OR
+	   (guided_profile->>'stock_bypass_requests')::bigint <> 0 THEN
+		RAISE EXCEPTION 'traversal-guided proof or admission counters failed: %',
+			guided_profile;
+	END IF;
+	-- Candidate admission may expand more graph nodes than stock to collect ef
+	-- predicate-valid results.  Its benefit is fewer invalid heap/SQL
+	-- validations and fewer iterative batches, not skipped vector distances.
+	IF guided_profile->>'distance_compute_count' IS DISTINCT FROM
+		   guided_profile->>'guided_phase_distance_computations' OR
        guided_profile->>'traversal_expanded_nodes' IS DISTINCT FROM
            guided_profile->>'guided_expanded_nodes' OR
        (guided_profile->>'guided_expanded_nodes')::bigint <>
            (guided_profile->>'traversal_matching_expanded')::bigint +
            (guided_profile->>'traversal_bridge_expanded')::bigint OR
-       guided_profile->>'distance_computations_avoided' IS DISTINCT FROM
-           guided_profile->>'distance_computations_avoided_attempted' THEN
-        RAISE EXCEPTION 'successful guided phase totals are ambiguous: %',
-            guided_profile;
+	   (guided_profile->>'distance_computations_avoided_attempted')::bigint <> 0 OR
+	   (guided_profile->>'net_distance_saved_available')::boolean OR
+	   (guided_profile->>'net_distance_saved')::bigint <> 0 THEN
+		RAISE EXCEPTION 'candidate-admission guided phase totals are ambiguous: %',
+			guided_profile;
     END IF;
 END
 $$;
@@ -204,8 +209,8 @@ BEGIN
 END
 $$;
 
--- A rare predicate plus zero bridge hops cannot certify the target. The entire
--- guided context must be discarded before a fresh stock traversal starts.
+-- A rare predicate remains safe with a zero legacy bridge-hop budget because
+-- candidate admission never prunes distance-ordered graph expansion.
 SET hnsw.filter_strategy = off;
 SELECT vector_hnsw_guidance_reset();
 SELECT vector_hnsw_reset_scan_profile();
@@ -232,7 +237,7 @@ SET hnsw.traversal_guided_target = 100;
 SET hnsw.traversal_guided_max_bridge_hops = 0;
 SELECT vector_hnsw_reset_scan_profile();
 INSERT INTO traversal_guidance_results (method, ids)
-SELECT 'fresh_stock_fallback', array_agg(id ORDER BY distance, id)
+SELECT 'admission_hop_budget_independent', array_agg(id ORDER BY distance, id)
 FROM (
     SELECT id, embedding <-> '[500,500]'::vector AS distance
     FROM traversal_guidance_binding_smoke
@@ -247,50 +252,49 @@ FROM (
 ) AS fallback;
 UPDATE traversal_guidance_results
 SET profile = vector_hnsw_last_scan_profile()::jsonb
-WHERE method = 'fresh_stock_fallback';
+WHERE method = 'admission_hop_budget_independent';
 
 DO $$
 DECLARE
     stock_ids integer[];
-    fallback_ids integer[];
+    admission_ids integer[];
     profile jsonb;
 BEGIN
     SELECT ids INTO stock_ids
     FROM traversal_guidance_results WHERE method = 'stock_rare';
-    SELECT ids, traversal_guidance_results.profile INTO fallback_ids, profile
-    FROM traversal_guidance_results WHERE method = 'fresh_stock_fallback';
+    SELECT ids, traversal_guidance_results.profile INTO admission_ids, profile
+    FROM traversal_guidance_results
+    WHERE method = 'admission_hop_budget_independent';
 
-    IF fallback_ids IS DISTINCT FROM stock_ids OR
-       profile->>'final_path' <> 'fresh_stock_fallback' OR
-       profile->>'fallback_reason' <> 'bridge_hop_budget' OR
-       (profile->>'fallback_requests')::bigint <> 1 OR
-       (profile->>'pre_distance_membership_checks')::bigint <= 0 OR
-       (profile->>'distance_computations_avoided_attempted')::bigint <= 0 OR
-       (profile->>'distance_computations_avoided')::bigint <> 0 OR
-       (profile->>'traversal_exhausted_terminations')::bigint <> 0 OR
-       (profile->>'fallback_stock_expanded_nodes')::bigint <= 0 OR
-       (profile->>'fallback_stock_distance_computations')::bigint <= 0 THEN
-        RAISE EXCEPTION 'fresh-stock fallback failed: stock %, fallback %, profile %',
-            stock_ids, fallback_ids, profile;
-    END IF;
-    IF (profile->>'distance_compute_count')::bigint <>
-         (profile->>'guided_phase_distance_computations')::bigint +
-         (profile->>'fallback_stock_distance_computations')::bigint OR
-       (profile->>'traversal_expanded_nodes')::bigint <>
-         (profile->>'guided_expanded_nodes')::bigint +
-         (profile->>'fallback_stock_expanded_nodes')::bigint THEN
-        RAISE EXCEPTION 'fallback phase totals are ambiguous: %', profile;
-    END IF;
+    IF cardinality(admission_ids) <> 5 OR
+	   profile->>'final_path' <> 'guided' OR
+	   profile->>'fallback_reason' <> 'none' OR
+	   (profile->>'fallback_requests')::bigint <> 0 OR
+	   (profile->>'pre_distance_membership_checks')::bigint <> 0 OR
+	   (profile->>'distance_computations_avoided_attempted')::bigint <> 0 OR
+	   (profile->>'distance_computations_avoided')::bigint <> 0 OR
+	   (profile->>'traversal_guided_admissions')::bigint <= 0 OR
+	   (profile->>'traversal_guided_suppressions')::bigint <= 0 OR
+	   (profile->>'fallback_stock_expanded_nodes')::bigint <> 0 OR
+	   (profile->>'fallback_stock_distance_computations')::bigint <> 0 THEN
+		RAISE EXCEPTION 'candidate admission depended on bridge-hop budget: stock %, admission %, profile %',
+			stock_ids, admission_ids, profile;
+	END IF;
+	IF profile->>'distance_compute_count' IS DISTINCT FROM
+		 profile->>'guided_phase_distance_computations' OR
+	   profile->>'traversal_expanded_nodes' IS DISTINCT FROM
+		 profile->>'guided_expanded_nodes' THEN
+		RAISE EXCEPTION 'admission phase totals are ambiguous: %', profile;
+	END IF;
 END
 $$;
 
--- Work-budget uncertainty is independently terminal and also restarts from a
--- fresh stock entry point.  One unit cannot pay for a level-0 bridge expansion.
+-- The legacy work budget is likewise irrelevant to candidate admission.
 SET hnsw.traversal_guided_max_bridge_hops = 3;
 SET hnsw.traversal_guided_max_bridge_work = 1;
 SELECT vector_hnsw_reset_scan_profile();
 INSERT INTO traversal_guidance_results (method, ids)
-SELECT 'fresh_stock_work_fallback', array_agg(id ORDER BY distance, id)
+SELECT 'admission_work_budget_independent', array_agg(id ORDER BY distance, id)
 FROM (
     SELECT id, embedding <-> '[500,500]'::vector AS distance
     FROM traversal_guidance_binding_smoke
@@ -305,40 +309,39 @@ FROM (
 ) AS fallback;
 UPDATE traversal_guidance_results
 SET profile = vector_hnsw_last_scan_profile()::jsonb
-WHERE method = 'fresh_stock_work_fallback';
+WHERE method = 'admission_work_budget_independent';
 
 DO $$
 DECLARE
-    stock_ids integer[];
-    fallback_ids integer[];
+    hop_budget_ids integer[];
+	 work_budget_ids integer[];
     profile jsonb;
 BEGIN
-    SELECT ids INTO stock_ids
-    FROM traversal_guidance_results WHERE method = 'stock_rare';
-    SELECT ids, traversal_guidance_results.profile INTO fallback_ids, profile
-    FROM traversal_guidance_results WHERE method = 'fresh_stock_work_fallback';
+    SELECT ids INTO hop_budget_ids
+	FROM traversal_guidance_results
+	WHERE method = 'admission_hop_budget_independent';
+	SELECT ids, traversal_guidance_results.profile INTO work_budget_ids, profile
+	FROM traversal_guidance_results
+	WHERE method = 'admission_work_budget_independent';
 
-    IF fallback_ids IS DISTINCT FROM stock_ids OR
-       profile->>'final_path' <> 'fresh_stock_fallback' OR
-       profile->>'fallback_reason' <> 'bridge_work_budget' OR
-       (profile->>'fallback_requests')::bigint <> 1 OR
-       (profile->>'guided_expanded_nodes')::bigint <> 0 OR
-       (profile->>'pre_distance_membership_checks')::bigint <> 0 OR
-       (profile->>'distance_computations_avoided_attempted')::bigint <> 0 OR
-       (profile->>'distance_computations_avoided')::bigint <> 0 OR
-       (profile->>'traversal_exhausted_terminations')::bigint <> 0 OR
-       (profile->>'fallback_stock_expanded_nodes')::bigint <= 0 OR
-       (profile->>'fallback_stock_distance_computations')::bigint <= 0 THEN
-        RAISE EXCEPTION 'fresh-stock work fallback failed: stock %, fallback %, profile %',
-            stock_ids, fallback_ids, profile;
-    END IF;
-    IF (profile->>'distance_compute_count')::bigint <>
-         (profile->>'guided_phase_distance_computations')::bigint +
-         (profile->>'fallback_stock_distance_computations')::bigint OR
-       (profile->>'traversal_expanded_nodes')::bigint <>
-         (profile->>'guided_expanded_nodes')::bigint +
-         (profile->>'fallback_stock_expanded_nodes')::bigint THEN
-        RAISE EXCEPTION 'work fallback phase totals are ambiguous: %', profile;
+	IF work_budget_ids IS DISTINCT FROM hop_budget_ids OR
+	   profile->>'final_path' <> 'guided' OR
+	   profile->>'fallback_reason' <> 'none' OR
+	   (profile->>'fallback_requests')::bigint <> 0 OR
+	   (profile->>'guided_expanded_nodes')::bigint <= 0 OR
+	   (profile->>'pre_distance_membership_checks')::bigint <> 0 OR
+	   (profile->>'distance_computations_avoided_attempted')::bigint <> 0 OR
+	   (profile->>'distance_computations_avoided')::bigint <> 0 OR
+	   (profile->>'fallback_stock_expanded_nodes')::bigint <> 0 OR
+	   (profile->>'fallback_stock_distance_computations')::bigint <> 0 THEN
+		RAISE EXCEPTION 'candidate admission depended on bridge-work budget: hop %, work %, profile %',
+			hop_budget_ids, work_budget_ids, profile;
+	END IF;
+	IF profile->>'distance_compute_count' IS DISTINCT FROM
+		 profile->>'guided_phase_distance_computations' OR
+	   profile->>'traversal_expanded_nodes' IS DISTINCT FROM
+		 profile->>'guided_expanded_nodes' THEN
+		RAISE EXCEPTION 'work-budget admission totals are ambiguous: %', profile;
     END IF;
 END
 $$;
@@ -509,14 +512,23 @@ WHERE method = 'traversal_guided_bloom';
 DO $$
 DECLARE
     profile jsonb;
+	 bloom_ids integer[];
+	 exact_ids integer[];
 BEGIN
-    SELECT traversal_guidance_results.profile INTO profile
+    SELECT ids, traversal_guidance_results.profile INTO bloom_ids, profile
     FROM traversal_guidance_results WHERE method = 'traversal_guided_bloom';
-    IF profile->>'final_path' <> 'guided' OR
+	SELECT ids INTO exact_ids
+	FROM traversal_guidance_results WHERE method = 'exact_eligible';
+    IF bloom_ids IS DISTINCT FROM exact_ids OR
+	   profile->>'final_path' <> 'guided' OR
        NOT (profile->>'traversal_estimated_skip_rate_valid')::boolean OR
        (profile->>'traversal_estimated_skip_rate')::double precision < 0.5 OR
-       (profile->>'pre_distance_membership_checks')::bigint <= 0 OR
-       (profile->>'distance_computations_avoided')::bigint <= 0 THEN
+	   (profile->>'neighbor_expansion_guidance_checks')::bigint <= 0 OR
+	   (profile->>'neighbor_expansion_guidance_misses')::bigint <= 0 OR
+	   (profile->>'traversal_guided_admissions')::bigint <= 0 OR
+	   (profile->>'traversal_guided_suppressions')::bigint <= 0 OR
+	   (profile->>'pre_distance_membership_checks')::bigint <> 0 OR
+	   (profile->>'distance_computations_avoided')::bigint <> 0 THEN
         RAISE EXCEPTION 'Bloom traversal admission was not exercised: %', profile;
     END IF;
 END
