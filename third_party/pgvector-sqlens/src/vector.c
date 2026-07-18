@@ -815,7 +815,7 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 					"\"index_page_distinct_counts_exact\":%s,"
 					"\"index_page_distinct_page_limit\":%d,"
 					"\"index_page_distinct_scope\":\"sum_of_scan_local_unique_pages\","
-					"\"index_page_profile_scope\":\"search_readbuffer_sequence_all_metapage_entry_neighbor_candidate_element\","
+					"\"index_page_profile_scope\":\"sum_of_scan_local_search_readbuffer_sequences_all_metapage_entry_neighbor_candidate_element\","
 					"\"index_page_neighbor_distinct_pages\":" INT64_FORMAT ","
 					"\"index_page_element_loads\":" INT64_FORMAT ","
 					"\"index_page_element_runs\":" INT64_FORMAT ","

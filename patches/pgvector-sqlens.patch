@@ -5538,7 +5538,7 @@ index f4e4d82..e5f1802 100644
  		AddConnections(base, element, neighbors, lc);
  
 diff --git a/src/vector.c b/src/vector.c
-index b8c2953..c518a6c 100644
+index b8c2953..c7ce8bb 100644
 --- a/src/vector.c
 +++ b/src/vector.c
 @@ -2,26 +2,564 @@
@@ -6331,7 +6331,7 @@ index b8c2953..c518a6c 100644
 +					"\"index_page_distinct_counts_exact\":%s,"
 +					"\"index_page_distinct_page_limit\":%d,"
 +					"\"index_page_distinct_scope\":\"sum_of_scan_local_unique_pages\","
-+					"\"index_page_profile_scope\":\"search_readbuffer_sequence_all_metapage_entry_neighbor_candidate_element\","
++					"\"index_page_profile_scope\":\"sum_of_scan_local_search_readbuffer_sequences_all_metapage_entry_neighbor_candidate_element\","
 +					"\"index_page_neighbor_distinct_pages\":" INT64_FORMAT ","
 +					"\"index_page_element_loads\":" INT64_FORMAT ","
 +					"\"index_page_element_runs\":" INT64_FORMAT ","
@@ -11259,10 +11259,10 @@ index 0000000..e69e865
 +
 diff --git a/test/expected/hnsw_profile.out b/test/expected/hnsw_profile.out
 new file mode 100644
-index 0000000..3abe3e0
+index 0000000..355f13e
 --- /dev/null
 +++ b/test/expected/hnsw_profile.out
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,44 @@
 +SET enable_seqscan = off;
 +SET hnsw.ef_search = 8;
 +CREATE TABLE hnsw_profile_t (id int, val vector(2));
@@ -11290,16 +11290,20 @@ index 0000000..3abe3e0
 +	(j->>'index_page_runs')::bigint >= 0 AND
 +	(j->>'index_page_distinct_pages')::bigint >= 0 AS index_nonnegative,
 +	(j->>'index_page_runs')::bigint <= (j->>'index_page_loads')::bigint AS index_runs_bounded,
++	(j->>'index_page_loads')::bigint =
++		(j->>'idx_blks_hit')::bigint + (j->>'idx_blks_read')::bigint AS index_buffers_match,
 +	j ? 'heap_tid_returns' AND j ? 'heap_tid_page_runs' AND
 +	j ? 'heap_tid_distinct_pages' AS heap_fields,
 +	(j->>'heap_tid_returns')::bigint = 4 AND
 +	(j->>'heap_tid_page_runs')::bigint = 1 AND
 +	(j->>'heap_tid_distinct_pages')::bigint = 1 AS predictable_heap_runs,
++	(j->>'heap_tid_returns')::bigint =
++		(j->>'raw_index_tids_returned')::bigint AS heap_returns_match,
 +	(j->>'heap_blks_are_exact_heap_io')::boolean = false AS heap_io_not_claimed_exact
 +FROM p;
-+ semantics_v7 | index_fields | index_nonnegative | index_runs_bounded | heap_fields | predictable_heap_runs | heap_io_not_claimed_exact 
-+--------------+--------------+-------------------+--------------------+-------------+-----------------------+---------------------------
-+ t            | t            | t                 | t                  | t           | t                     | t
++ semantics_v7 | index_fields | index_nonnegative | index_runs_bounded | index_buffers_match | heap_fields | predictable_heap_runs | heap_returns_match | heap_io_not_claimed_exact 
++--------------+--------------+-------------------+--------------------+---------------------+-------------+-----------------------+--------------------+---------------------------
++ t            | t            | t                 | t                  | t                   | t           | t                     | t                  | t
 +(1 row)
 +
 +DROP TABLE hnsw_profile_t;
@@ -11428,10 +11432,10 @@ index 0000000..1999f0c
 +permutation "prepare_table" "take_old_snapshot" "hot_update" "build_source" "build_clone" "plan_with_old_snapshot" "finish_old_snapshot" "plan_with_fresh_snapshot"
 diff --git a/test/sql/hnsw_profile.sql b/test/sql/hnsw_profile.sql
 new file mode 100644
-index 0000000..2a4450a
+index 0000000..50faf0b
 --- /dev/null
 +++ b/test/sql/hnsw_profile.sql
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,35 @@
 +SET enable_seqscan = off;
 +SET hnsw.ef_search = 8;
 +
@@ -11454,11 +11458,15 @@ index 0000000..2a4450a
 +	(j->>'index_page_runs')::bigint >= 0 AND
 +	(j->>'index_page_distinct_pages')::bigint >= 0 AS index_nonnegative,
 +	(j->>'index_page_runs')::bigint <= (j->>'index_page_loads')::bigint AS index_runs_bounded,
++	(j->>'index_page_loads')::bigint =
++		(j->>'idx_blks_hit')::bigint + (j->>'idx_blks_read')::bigint AS index_buffers_match,
 +	j ? 'heap_tid_returns' AND j ? 'heap_tid_page_runs' AND
 +	j ? 'heap_tid_distinct_pages' AS heap_fields,
 +	(j->>'heap_tid_returns')::bigint = 4 AND
 +	(j->>'heap_tid_page_runs')::bigint = 1 AND
 +	(j->>'heap_tid_distinct_pages')::bigint = 1 AS predictable_heap_runs,
++	(j->>'heap_tid_returns')::bigint =
++		(j->>'raw_index_tids_returned')::bigint AS heap_returns_match,
 +	(j->>'heap_blks_are_exact_heap_io')::boolean = false AS heap_io_not_claimed_exact
 +FROM p;
 +

@@ -20,11 +20,15 @@ SELECT
 	(j->>'index_page_runs')::bigint >= 0 AND
 	(j->>'index_page_distinct_pages')::bigint >= 0 AS index_nonnegative,
 	(j->>'index_page_runs')::bigint <= (j->>'index_page_loads')::bigint AS index_runs_bounded,
+	(j->>'index_page_loads')::bigint =
+		(j->>'idx_blks_hit')::bigint + (j->>'idx_blks_read')::bigint AS index_buffers_match,
 	j ? 'heap_tid_returns' AND j ? 'heap_tid_page_runs' AND
 	j ? 'heap_tid_distinct_pages' AS heap_fields,
 	(j->>'heap_tid_returns')::bigint = 4 AND
 	(j->>'heap_tid_page_runs')::bigint = 1 AND
 	(j->>'heap_tid_distinct_pages')::bigint = 1 AS predictable_heap_runs,
+	(j->>'heap_tid_returns')::bigint =
+		(j->>'raw_index_tids_returned')::bigint AS heap_returns_match,
 	(j->>'heap_blks_are_exact_heap_io')::boolean = false AS heap_io_not_claimed_exact
 FROM p;
 
