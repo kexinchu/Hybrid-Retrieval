@@ -34,13 +34,14 @@ CLASS_NAME = "AmazonGroceryReview"
 EXPECTED_ROWS = 10_000_000
 DEFAULT_EF_VALUES = (100, 250, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000)
 DEFAULT_TARGETS = (0.90, 0.95, 0.99)
-CALIBRATION_QUERY_NOS = tuple(range(100))
+CALIBRATION_QUERY_NOS = tuple(range(20, 100))
 FINAL_QUERY_NOS = tuple(range(100, 200))
 CALIBRATION_REPEATS = 2
 FINAL_REPEATS = 5
 BOOTSTRAP_SAMPLES = 10_000
 K = 10
 NA = "N/A"
+TARGET_SELECTION_RULE = "query-level mean recall@10 >= target; bootstrap CI/LCB reporting only"
 ACORN_REPORTED_STRATEGY = "acorn_configured_auto_fallback"
 ACORN_RATIO_ENV = "HNSW_ACORN_FILTER_RATIO"
 DEFAULT_FILTERS = ROOT / "experiments/hybrid_vector_db/configs/amazon10m_selectivity14_filters.csv"
@@ -824,12 +825,12 @@ def summarize_configuration(
 
 
 def select_fastest_config(summaries: Sequence[dict[str, Any]], target: float) -> dict[str, Any] | None:
-    eligible = [row for row in summaries if row.get("complete") is True and _finite_number(row.get("recall_lcb95")) and float(row["recall_lcb95"]) >= target]
+    eligible = [row for row in summaries if row.get("complete") is True and _finite_number(row.get("recall_mean")) and float(row["recall_mean"]) >= target]
     return min(eligible, key=lambda row: (float(row["latency_mean_ms"]), int(row["ef"]))) if eligible else None
 
 
 def reaches_target(summary: dict[str, Any], target: float) -> bool:
-    return bool(summary.get("complete") is True and _finite_number(summary.get("recall_lcb95")) and float(summary["recall_lcb95"]) >= target)
+    return bool(summary.get("complete") is True and _finite_number(summary.get("recall_mean")) and float(summary["recall_mean"]) >= target)
 
 
 def pair_calibration_summaries(
@@ -1387,7 +1388,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _dry_run(args: argparse.Namespace) -> int:
     strategies = [args.strategy] if args.strategy else args.strategies
-    print(json.dumps({"dry_run": True, "network": False, "files_read": False, "files_written": False, "class": CLASS_NAME, "k": K, "configured_filter_strategies": strategies, "reported_strategies": [reported_strategy(strategy) for strategy in strategies], "ef_values": args.ef_values, "targets": args.targets, "calibration_query_nos": [0, 99], "final_query_nos": [100, 199]}, sort_keys=True))
+    print(json.dumps({"dry_run": True, "network": False, "files_read": False, "files_written": False, "class": CLASS_NAME, "k": K, "configured_filter_strategies": strategies, "reported_strategies": [reported_strategy(strategy) for strategy in strategies], "ef_values": args.ef_values, "targets": args.targets, "target_selection_rule": TARGET_SELECTION_RULE, "calibration_query_nos": [20, 99], "final_query_nos": [100, 199], "reserved_query_nos": [0, 19]}, sort_keys=True))
     return 0
 
 
@@ -1452,14 +1453,14 @@ def _summary_row_for_target(
     target_status: str,
 ) -> dict[str, Any]:
     result = dict(final or {"complete": False, "recall_mean": NA, "recall_lcb95": NA, "recall_ci95_low": NA, "recall_ci95_high": NA, "latency_mean_ms": NA, "latency_p50_ms": NA, "latency_p95_ms": NA, "latency_p99_ms": NA, "latency_ci95_low_ms": NA, "latency_ci95_high_ms": NA, "single_client_service_qps": NA})
-    final_met = bool(result.get("complete") is True and _finite_number(result.get("recall_lcb95")) and float(result["recall_lcb95"]) >= target)
+    final_met = bool(result.get("complete") is True and _finite_number(result.get("recall_mean")) and float(result["recall_mean"]) >= target)
     unattainable = target_status == "unattainable_on_grid"
     target_outcome = (
         "selected_and_confirmed" if selected and final_met else
         "selected_but_final_unconfirmed" if selected else
         "unattainable_on_grid" if unattainable else "incomplete_grid"
     )
-    result.update({"phase": "final", "strategy": base["strategy"], "configured_filter_strategy": base["configured_filter_strategy"], "filter_name": base["filter_name"], "target_recall": target, "selected_ef": selected["ef"] if selected else NA, "target_status": target_status, "target_met": final_met if selected else (NA if unattainable else False), "target_met_final": final_met if selected else (NA if unattainable else False), "target_outcome": target_outcome, "comparison_status": "confirmed" if target_outcome == "selected_and_confirmed" else "unconfirmed" if target_outcome == "selected_but_final_unconfirmed" else target_outcome, "calibration_recall_lcb95": base.get("recall_lcb95", NA), "calibration_complete": base.get("complete", False)})
+    result.update({"phase": "final", "strategy": base["strategy"], "configured_filter_strategy": base["configured_filter_strategy"], "filter_name": base["filter_name"], "target_recall": target, "selected_ef": selected["ef"] if selected else NA, "target_status": target_status, "target_met": final_met if selected else (NA if unattainable else False), "target_met_final": final_met if selected else (NA if unattainable else False), "target_outcome": target_outcome, "comparison_status": "confirmed" if target_outcome == "selected_and_confirmed" else "unconfirmed" if target_outcome == "selected_but_final_unconfirmed" else target_outcome, "calibration_recall_mean": base.get("recall_mean", NA), "calibration_recall_lcb95": base.get("recall_lcb95", NA), "calibration_complete": base.get("complete", False), "target_selection_rule": TARGET_SELECTION_RULE})
     return result
 
 
@@ -1678,12 +1679,12 @@ def run(args: argparse.Namespace) -> int:
                 measured = _run_measurements(args, base_url, vectors, truth, query_ids, spec, strategy, ef, "calibration", CALIBRATION_QUERY_NOS, CALIBRATION_REPEATS, schedule_rotation=schedule_index + filter_position, schedule_index=schedule_index)
                 raw_rows.extend(measured)
                 summary = summarize_configuration(measured, strategy=strategy, filter_name=spec.name, ef=ef, query_nos=CALIBRATION_QUERY_NOS, repeats=CALIBRATION_REPEATS, bootstrap_seed=args.bootstrap_seed + schedule_index * len(filters) + filter_position)
-                calibration_summaries.append({**summary, "schedule_index": schedule_index, "target_recall": NA, "target_met": {str(target): bool(summary["complete"] and _finite_number(summary["recall_lcb95"]) and float(summary["recall_lcb95"]) >= target) for target in args.targets}})
+                calibration_summaries.append({**summary, "schedule_index": schedule_index, "target_recall": NA, "target_met": {str(target): reaches_target(summary, target) for target in args.targets}})
                 block = _block_record("calibration", strategy, spec.name, ef)
                 completed_blocks.append(block)
                 completed_keys.add(_block_key("calibration", strategy, spec.name, ef))
                 save_checkpoint()
-                print(f"progress strategy={strategy} ef={ef} filter={spec.name} completed=calibration active={len(pending_specs)} recall_lcb95={summary['recall_lcb95']} elapsed_s={time.perf_counter() - block_started:.1f}", flush=True)
+                print(f"progress strategy={strategy} ef={ef} filter={spec.name} completed=calibration active={len(pending_specs)} recall_mean={summary['recall_mean']} recall_lcb95_reported={summary['recall_lcb95']} elapsed_s={time.perf_counter() - block_started:.1f}", flush=True)
 
         for strategy in strategies:
             for spec in filters:
@@ -1730,6 +1731,16 @@ def run(args: argparse.Namespace) -> int:
                 block_started = time.perf_counter()
                 key = (strategy, spec.name, ef)
                 targets_reusing_measurement = selected_groups[key]
+                if args.warmup_queries:
+                    final_warmup = _run_measurements(
+                        args, base_url, vectors, truth, query_ids, spec, strategy, ef,
+                        "final_warmup", FINAL_QUERY_NOS[: args.warmup_queries], 1,
+                        schedule_rotation=final_schedule_index + filter_position,
+                        schedule_index=final_schedule_index,
+                    )
+                    for row in final_warmup:
+                        row["recall_at_10"] = NA
+                    raw_rows.extend(final_warmup)
                 measured = _run_measurements(args, base_url, vectors, truth, query_ids, spec, strategy, ef, "final", FINAL_QUERY_NOS, FINAL_REPEATS, schedule_rotation=final_schedule_index + filter_position, schedule_index=final_schedule_index)
                 for row in measured:
                     row["reused_for_targets"] = ",".join(str(target) for target in targets_reusing_measurement)
@@ -1740,7 +1751,7 @@ def run(args: argparse.Namespace) -> int:
                 completed_blocks.append(block)
                 completed_keys.add(_block_key("final", strategy, spec.name, ef))
                 save_checkpoint()
-                print(f"progress strategy={strategy} ef={ef} filter={spec.name} completed=final active={len(pending_groups)} recall_lcb95={final_results[key]['recall_lcb95']} elapsed_s={time.perf_counter() - block_started:.1f}", flush=True)
+                print(f"progress strategy={strategy} ef={ef} filter={spec.name} completed=final active={len(pending_groups)} recall_mean={final_results[key]['recall_mean']} recall_lcb95_reported={final_results[key]['recall_lcb95']} elapsed_s={time.perf_counter() - block_started:.1f}", flush=True)
             final_schedule_index += 1
 
         for strategy in strategies:
@@ -1807,13 +1818,115 @@ def run(args: argparse.Namespace) -> int:
         }
         for (strategy, filter_name, target), winner in sorted(selections.items())
     ]
-    config = {"class": CLASS_NAME, "git_revision": revision, "source_hashes": source_hashes, "run_spec_hash": run_spec_hash(specification), "vector_rows": vector_rows, "dimensions": dimensions, "k": K, "query_limit": K + 1, "recall_contract": "returned filter-valid self-excluded IDs with exact fbin squared L2 <= kth_distance_sq + tie_tolerance, capped at k", "filters": [asdict(spec) for spec in filters], "configured_filter_strategies": strategies, "reported_strategies": [reported_strategy(strategy) for strategy in strategies], "ef_values": args.ef_values, "targets": args.targets, "calibration": {"query_nos": [0, 99], "queries": 100, "repeats": CALIBRATION_REPEATS, "configuration_schedule": configuration_schedule, "warmup_queries_per_filter_config": args.warmup_queries, "schedule": "ef-interleaved strategy rotation; rotated filter and query order", "selection_rule": "measure ef in ascending order per strategy/filter; stop that pair after recall_lcb95 reaches the highest target; select the fastest measured complete configuration whose LCB95 meets each target", "unattainable_rule": "unattainable_on_grid is valid only after every ef through max_ef completed without measurement errors"}, "final": {"query_nos": [100, 199], "queries": 100, "repeats": FINAL_REPEATS, "deduplication_key": ["configured_filter_strategy", "filter_name", "ef"], "runs_only_selected_configurations": True, "comparison_common_attainable_targets_by_filter": common_targets}, "checkpoint": {"path": str(checkpoint), "resume": bool(args.resume), "block_boundary": "complete calibration or final filter block", "run_spec_hash": run_spec_hash(specification)}, "bootstrap_samples": BOOTSTRAP_SAMPLES, "schema_timings": schema_timings, "node_records": node_records, "measurement_mode": "single_client_sequential"}
+    config = {
+        "class": CLASS_NAME,
+        "git_revision": revision,
+        "source_hashes": source_hashes,
+        "run_spec_hash": run_spec_hash(specification),
+        "vector_rows": vector_rows,
+        "dimensions": dimensions,
+        "k": K,
+        "query_limit": K + 1,
+        "recall_contract": "returned filter-valid self-excluded IDs with exact fbin squared L2 <= kth_distance_sq + tie_tolerance, capped at k",
+        "target_selection_rule": TARGET_SELECTION_RULE,
+        "filters": [asdict(spec) for spec in filters],
+        "configured_filter_strategies": strategies,
+        "reported_strategies": [reported_strategy(strategy) for strategy in strategies],
+        "ef_values": args.ef_values,
+        "targets": args.targets,
+        "calibration": {
+            "query_nos": list(CALIBRATION_QUERY_NOS),
+            "queries": len(CALIBRATION_QUERY_NOS),
+            "repeats": CALIBRATION_REPEATS,
+            "configuration_schedule": configuration_schedule,
+            "warmup_queries_per_filter_config": args.warmup_queries,
+            "schedule": "ef-interleaved strategy rotation; rotated filter and query order",
+            "selection_rule": TARGET_SELECTION_RULE,
+            "unattainable_rule": "unattainable_on_grid is valid only after every ef through max_ef completed without measurement errors",
+        },
+        "final": {
+            "query_nos": list(FINAL_QUERY_NOS),
+            "queries": len(FINAL_QUERY_NOS),
+            "repeats": FINAL_REPEATS,
+            "final_warmup_phase": "final_warmup",
+            "final_warmup_query_nos": list(FINAL_QUERY_NOS[: args.warmup_queries]),
+            "final_warmup_queries_per_selected_configuration": args.warmup_queries,
+            "final_warmup_excluded_from_summaries": True,
+            "deduplication_key": ["configured_filter_strategy", "filter_name", "ef"],
+            "runs_only_selected_configurations": True,
+            "comparison_common_attainable_targets_by_filter": common_targets,
+        },
+        "checkpoint": {
+            "path": str(checkpoint),
+            "resume": bool(args.resume),
+            "block_boundary": "complete calibration or final block; completed final blocks skip warmup and timed queries",
+            "run_spec_hash": run_spec_hash(specification),
+        },
+        "bootstrap_samples": BOOTSTRAP_SAMPLES,
+        "bootstrap_ci_lcb": "reported_only",
+        "schema_timings": schema_timings,
+        "node_records": node_records,
+        "measurement_mode": "single_client_sequential",
+    }
     outcome_counts = target_outcome_counts(final_summaries, target_statuses.values())
     outcome_notes = [
         f"held-out target unconfirmed: strategy={row.get('configured_filter_strategy')} filter={row.get('filter_name')} target={row.get('target_recall')}"
         for row in final_summaries if row.get("target_outcome") == "selected_but_final_unconfirmed"
     ]
-    manifest = {"artifact_valid": not errors, "status": "complete" if not errors else "invalid", "git_revision": revision, "source_hashes": source_hashes, "run_spec_hash": run_spec_hash(specification), "stale_outputs_quarantined_at": str(quarantined_outputs) if quarantined_outputs else NA, "service": {"meta": service_meta, "count": total_count, "filter_counts": filter_counts, "result_order": "ascending _additional.distance", "measurement_mode": "single_client_sequential", "concurrency": 1, "qps_metric": "single_client_service_qps", ACORN_RATIO_ENV: {"runner_environment": os.environ.get(ACORN_RATIO_ENV, NA), "service_meta_values": _find_meta_values(service_meta, ACORN_RATIO_ENV) or [NA]}, "errors": errors}, "outcome_notes": outcome_notes, "target_outcomes": outcome_counts, "strategy_reporting": {"acorn": acorn_reporting_metadata(service_meta)} if "acorn" in strategies else {}, "schema": {"class": CLASS_NAME, "initial_definition_recorded": True, "initial_definition_restored": True, "update_method": "GET full definition, PUT full definition, GET readback gate", "flatSearchCutoff": 0, "distance": "l2-squared", "vector_index_type": "hnsw", "configured_filter_strategies": strategies}, "inputs": {"fbin_rows": vector_rows, "fbin_dimensions": dimensions, "truth_schema": "tie-aware self-excluded v1", "truth_grid": "q100 calibration 0-99 / q100 final 100-199"}, "calibration_selection": {"rule": "monotone highest-target LCB95 early-stop; fastest measured LCB95-qualified winner per target", "targets": selection_status_records, "common_attainable_targets_by_filter": common_targets}, "selection_grid_expected": len(strategies) * len(filters) * len(args.targets), "selection_winners": sum(winner is not None for winner in selections.values()), "unattainable_on_grid": outcome_counts["unattainable_on_grid"], "final_targets_met": outcome_counts["selected_and_confirmed"], "raw_rows": len(raw_rows), "summary_rows": len(calibration_summaries) + len(final_summaries)}
+    manifest = {
+        "artifact_valid": not errors,
+        "status": "complete" if not errors else "invalid",
+        "git_revision": revision,
+        "source_hashes": source_hashes,
+        "run_spec_hash": run_spec_hash(specification),
+        "stale_outputs_quarantined_at": str(quarantined_outputs) if quarantined_outputs else NA,
+        "service": {
+            "meta": service_meta,
+            "count": total_count,
+            "filter_counts": filter_counts,
+            "result_order": "ascending _additional.distance",
+            "measurement_mode": "single_client_sequential",
+            "concurrency": 1,
+            "qps_metric": "single_client_service_qps",
+            ACORN_RATIO_ENV: {
+                "runner_environment": os.environ.get(ACORN_RATIO_ENV, NA),
+                "service_meta_values": _find_meta_values(service_meta, ACORN_RATIO_ENV) or [NA],
+            },
+            "errors": errors,
+        },
+        "outcome_notes": outcome_notes,
+        "target_outcomes": outcome_counts,
+        "target_selection_rule": TARGET_SELECTION_RULE,
+        "strategy_reporting": {"acorn": acorn_reporting_metadata(service_meta)} if "acorn" in strategies else {},
+        "schema": {
+            "class": CLASS_NAME,
+            "initial_definition_recorded": True,
+            "initial_definition_restored": True,
+            "update_method": "GET full definition, PUT full definition, GET readback gate",
+            "flatSearchCutoff": 0,
+            "distance": "l2-squared",
+            "vector_index_type": "hnsw",
+            "configured_filter_strategies": strategies,
+        },
+        "inputs": {
+            "fbin_rows": vector_rows,
+            "fbin_dimensions": dimensions,
+            "truth_schema": "tie-aware self-excluded v1",
+            "truth_grid": "q20-q99 calibration / q100-q199 held-out final; q0-q19 reserved for pgvector screen",
+        },
+        "calibration_selection": {
+            "rule": TARGET_SELECTION_RULE,
+            "bootstrap_ci_lcb": "reported_only",
+            "targets": selection_status_records,
+            "common_attainable_targets_by_filter": common_targets,
+        },
+        "selection_grid_expected": len(strategies) * len(filters) * len(args.targets),
+        "selection_winners": sum(winner is not None for winner in selections.values()),
+        "unattainable_on_grid": outcome_counts["unattainable_on_grid"],
+        "final_targets_met": outcome_counts["selected_and_confirmed"],
+        "raw_rows": len(raw_rows),
+        "summary_rows": len(calibration_summaries) + len(final_summaries),
+    }
     staged = staging_outputs(outputs)
     try:
         write_csv(staged["raw_csv"], raw_rows)

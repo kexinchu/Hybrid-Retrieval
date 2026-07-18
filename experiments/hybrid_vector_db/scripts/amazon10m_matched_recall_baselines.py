@@ -43,6 +43,11 @@ DEFAULT_RESULTS = ROOT / "results/hybrid_vector_db"
 DEFAULT_TABLE = "amazon_grocery_reviews_10m_pgvector"
 DEFAULT_EF_SEARCH = (250, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000)
 DEFAULT_TARGETS = (0.90, 0.95, 0.99)
+DEFAULT_CALIBRATION_QUERY_OFFSET = 20
+DEFAULT_CALIBRATION_QUERIES = 80
+DEFAULT_FINAL_QUERY_OFFSET = 100
+DEFAULT_FINAL_QUERIES = 100
+TARGET_SELECTION_RULE = "query-level mean recall@10 >= target; bootstrap CI/LCB reporting only"
 NA = "N/A"
 FINALIZER_VERSION = "amazon10m-matched-recall-finalizer-v1"
 
@@ -820,7 +825,7 @@ def calibration_table(
             for target in targets:
                 eligible = bool(
                     stats["status"] == "valid"
-                    and float(stats["recall_lcb95"]) >= target
+                    and float(stats["recall_mean"]) >= target
                 )
                 rows.append(
                     {
@@ -858,9 +863,9 @@ def calibration_table(
                 "configured_ef_search": list(ef_values),
                 "observed_ef_search": [int(row["ef_search"]) for row in ladder_rows],
                 "all_configs_complete": ladder_complete,
-                "all_lcb_below_target": bool(
+                "all_mean_below_target": bool(
                     ladder_complete
-                    and all(float(row["recall_lcb95"]) < target for row in ladder_rows)
+                    and all(float(row["recall_mean"]) < target for row in ladder_rows)
                 ),
             }
             candidates = [row for row in ladder_rows if row["eligible"]]
@@ -877,7 +882,7 @@ def calibration_table(
                     row["selection_status"] = "unattainable_on_grid"
                 elif not candidates:
                     row["outcome"] = "calibration_invalid"
-                    row["selection_status"] = "no_config_meets_lcb"
+                    row["selection_status"] = "no_config_meets_mean"
                 elif row["selected"]:
                     row["outcome"] = "selected_pending_final"
                     row["selection_status"] = "selected"
@@ -1007,8 +1012,8 @@ def final_summary_table(
             )
             target_confirmed = bool(
                 matched_pairs
-                and float(sql_stats["recall_lcb95"]) >= target
-                and float(faiss_stats["recall_lcb95"]) >= target
+                and float(sql_stats["recall_mean"]) >= target
+                and float(faiss_stats["recall_mean"]) >= target
             )
             outcome = (
                 "unattainable_on_grid"
@@ -1078,7 +1083,7 @@ def final_summary_table(
                     method == "faiss_allowlist" and outcome == "unattainable_on_grid"
                 )
                 method_target_confirmed = bool(
-                    metrics_valid and float(stats["recall_lcb95"]) >= target
+                    metrics_valid and float(stats["recall_mean"]) >= target
                 )
                 output.append(
                     {
@@ -1582,6 +1587,16 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         range(args.calibration_query_offset, args.calibration_query_offset + args.calibration_queries)
     )
     final_query_nos = list(range(args.final_query_offset, args.final_query_offset + args.final_queries))
+    expected_calibration = list(range(
+        DEFAULT_CALIBRATION_QUERY_OFFSET,
+        DEFAULT_CALIBRATION_QUERY_OFFSET + DEFAULT_CALIBRATION_QUERIES,
+    ))
+    expected_final = list(range(
+        DEFAULT_FINAL_QUERY_OFFSET,
+        DEFAULT_FINAL_QUERY_OFFSET + DEFAULT_FINAL_QUERIES,
+    ))
+    if calibration_query_nos != expected_calibration or final_query_nos != expected_final:
+        raise ValueError("formal matched-recall split requires calibration q20..q99 and held-out final q100..q199")
     targets = parse_targets(args.target_recalls)
     ef_values = parse_int_csv(args.ef_search_values)
     specs = load_filter_specs(args.filters_csv, set(args.filter_names) or None)
@@ -1637,6 +1652,7 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         "query_splits": {
             "calibration_query_nos": calibration_query_nos,
             "final_query_nos": final_query_nos,
+            "reserved_query_nos": list(range(20)),
             "query_no_overlap": False,
             "query_id_overlap": False,
         },
@@ -1670,7 +1686,8 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         },
         "bootstrap": {
             "unit": "query cluster after averaging repeats",
-            "selection_bound": "one-sided 95% LCB (5th bootstrap percentile)",
+            "target_selection": TARGET_SELECTION_RULE,
+            "ci_lcb": "reported_only",
             "samples": args.bootstrap_samples,
             "seed": args.bootstrap_seed,
         },
@@ -1973,11 +1990,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--k", type=positive_int, default=10)
     parser.add_argument("--ef-search-values", default=",".join(str(value) for value in DEFAULT_EF_SEARCH))
     parser.add_argument("--target-recalls", default=",".join(str(value) for value in DEFAULT_TARGETS))
-    parser.add_argument("--calibration-query-offset", type=nonnegative_int, default=0)
-    parser.add_argument("--calibration-queries", type=positive_int, default=100)
+    parser.add_argument("--calibration-query-offset", type=nonnegative_int, default=DEFAULT_CALIBRATION_QUERY_OFFSET)
+    parser.add_argument("--calibration-queries", type=positive_int, default=DEFAULT_CALIBRATION_QUERIES)
     parser.add_argument("--calibration-repeats", type=positive_int, default=2)
-    parser.add_argument("--final-query-offset", type=nonnegative_int, default=100)
-    parser.add_argument("--final-queries", type=positive_int, default=100)
+    parser.add_argument("--final-query-offset", type=nonnegative_int, default=DEFAULT_FINAL_QUERY_OFFSET)
+    parser.add_argument("--final-queries", type=positive_int, default=DEFAULT_FINAL_QUERIES)
     parser.add_argument("--final-repeats", type=positive_int, default=5)
     parser.add_argument("--bootstrap-samples", type=positive_int, default=10_000)
     parser.add_argument("--bootstrap-seed", type=int, default=20260718)

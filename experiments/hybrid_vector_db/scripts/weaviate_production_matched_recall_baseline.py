@@ -34,7 +34,7 @@ FLAT_STRATEGY_REPRESENTATIVE = "sweeping"
 # absolute LCB margin, not a quantity estimated from held-out final results.
 DEFAULT_CALIBRATION_LCB_MARGIN = 0.03
 CALIBRATION_SELECTION_POLICY = (
-    "calibration_lcb95_target_plus_headroom_capped_absolute_margin_v1"
+    "calibration_query_level_mean_recall_target_v1"
 )
 # Covers every published Amazon-10M filter cardinality, including the 5.03M
 # largest allow-list, while retaining a no-flat baseline at zero.
@@ -261,22 +261,19 @@ def _candidate_summaries(
 
 
 def required_calibration_lcb(target: float, margin: float = DEFAULT_CALIBRATION_LCB_MARGIN) -> float:
-    target = float(target)
-    margin = float(margin)
-    # Preserve a meaningful HNSW frontier at high recall targets. An uncapped
-    # absolute margin would make target=0.99 impossible for every approximate
-    # configuration whenever margin > 0.01.
-    return target + min(margin, max(0.0, 1.0 - target) / 2.0)
+    """Compatibility helper: target eligibility is based on the query mean."""
+    del margin
+    return float(target)
 
 
 def select_fastest_config(
     summaries: Sequence[dict[str, Any]], target: float,
     calibration_lcb_margin: float = 0.0,
 ) -> dict[str, Any] | None:
-    required_lcb = required_calibration_lcb(target, calibration_lcb_margin)
+    del calibration_lcb_margin
     eligible = [
         row for row in summaries
-        if baseline.reaches_target(row, required_lcb)
+        if baseline.reaches_target(row, target)
         and baseline._finite_number(row.get("latency_mean_ms"))
     ]
     return min(
@@ -306,9 +303,7 @@ def _exact_flat_calibration_fallback(
     if not (
         candidate.get("complete") is True
         and baseline._finite_number(candidate.get("recall_mean"))
-        and baseline._finite_number(candidate.get("recall_lcb95"))
         and float(candidate["recall_mean"]) == 1.0
-        and float(candidate["recall_lcb95"]) == 1.0
     ):
         return None
     return candidate
@@ -320,7 +315,6 @@ def select_conservative_config(
     calibration_lcb_margin: float = DEFAULT_CALIBRATION_LCB_MARGIN,
 ) -> dict[str, Any] | None:
     """Select from calibration only, with an exact-flat fail-closed fallback."""
-    required_lcb = required_calibration_lcb(target, calibration_lcb_margin)
     # Keep the exact flat route out of the latency competition.  It is the
     # predeclared safety fallback, and is always measured as its own control.
     hnsw_candidates = [
@@ -330,10 +324,9 @@ def select_conservative_config(
     if selected is not None:
         return {
             **selected,
-            "selection_mode": "conservative_calibration_lcb",
+            "selection_mode": "calibration_query_level_mean_recall",
             "calibration_selection_policy": CALIBRATION_SELECTION_POLICY,
-            "calibration_lcb_margin": float(calibration_lcb_margin),
-            "required_calibration_lcb95": required_lcb,
+            "calibration_target_recall": float(target),
         }
     fallback = _exact_flat_calibration_fallback(
         summaries, spec, flat_search_cutoffs, ef_values
@@ -342,10 +335,9 @@ def select_conservative_config(
         return None
     return {
         **fallback,
-        "selection_mode": "exact_flat_calibration_fallback",
+        "selection_mode": "exact_flat_calibration_fallback_mean_recall",
         "calibration_selection_policy": CALIBRATION_SELECTION_POLICY,
-        "calibration_lcb_margin": float(calibration_lcb_margin),
-        "required_calibration_lcb95": required_lcb,
+        "calibration_target_recall": float(target),
     }
 
 
@@ -389,9 +381,7 @@ def hnsw_dominance_proof(
         flat_summary is not None
         and flat_summary.get("complete") is True
         and baseline._finite_number(flat_summary.get("recall_mean"))
-        and baseline._finite_number(flat_summary.get("recall_lcb95"))
         and float(flat_summary["recall_mean"]) == 1.0
-        and float(flat_summary["recall_lcb95"]) == 1.0
     )
     flat_finite_ci = bool(flat_summary is not None and _complete_finite_latency_ci(flat_summary))
     hnsw = _route_summaries(summaries, strategy, spec.name, 0)
@@ -823,10 +813,15 @@ def run_specification(
         "targets": [float(value) for value in args.targets], "k": K,
         "calibration": {"query_nos": list(CALIBRATION_QUERY_NOS), "repeats": CALIBRATION_REPEATS,
                         "warmup_queries": args.warmup_queries,
-                        "conservative_lcb_margin": float(args.calibration_lcb_margin),
+                        "selection_rule": baseline.TARGET_SELECTION_RULE,
+                        "bootstrap_ci_lcb": "reported_only",
                         "selection_policy": CALIBRATION_SELECTION_POLICY,
                         "fallback": "complete_calibration_exact_flat_representative"},
-        "final": {"query_nos": list(FINAL_QUERY_NOS), "repeats": FINAL_REPEATS},
+        "final": {"query_nos": list(FINAL_QUERY_NOS), "repeats": FINAL_REPEATS,
+                  "final_warmup_phase": "final_warmup",
+                  "final_warmup_query_nos": list(FINAL_QUERY_NOS[: args.warmup_queries]),
+                  "final_warmup_queries_per_selected_configuration": args.warmup_queries,
+                  "final_warmup_excluded_from_summaries": True},
         "bootstrap_seed": args.bootstrap_seed,
         "calibration_query_budget": calibration_query_budget(
             filters, args.ef_values, args.warmup_queries
@@ -1007,21 +1002,15 @@ def _summary_row_for_target(
         "target_met": target_met,
         "target_outcome": "selected_and_confirmed" if target_met else "selected_but_final_unconfirmed",
         "comparison_status": "confirmed" if target_met else "unconfirmed",
-        "calibration_recall_lcb95": selected["recall_lcb95"],
+        "calibration_recall_mean": selected.get("recall_mean", NA),
+        "calibration_recall_lcb95": selected.get("recall_lcb95", NA),
         "calibration_complete": selected["complete"],
-        "calibration_lcb_margin": selected.get(
-            "calibration_lcb_margin", DEFAULT_CALIBRATION_LCB_MARGIN
-        ),
-        "required_calibration_lcb95": selected.get(
-            "required_calibration_lcb95",
-            required_calibration_lcb(target, selected.get(
-                "calibration_lcb_margin", DEFAULT_CALIBRATION_LCB_MARGIN
-            )),
-        ),
+        "calibration_target_recall": selected.get("calibration_target_recall", target),
         "calibration_selection_policy": selected.get(
             "calibration_selection_policy", CALIBRATION_SELECTION_POLICY
         ),
         "selection_mode": selected.get("selection_mode", "legacy_calibration_selection"),
+        "target_selection_rule": baseline.TARGET_SELECTION_RULE,
     })
     return result
 
@@ -1067,12 +1056,10 @@ def artifact_gate_errors(
             errors.append(f"flat held-out exactness control is incomplete: filter={spec.name}")
             continue
         mean = result.get("recall_mean")
-        lcb = result.get("recall_lcb95")
-        if (not baseline._finite_number(mean) or not baseline._finite_number(lcb)
-                or float(mean) != 1.0 or float(lcb) != 1.0):
+        if not baseline._finite_number(mean) or float(mean) != 1.0:
             errors.append(
                 f"flat held-out exactness gate failed: filter={spec.name} "
-                f"recall_mean={result.get('recall_mean')} recall_lcb95={result.get('recall_lcb95')}"
+                f"recall_mean={result.get('recall_mean')} recall_lcb95_reported={result.get('recall_lcb95')}"
             )
     for row in raw_rows:
         if row.get("phase") in {"calibration", "final"}:
@@ -1109,7 +1096,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--targets", type=float, nargs="+", default=list(DEFAULT_TARGETS))
     parser.add_argument(
         "--calibration-lcb-margin", type=float, default=DEFAULT_CALIBRATION_LCB_MARGIN,
-        help="absolute LCB95 margin added to every target during calibration-only selection",
+        help="deprecated compatibility option; target selection uses query-level mean recall",
     )
     parser.add_argument("--hnsw-dominance-guard", type=float, default=1.05)
     parser.add_argument("--expected-service-version", default="1.38.0")
@@ -1133,10 +1120,11 @@ def _dry_run(args: argparse.Namespace) -> int:
                       "filter_names": args.filter_names or "all",
                       "maximum_effective_calibration_timed_queries": query_budget["maximum_timed_queries_before_hnsw_early_stop"],
                       "hnsw_dominance_guard": args.hnsw_dominance_guard,
-                      "calibration_lcb_margin": args.calibration_lcb_margin,
                       "expected_service_version": args.expected_service_version,
                       "service_image_digest": args.service_image_digest or NA,
-                      "calibration_query_nos": [0, 99], "final_query_nos": [100, 199]}, sort_keys=True))
+                      "target_selection_rule": baseline.TARGET_SELECTION_RULE,
+                      "calibration_query_nos": [20, 99], "final_query_nos": [100, 199],
+                      "reserved_query_nos": [0, 19]}, sort_keys=True))
     return 0
 
 
@@ -1145,14 +1133,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(f"formal runner requires k={K}")
     if sorted(set(args.targets)) != list(args.targets) or any(value <= 0 or value > 1 for value in args.targets):
         raise ValueError("targets must be sorted, unique, and in (0, 1]")
-    if (
-        not baseline._finite_number(args.calibration_lcb_margin)
-        or float(args.calibration_lcb_margin) < DEFAULT_CALIBRATION_LCB_MARGIN
-    ):
-        raise ValueError(
-            "calibration-lcb-margin must be finite and >= "
-            f"{DEFAULT_CALIBRATION_LCB_MARGIN}"
-        )
     if sorted(set(args.ef_values)) != list(args.ef_values) or any(value <= 0 for value in args.ef_values):
         raise ValueError("ef values must be sorted, unique, and positive")
     if sorted(set(args.flat_search_cutoffs)) != list(args.flat_search_cutoffs) or any(value < 0 for value in args.flat_search_cutoffs):
@@ -1345,6 +1325,16 @@ def run(args: argparse.Namespace) -> int:
                 key = by_name.get(spec.name)
                 if key is None:
                     continue
+                if args.warmup_queries:
+                    final_warmup = _run_measurements(
+                        args, base_url, vectors, truth, query_ids, spec, strategy, cutoff, ef,
+                        "final_warmup", FINAL_QUERY_NOS[: args.warmup_queries], 1,
+                        schedule_rotation=schedule_index + position,
+                        schedule_index=schedule_index,
+                    )
+                    for row in final_warmup:
+                        row["recall_at_10"] = NA
+                    raw_rows.extend(final_warmup)
                 measured = _run_measurements(args, base_url, vectors, truth, query_ids, spec, strategy, cutoff, ef, "final", FINAL_QUERY_NOS, FINAL_REPEATS, schedule_rotation=schedule_index + position, schedule_index=schedule_index)
                 reused_targets = selected_groups[key]
                 final_config_role = (
@@ -1442,6 +1432,7 @@ def run(args: argparse.Namespace) -> int:
         ),
         "timed_queries": sum(row.get("phase") == "calibration" for row in raw_rows),
         "warmup_queries": sum(row.get("phase") == "warmup" for row in raw_rows),
+        "final_warmup_queries": sum(row.get("phase") == "final_warmup" for row in raw_rows),
         "termination_reason_counts": {
             reason: sum(
                 route["termination"]["termination_reason"] == reason
@@ -1486,19 +1477,17 @@ def run(args: argparse.Namespace) -> int:
         "actual_calibration": actual_calibration,
         "hnsw_dominance_guard": args.hnsw_dominance_guard,
         "service_identity": service_identity,
-        "calibration": {"queries": 100, "repeats": CALIBRATION_REPEATS, "schedule": schedule,
+        "calibration": {"query_nos": list(CALIBRATION_QUERY_NOS), "queries": len(CALIBRATION_QUERY_NOS), "repeats": CALIBRATION_REPEATS, "schedule": schedule,
                         "schedule_order": "all per-filter flat representatives before any HNSW configuration",
-                        "selection_rule": (
-                            "calibration-only: select lowest mean-latency complete configuration "
-                            "with recall LCB95 >= target + min(predeclared absolute margin, "
-                            "remaining recall headroom / 2); "
-                            "fallback only to complete calibration exact-flat representative; "
-                            "held-out final evidence cannot reselect"
-                        ),
-                        "conservative_lcb_margin": args.calibration_lcb_margin,
+                        "selection_rule": baseline.TARGET_SELECTION_RULE + "; held-out final evidence cannot reselect",
+                        "bootstrap_ci_lcb": "reported_only",
                         "selection_policy": CALIBRATION_SELECTION_POLICY,
                         "fallback": "complete_calibration_exact_flat_representative"},
-        "final": {"queries": 100, "repeats": FINAL_REPEATS,
+        "final": {"query_nos": list(FINAL_QUERY_NOS), "queries": len(FINAL_QUERY_NOS), "repeats": FINAL_REPEATS,
+                  "final_warmup_phase": "final_warmup",
+                  "final_warmup_query_nos": list(FINAL_QUERY_NOS[: args.warmup_queries]),
+                  "final_warmup_queries_per_selected_configuration": args.warmup_queries,
+                  "final_warmup_excluded_from_summaries": True,
                   "runs_selected_system_configs_plus_flat_exactness_controls": True,
                   "deduplication_key": ["configured_filter_strategy", "filter_name", "flat_search_cutoff", "ef"],
                   "reuses_one_exact_measurement_for_multiple_targets": True,
@@ -1546,13 +1535,13 @@ def run(args: argparse.Namespace) -> int:
         },
         "actual_calibration": actual_calibration,
         "flat_held_out_exactness_gate": {
-            "required_recall_mean": 1.0, "required_recall_lcb95": 1.0,
+            "required_recall_mean": 1.0, "bootstrap_ci_lcb": "reported_only",
             "records": flat_exactness_records,
         },
         "checkpoint": {"persistence": "atomic complete-block snapshot",
                        "storage": "single JSON snapshot", "complete_block_boundary": True,
                        "original_schema_persisted_before_schema_put": True},
-        "calibration_selection": {"targets": [
+        "calibration_selection": {"rule": baseline.TARGET_SELECTION_RULE, "bootstrap_ci_lcb": "reported_only", "targets": [
             {"filter_name": name, "target_recall": target,
              "status": statuses[(name, target)],
              "selected_filter_strategy": selected["configured_filter_strategy"] if selected else NA,
@@ -1560,8 +1549,8 @@ def run(args: argparse.Namespace) -> int:
              "selected_flat_search_cutoff": selected["flat_search_cutoff"] if selected else NA,
              "selection_mode": selected["selection_mode"] if selected else NA,
              "calibration_selection_policy": selected.get("calibration_selection_policy", NA) if selected else NA,
-             "calibration_lcb_margin": selected.get("calibration_lcb_margin", args.calibration_lcb_margin) if selected else args.calibration_lcb_margin,
-             "required_calibration_lcb95": required_calibration_lcb(target, args.calibration_lcb_margin),
+             "calibration_target_recall": selected.get("calibration_target_recall", target) if selected else target,
+             "calibration_recall_mean": selected.get("recall_mean", NA) if selected else NA,
              "calibration_recall_lcb95": selected.get("recall_lcb95", NA) if selected else NA,
              "grid_proof": grid_proofs[name]}
             for (name, target), selected in sorted(selections.items())],

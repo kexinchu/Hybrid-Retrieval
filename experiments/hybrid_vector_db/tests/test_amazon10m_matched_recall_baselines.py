@@ -72,6 +72,23 @@ class Amazon10mMatchedRecallBaselineTests(unittest.TestCase):
     def test_formal_default_table_matches_the_exact_gt_and_fbin_id_space(self) -> None:
         args = build_parser().parse_args([])
         self.assertEqual(args.table, "amazon_grocery_reviews_10m_pgvector")
+        self.assertEqual(args.calibration_query_offset, 20)
+        self.assertEqual(args.calibration_queries, 80)
+        self.assertEqual(args.final_query_offset, 100)
+        self.assertEqual(args.final_queries, 100)
+
+    def test_target_eligibility_uses_query_mean_and_reports_lcb_only(self):
+        rows = [
+            measured_row("calibration", "faiss_allowlist", 20, 0, 1.0, 1.0, 100),
+            measured_row("calibration", "faiss_allowlist", 20, 1, 1.0, 0.0, 100),
+        ]
+        table, selected = calibration_table(
+            rows, [SPEC], [100], [0.5], [20], repeats=2,
+            bootstrap_samples=100, bootstrap_seed=57,
+        )
+        self.assertTrue(table[0]["eligible"])
+        self.assertEqual(selected[(SPEC.name, 0.5)], 100)
+        self.assertIn("recall_lcb95", table[0])
 
     def test_exact_sql_materializes_filter_and_excludes_hnsw_plan(self):
         sql = exact_sql("samegraph_insert", SPEC.predicate, 10)

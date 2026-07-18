@@ -186,6 +186,31 @@ def truth_entry(query_no=0, query_id=99, filter_name="f", kth=1.0, tolerance=1e-
 
 
 class WeaviateMatchedRecallBaselineTests(unittest.TestCase):
+    def test_formal_query_split_reserves_pgvector_screen(self):
+        self.assertEqual(runner.CALIBRATION_QUERY_NOS, tuple(range(20, 100)))
+        self.assertEqual(runner.FINAL_QUERY_NOS, tuple(range(100, 200)))
+        self.assertTrue(set(range(20)) not in (set(runner.CALIBRATION_QUERY_NOS), set(runner.FINAL_QUERY_NOS)))
+
+    def test_final_warmup_is_explicit_and_excluded_from_final_summary(self):
+        spec = runner.FILTERS[0]
+        args = SimpleNamespace(timeout=1.0, retries=1)
+        vectors = np.zeros((20, 2), dtype=np.float32)
+        truth = {(spec.name, 100): truth_entry(100, 19, spec.name)}
+        result = runner.QueryResult(tuple(range(10)), 1.0, 0, "", "")
+        with mock.patch.object(runner, "query_once", return_value=result), mock.patch.object(runner, "exact_squared_l2", return_value=(0.0,) * 10):
+            rows = runner._run_measurements(
+                args, "http://unused", vectors, truth, {100: 19}, spec, "acorn", 100,
+                "final_warmup", [100], 1,
+            )
+        self.assertEqual(rows[0]["phase"], "final_warmup")
+        self.assertEqual(
+            runner.summarize_configuration(
+                rows, strategy="acorn", filter_name=spec.name, ef=100,
+                query_nos=[100], repeats=1, bootstrap_seed=1, phase="final",
+            )["complete"],
+            False,
+        )
+
     def test_http_error_preserves_weaviate_response_body(self):
         failure = HTTPError(
             "http://unused/v1/graphql",
@@ -398,15 +423,15 @@ class WeaviateMatchedRecallBaselineTests(unittest.TestCase):
     def test_selection_missing_winner_is_invalid_but_final_target_miss_is_a_valid_outcome(self):
         spec = runner.FILTERS[0]
         candidates = [
-            {"ef": 100, "complete": True, "recall_lcb95": 0.91, "latency_mean_ms": 10.0},
-            {"ef": 250, "complete": True, "recall_lcb95": 0.96, "latency_mean_ms": 20.0},
+            {"ef": 100, "complete": True, "recall_mean": 0.91, "recall_lcb95": 0.50, "latency_mean_ms": 10.0},
+            {"ef": 250, "complete": True, "recall_mean": 0.96, "recall_lcb95": 0.50, "latency_mean_ms": 20.0},
         ]
         self.assertEqual(runner.select_fastest_config(candidates, 0.95)["ef"], 250)
         self.assertIsNone(runner.select_fastest_config(candidates, 0.99))
         missing_key = ("acorn", spec.name, 0.99)
         errors = runner.artifact_gate_errors(strategies=["acorn"], filters=[spec], targets=[0.99], selections={missing_key: None}, final_summaries=[], raw_rows=[])
         self.assertTrue(any("missing calibration winner" in error for error in errors))
-        winner = {"ef": 250, "complete": True, "recall_lcb95": 0.99, "latency_mean_ms": 20.0}
+        winner = {"ef": 250, "complete": True, "recall_mean": 0.99, "recall_lcb95": 0.50, "latency_mean_ms": 20.0}
         final = runner._summary_row_for_target(
             {"strategy": runner.ACORN_REPORTED_STRATEGY, "configured_filter_strategy": "acorn", "filter_name": spec.name, **winner},
             0.99, winner,
@@ -454,8 +479,8 @@ class WeaviateMatchedRecallBaselineTests(unittest.TestCase):
 
     def test_monotone_calibration_stops_pair_after_highest_target_and_keeps_fastest_low_target(self):
         candidates = [
-            {"ef": 100, "complete": True, "recall_lcb95": 0.91, "latency_mean_ms": 4.0},
-            {"ef": 250, "complete": True, "recall_lcb95": 0.99, "latency_mean_ms": 9.0},
+            {"ef": 100, "complete": True, "recall_mean": 0.91, "recall_lcb95": 0.50, "latency_mean_ms": 4.0},
+            {"ef": 250, "complete": True, "recall_mean": 0.99, "recall_lcb95": 0.50, "latency_mean_ms": 9.0},
         ]
         self.assertFalse(runner.pair_reached_highest_target(candidates[:1], 0.99))
         self.assertTrue(runner.pair_reached_highest_target(candidates, 0.99))
@@ -517,11 +542,15 @@ class WeaviateMatchedRecallBaselineTests(unittest.TestCase):
         result = runner.QueryResult(tuple(range(10)), 1.0, 0, "", "")
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(runner, "CALIBRATION_QUERY_NOS", (0,)), mock.patch.object(runner, "FINAL_QUERY_NOS", (1,)), mock.patch.object(runner, "CALIBRATION_REPEATS", 1), mock.patch.object(runner, "FINAL_REPEATS", 1):
             out = Path(tmp) / "run.csv"
-            args = runner.build_parser().parse_args(["--ef-values", "100", "250", "--targets", "0.9", "--warmup-queries", "0", "--out", str(out)])
+            args = runner.build_parser().parse_args(["--ef-values", "100", "250", "--targets", "0.9", "--warmup-queries", "1", "--out", str(out)])
             with mock.patch.object(runner, "load_filter_specs", return_value=(spec,)), mock.patch.object(runner, "read_fbin_memmap", return_value=(vectors, len(vectors), 2)), mock.patch.object(runner, "load_truth", return_value=(truth, query_ids)), mock.patch.object(runner, "sha256_file", return_value="hash"), mock.patch.object(runner, "request_json", side_effect=[(initial, 0), ({"version": "test"}, 0)]), mock.patch.object(runner, "get_ready_nodes", return_value=(ready_nodes(), 0)), mock.patch.object(runner, "graphql", side_effect=[(total, 0), (filtered, 0)]), mock.patch.object(runner, "put_hnsw_config", return_value=(initial, 0.0, 0)) as put_config, mock.patch.object(runner, "put_schema_definition", return_value=(initial, 0)), mock.patch.object(runner, "query_once", return_value=result):
                 self.assertEqual(runner.run(args), 0)
             self.assertEqual([call.args[2] for call in put_config.call_args_list], [100, 100])
             self.assertTrue(out.is_file())
+            raw_text = runner.sibling_outputs(out)["raw_csv"].read_text(encoding="utf-8")
+            summary_text = runner.sibling_outputs(out)["summary_csv"].read_text(encoding="utf-8")
+            self.assertIn("final_warmup", raw_text)
+            self.assertNotIn("final_warmup", summary_text)
             self.assertFalse(runner.checkpoint_path(out).exists())
 
     def test_acorn_reporting_records_auto_fallback_and_ratio_sources(self):
