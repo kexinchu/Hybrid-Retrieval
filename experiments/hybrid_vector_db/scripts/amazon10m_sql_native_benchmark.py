@@ -41,10 +41,8 @@ DEFAULT_EXACT_TRUTH_CSV = DEFAULT_EXACT_TRUTH_DIR / "amazon10m_sql_native_exact_
 DEFAULT_EXACT_TRUTH_MANIFEST = DEFAULT_EXACT_TRUTH_DIR / "amazon10m_sql_native_exact_truth_manifest.json"
 DEFAULT_VECTOR_TABLE = "public.amazon_grocery_reviews_10m_pgvector"
 DEFAULT_PRINCIPAL = "amazon10m_sql_native_benchmark"
-DEFAULT_SOURCE_INDEX = "public.amazon_grocery_reviews_10m_pgvector_embedding_hnsw_idx"
-DEFAULT_CLONE_INDEX = (
-    "public.amazon_grocery_reviews_10m_pgvector_hnsw_bfs_clone_idx"
-)
+DEFAULT_SOURCE_INDEX = "public.amazon10m_embedding_valid_hnsw_source_idx"
+DEFAULT_CLONE_INDEX = "public.amazon10m_embedding_valid_hnsw_bfs_clone_idx"
 # Compatibility for callers that imported the old constant. Formal artifacts use
 # source_index and clone_index explicitly.
 DEFAULT_VECTOR_INDEX = DEFAULT_SOURCE_INDEX
@@ -52,7 +50,8 @@ DEFAULT_K = 10
 DEFAULT_CANDIDATE_VALIDITY_PREDICATE = (
     exact_truth_contract.DEFAULT_CANDIDATE_VALIDITY_PREDICATE
 )
-DEFAULT_CALIBRATION_QUERIES = 100
+DEFAULT_CALIBRATION_QUERY_OFFSET = 20
+DEFAULT_CALIBRATION_QUERIES = 80
 DEFAULT_FINAL_QUERIES = 100
 DEFAULT_CALIBRATION_REPEATS = 2
 DEFAULT_FINAL_REPEATS = 5
@@ -3584,7 +3583,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--plans", type=Path, default=None)
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--k", type=positive_int, default=DEFAULT_K)
-    parser.add_argument("--calibration-query-offset", type=nonnegative_int, default=0)
+    parser.add_argument("--calibration-query-offset", type=nonnegative_int, default=DEFAULT_CALIBRATION_QUERY_OFFSET)
     parser.add_argument("--calibration-queries", type=positive_int, default=DEFAULT_CALIBRATION_QUERIES)
     parser.add_argument("--calibration-repeats", type=positive_int, default=DEFAULT_CALIBRATION_REPEATS)
     parser.add_argument("--final-query-offset", type=nonnegative_int, default=100)
@@ -3637,8 +3636,8 @@ def validate_formal_dimensions(
     problems: list[str] = []
     if len(filters) != 14 or len({spec.name for spec in filters}) != 14:
         problems.append("exactly 14 distinct registered filters are required")
-    if args.calibration_query_offset != 0 or args.calibration_queries != 100:
-        problems.append("calibration must be q100 at offset 0")
+    if args.calibration_query_offset != DEFAULT_CALIBRATION_QUERY_OFFSET or args.calibration_queries != DEFAULT_CALIBRATION_QUERIES:
+        problems.append("calibration must be q80 over q20..q99, reserving q0..q19 for screening")
     if args.final_query_offset != 100 or args.final_queries != 100:
         problems.append("final must be disjoint q100 at offset 100")
     if args.calibration_repeats != 2 or args.final_repeats != 5:
@@ -3656,7 +3655,7 @@ def print_dry_run(args: argparse.Namespace) -> None:
     print("modes=" + ",".join(MODES))
     print("guidance_claim=candidate-admission/validation; hard-traversal-pruning=false")
     print("workloads=" + ",".join(item.name for item in WORKLOADS))
-    print("calibration=q100/r2; final=q100/r5; final_queries_disjoint=true")
+    print("calibration=q80/r2 (q20..q99); final=q100/r5 (q100..q199); q0..q19_reserved=true")
     print("targets=" + ",".join(f"{target:.2f}" for target in args.targets))
     print("bootstrap_samples=" + str(args.bootstrap_samples))
     print(

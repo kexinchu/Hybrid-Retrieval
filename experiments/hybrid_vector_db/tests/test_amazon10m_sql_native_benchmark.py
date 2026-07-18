@@ -217,7 +217,8 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
 
     def test_defaults_are_formal_disjoint_q100_q100_and_r2_r5(self):
         args = benchmark.create_argument_parser().parse_args([])
-        self.assertEqual(args.calibration_queries, 100)
+        self.assertEqual(args.calibration_query_offset, 20)
+        self.assertEqual(args.calibration_queries, 80)
         self.assertEqual(args.final_queries, 100)
         self.assertEqual(args.calibration_repeats, 2)
         self.assertEqual(args.final_repeats, 5)
@@ -1098,7 +1099,7 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         run.assert_not_called()
         text = output.getvalue()
         self.assertIn("database=not_opened", text)
-        self.assertIn("calibration=q100/r2; final=q100/r5", text)
+        self.assertIn("calibration=q80/r2 (q20..q99); final=q100/r5", text)
         self.assertIn("acl_only", text)
 
     def test_manifest_contract_records_fingerprint_and_timing_fields(self):
