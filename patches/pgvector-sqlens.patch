@@ -12,7 +12,7 @@ index 821fa23..6c4cc18 100644
  RUN apt-get update && \
  		apt-mark hold locales && \
 diff --git a/Makefile b/Makefile
-index 8bedb89..7e3189c 100644
+index 8bedb89..8ccb1e8 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -4,12 +4,14 @@ EXTVERSION = 0.8.2
@@ -31,13 +31,14 @@ index 8bedb89..7e3189c 100644
  
  # To compile for portability, run: make OPTFLAGS=""
  OPTFLAGS = -march=native
-@@ -52,6 +54,24 @@ PG_CONFIG ?= pg_config
+@@ -52,6 +54,25 @@ PG_CONFIG ?= pg_config
  PGXS := $(shell $(PG_CONFIG) --pgxs)
  include $(PGXS)
  
 +SQLENS_SMOKE_SQL = \
 +	$(abspath ../../experiments/hybrid_vector_db/sql/pgvector_clone_formality_smoke.sql) \
-+	$(abspath ../../experiments/hybrid_vector_db/sql/pgvector_preferred_index_smoke.sql)
++	$(abspath ../../experiments/hybrid_vector_db/sql/pgvector_preferred_index_smoke.sql) \
++	$(abspath ../../experiments/hybrid_vector_db/sql/pgvector_epoch_writer_permissions_smoke.sql)
 +
 +.PHONY: sqlens_smoke_installcheck
 +
@@ -57,12 +58,16 @@ index 8bedb89..7e3189c 100644
  ifeq ($(PROVE),)
  	PROVE = prove
 diff --git a/sql/vector--0.8.1--0.8.2.sql b/sql/vector--0.8.1--0.8.2.sql
-index f7730a1..3d4a2d2 100644
+index f7730a1..016c2e8 100644
 --- a/sql/vector--0.8.1--0.8.2.sql
 +++ b/sql/vector--0.8.1--0.8.2.sql
-@@ -1,2 +1,23 @@
+@@ -1,2 +1,27 @@
  -- complain if script is sourced in psql, rather than via CREATE EXTENSION
  \echo Use "ALTER EXTENSION vector UPDATE TO '0.8.2'" to load this file. \quit
++
++ALTER FUNCTION vector_hnsw_fragment_epoch_bump_trigger() SECURITY DEFINER;
++ALTER FUNCTION vector_hnsw_fragment_epoch_bump_trigger()
++	SET search_path = pg_catalog, pg_temp;
 +
 +CREATE FUNCTION vector_hnsw_guidance_bind(regclass, text[], text) RETURNS boolean
 +	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
@@ -86,10 +91,10 @@ index f7730a1..3d4a2d2 100644
 +REVOKE ALL ON FUNCTION vector_hnsw_graph_compare(regclass, regclass) FROM PUBLIC;
 diff --git a/sql/vector--0.8.2.sql b/sql/vector--0.8.2.sql
 new file mode 100644
-index 0000000..30095e5
+index 0000000..789fcc4
 --- /dev/null
 +++ b/sql/vector--0.8.2.sql
-@@ -0,0 +1,1002 @@
+@@ -0,0 +1,1003 @@
 +-- complain if script is sourced in psql, rather than via CREATE EXTENSION
 +\echo Use "CREATE EXTENSION vector" to load this file. \quit
 +
@@ -232,7 +237,8 @@ index 0000000..30095e5
 +REVOKE ALL ON FUNCTION vector_hnsw_graph_compare(regclass, regclass) FROM PUBLIC;
 +
 +CREATE FUNCTION vector_hnsw_fragment_epoch_bump_trigger() RETURNS trigger
-+	AS 'MODULE_PATHNAME' LANGUAGE C;
++	AS 'MODULE_PATHNAME' LANGUAGE C SECURITY DEFINER
++	SET search_path = pg_catalog, pg_temp;
 +
 +CREATE FUNCTION vector_hnsw_fragment_tracking_enable(regclass) RETURNS int8
 +	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
@@ -1093,10 +1099,10 @@ index 0000000..30095e5
 +	FUNCTION 1 l1_distance(sparsevec, sparsevec),
 +	FUNCTION 3 hnsw_sparsevec_support(internal);
 diff --git a/sql/vector.sql b/sql/vector.sql
-index 7fc3671..30095e5 100644
+index 7fc3671..789fcc4 100644
 --- a/sql/vector.sql
 +++ b/sql/vector.sql
-@@ -102,6 +102,90 @@ CREATE FUNCTION vector_negative_inner_product(vector, vector) RETURNS float8
+@@ -102,6 +102,91 @@ CREATE FUNCTION vector_negative_inner_product(vector, vector) RETURNS float8
  CREATE FUNCTION vector_spherical_distance(vector, vector) RETURNS float8
  	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
  
@@ -1138,7 +1144,8 @@ index 7fc3671..30095e5 100644
 +REVOKE ALL ON FUNCTION vector_hnsw_graph_compare(regclass, regclass) FROM PUBLIC;
 +
 +CREATE FUNCTION vector_hnsw_fragment_epoch_bump_trigger() RETURNS trigger
-+	AS 'MODULE_PATHNAME' LANGUAGE C;
++	AS 'MODULE_PATHNAME' LANGUAGE C SECURITY DEFINER
++	SET search_path = pg_catalog, pg_temp;
 +
 +CREATE FUNCTION vector_hnsw_fragment_tracking_enable(regclass) RETURNS int8
 +	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
@@ -1188,7 +1195,7 @@ index 7fc3671..30095e5 100644
  	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
  
 diff --git a/src/hnsw.c b/src/hnsw.c
-index bfc92a1..55ae82c 100644
+index bfc92a1..3082ac9 100644
 --- a/src/hnsw.c
 +++ b/src/hnsw.c
 @@ -6,7 +6,12 @@
@@ -1455,7 +1462,7 @@ index bfc92a1..55ae82c 100644
 +							   HnswPreferredIndexAssign, NULL);
 +
 +	DefineCustomEnumVariable("hnsw.filter_strategy", "Sets predicate-aware HNSW traversal strategy",
-+							 "off preserves pgvector behavior; safe_guided is validation-only and preserves stock graph traversal; traversal_guided performs planner-proven pre-distance filtering with bounded bridge expansion and fresh-stock fallback when iterative_scan is off, and otherwise bypasses to stock; acorn1 and guided_collect are experimental heuristic modes.",
++							 "off preserves pgvector behavior; safe_guided is validation-only and preserves stock graph traversal; traversal_guided performs native graph expansion and vector distance computation followed by planner-proven predicate-aware result-heap admission and pre-heap TID suppression when iterative_scan is off, and otherwise bypasses to stock; acorn1 and guided_collect are experimental heuristic modes.",
 +							 &hnsw_filter_strategy,
 +							 HNSW_FILTER_STRATEGY_OFF, hnsw_filter_strategy_options, PGC_USERSET, 0, NULL, NULL, NULL);
 +
@@ -1464,18 +1471,18 @@ index bfc92a1..55ae82c 100644
 +							&hnsw_guided_collect_target,
 +							 100, 1, 1000000, PGC_USERSET, 0, NULL, NULL, NULL);
 +
-+	DefineCustomIntVariable("hnsw.traversal_guided_target", "Sets the minimum matching candidate batch for traversal_guided",
-+							 "A guided phase that cannot produce this many candidates before uncertainty is discarded and rerun through a fresh stock traversal.",
++	DefineCustomIntVariable("hnsw.traversal_guided_target", "Deprecated compatibility target for legacy traversal_guided search",
++							 "Retained for configuration compatibility; native candidate admission ignores this value and collects the hnsw.ef_search result batch.",
 +							 &hnsw_traversal_guided_target,
 +							 40, 1, 1000000, PGC_USERSET, 0, NULL, NULL, NULL);
 +
-+	DefineCustomIntVariable("hnsw.traversal_guided_max_bridge_hops", "Sets the maximum consecutive predicate-miss bridge hops for traversal_guided",
-+							 "Miss nodes may be expanded without vector distance only up to this level-0 hop bound.",
++	DefineCustomIntVariable("hnsw.traversal_guided_max_bridge_hops", "Deprecated compatibility limit for legacy traversal_guided bridge hops",
++							 "Retained for configuration compatibility; native candidate admission ignores this value and does not bound predicate-miss graph expansion.",
 +							 &hnsw_traversal_guided_max_bridge_hops,
 +							 2, 0, 64, PGC_USERSET, 0, NULL, NULL, NULL);
 +
-+	DefineCustomIntVariable("hnsw.traversal_guided_max_bridge_work", "Sets the maximum predicate-miss bridge work for traversal_guided",
-+							 "The bound counts expanded miss nodes and their newly discovered level-0 edges before a fresh-stock fallback.",
++	DefineCustomIntVariable("hnsw.traversal_guided_max_bridge_work", "Deprecated compatibility limit for legacy traversal_guided bridge work",
++							 "Retained for configuration compatibility; native candidate admission ignores this value and does not use bridge-work fallback.",
 +							 &hnsw_traversal_guided_max_bridge_work,
 +							 10000, 1, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
 +
@@ -1520,7 +1527,7 @@ index bfc92a1..55ae82c 100644
  	/* Never use index without order */
  	if (path->indexorderbys == NIL)
 diff --git a/src/hnsw.h b/src/hnsw.h
-index 841af0f..0dbf396 100644
+index 841af0f..7222086 100644
 --- a/src/hnsw.h
 +++ b/src/hnsw.h
 @@ -7,13 +7,17 @@
@@ -1536,7 +1543,7 @@ index 841af0f..0dbf396 100644
  #include "utils/sampling.h"
  #include "vector.h"
  
-+#define SQLENS_BUILD_ID "sqlens-v11-admission-join-safe-20260718-r6"
++#define SQLENS_BUILD_ID "sqlens-v11-admission-writer-safe-20260718-r7"
 +
  #if PG_VERSION_NUM >= 190000
  typedef Pointer Item;
@@ -6053,7 +6060,7 @@ index f4e4d82..30f0f84 100644
  		AddConnections(base, element, neighbors, lc);
  
 diff --git a/src/vector.c b/src/vector.c
-index b8c2953..b27ce4d 100644
+index b8c2953..8f13ce9 100644
 --- a/src/vector.c
 +++ b/src/vector.c
 @@ -2,26 +2,564 @@
@@ -6621,7 +6628,7 @@ index b8c2953..b27ce4d 100644
  #if PG_VERSION_NUM >= 160000
  #include "varatt.h"
  #endif
-@@ -56,6 +594,4999 @@ _PG_init(void)
+@@ -56,6 +594,5044 @@ _PG_init(void)
  	HalfvecInit();
  	HnswInit();
  	IvfflatInit();
@@ -7862,7 +7869,7 @@ index b8c2953..b27ce4d 100644
 +		"bloom_bit_count bigint NOT NULL,"
 +		"payload bytea NOT NULL,"
 +		"format_version integer NOT NULL DEFAULT 3,"
-+		"built_at timestamptz NOT NULL DEFAULT now(),"
++		"built_at timestamptz NOT NULL DEFAULT pg_catalog.now(),"
 +		"PRIMARY KEY (heap_oid, filter_name, kind)"
 +		")",
 +		false, 0);
@@ -7873,7 +7880,7 @@ index b8c2953..b27ce4d 100644
 +		"CREATE TABLE IF NOT EXISTS public.pgvector_hnsw_fragment_epoch ("
 +		"heap_oid oid PRIMARY KEY,"
 +		"epoch bigint NOT NULL DEFAULT 0,"
-+		"updated_at timestamptz NOT NULL DEFAULT now()"
++		"updated_at timestamptz NOT NULL DEFAULT pg_catalog.now()"
 +		")",
 +		false, 0);
 +	if (spiStatus != SPI_OK_UTILITY)
@@ -7920,8 +7927,19 @@ index b8c2953..b27ce4d 100644
 +				"AND t.tgname = 'pgvector_hnsw_fragment_epoch' "
 +				"AND NOT t.tgisinternal "
 +				"AND t.tgenabled IN ('O', 'A') "
-+				"AND t.tgfoid = pg_catalog.to_regprocedure("
-+				"'public.vector_hnsw_fragment_epoch_bump_trigger()') "
++				"AND EXISTS (SELECT 1 "
++				"FROM pg_catalog.pg_proc AS p "
++				"JOIN pg_catalog.pg_depend AS d ON d.objid = p.oid "
++				"AND d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass "
++				"AND d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass "
++				"AND d.deptype = 'e' "
++				"JOIN pg_catalog.pg_extension AS x ON x.oid = d.refobjid "
++				"WHERE p.oid = t.tgfoid "
++				"AND p.proname = 'vector_hnsw_fragment_epoch_bump_trigger' "
++				"AND p.pronamespace = x.extnamespace "
++				"AND p.pronargs = 0 "
++				"AND p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype "
++				"AND x.extname = 'vector') "
 +				"AND t.tgnargs = 0 "
 +				"AND t.tgqual IS NULL "
 +				"AND t.tgattr::text = '' "
@@ -7974,6 +7992,14 @@ index b8c2953..b27ce4d 100644
 +				 errmsg("vector_hnsw_fragment_epoch_bump_trigger must be called as a trigger")));
 +
 +	triggerData = (TriggerData *) fcinfo->context;
++	if (!TRIGGER_FIRED_FOR_STATEMENT(triggerData->tg_event) ||
++		!(TRIGGER_FIRED_BY_INSERT(triggerData->tg_event) ||
++		  TRIGGER_FIRED_BY_UPDATE(triggerData->tg_event) ||
++		  TRIGGER_FIRED_BY_DELETE(triggerData->tg_event) ||
++		  TRIGGER_FIRED_BY_TRUNCATE(triggerData->tg_event)))
++		ereport(ERROR,
++				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
++				 errmsg("vector_hnsw_fragment_epoch_bump_trigger requires a statement-level data-change trigger")));
 +	heapOid = RelationGetRelid(triggerData->tg_relation);
 +	values[0] = ObjectIdGetDatum(heapOid);
 +
@@ -7981,12 +8007,17 @@ index b8c2953..b27ce4d 100644
 +	if (spiStatus != SPI_OK_CONNECT)
 +		elog(ERROR, "SPI_connect failed: %d", spiStatus);
 +	spiStatus = SPI_execute_with_args(
-+		"INSERT INTO public.pgvector_hnsw_fragment_epoch (heap_oid, epoch) VALUES ($1, 1) "
-+		"ON CONFLICT (heap_oid) DO UPDATE SET epoch = "
-+		"public.pgvector_hnsw_fragment_epoch.epoch + 1, updated_at = now()",
++		"UPDATE public.pgvector_hnsw_fragment_epoch "
++		"SET epoch = epoch + 1, updated_at = pg_catalog.now() "
++		"WHERE heap_oid = $1",
 +		1, argTypes, values, nulls, false, 0);
-+	if (spiStatus != SPI_OK_INSERT && spiStatus != SPI_OK_UPDATE)
++	if (spiStatus != SPI_OK_UPDATE)
 +		elog(ERROR, "SPI_execute_with_args failed: %d", spiStatus);
++	if (SPI_processed != 1)
++		ereport(ERROR,
++				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
++				 errmsg("fragment epoch tracking is not registered for relation %u", heapOid),
++				 errhint("Call vector_hnsw_fragment_tracking_enable() before modifying the relation.")));
 +	SPI_finish();
 +
 +	PG_RETURN_POINTER(NULL);
@@ -8006,6 +8037,8 @@ index b8c2953..b27ce4d 100644
 +	char	   *relName;
 +	char	   *namespaceName;
 +	char	   *qualifiedName;
++	char	   *functionNamespaceName;
++	char	   *qualifiedTriggerFunction;
 +	StringInfoData sql;
 +	int64		epoch;
 +	bool		isnull;
@@ -8017,6 +8050,13 @@ index b8c2953..b27ce4d 100644
 +				 errmsg("relation with OID %u does not exist", heapOid)));
 +	namespaceName = get_namespace_name(get_rel_namespace(heapOid));
 +	qualifiedName = quote_qualified_identifier(namespaceName, relName);
++	functionNamespaceName = get_namespace_name(get_func_namespace(fcinfo->flinfo->fn_oid));
++	if (functionNamespaceName == NULL)
++		ereport(ERROR,
++				(errcode(ERRCODE_UNDEFINED_SCHEMA),
++				 errmsg("could not resolve the vector extension schema")));
++	qualifiedTriggerFunction = quote_qualified_identifier(functionNamespaceName,
++		"vector_hnsw_fragment_epoch_bump_trigger");
 +	HnswMetadataEnsureFragmentStore();
 +
 +	initStringInfo(&sql);
@@ -8055,8 +8095,19 @@ index b8c2953..b27ce4d 100644
 +			"AND t.tgname = 'pgvector_hnsw_fragment_epoch' "
 +			"AND NOT t.tgisinternal "
 +			"AND t.tgenabled IN ('O', 'A') "
-+			"AND t.tgfoid = pg_catalog.to_regprocedure("
-+			"'public.vector_hnsw_fragment_epoch_bump_trigger()') "
++			"AND EXISTS (SELECT 1 "
++			"FROM pg_catalog.pg_proc AS p "
++			"JOIN pg_catalog.pg_depend AS d ON d.objid = p.oid "
++			"AND d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass "
++			"AND d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass "
++			"AND d.deptype = 'e' "
++			"JOIN pg_catalog.pg_extension AS x ON x.oid = d.refobjid "
++			"WHERE p.oid = t.tgfoid "
++			"AND p.proname = 'vector_hnsw_fragment_epoch_bump_trigger' "
++			"AND p.pronamespace = x.extnamespace "
++			"AND p.pronargs = 0 "
++			"AND p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype "
++			"AND x.extname = 'vector') "
 +			"AND t.tgnargs = 0 "
 +			"AND t.tgqual IS NULL "
 +			"AND t.tgattr::text = '' "
@@ -8103,8 +8154,8 @@ index b8c2953..b27ce4d 100644
 +		appendStringInfo(&sql,
 +						 "CREATE TRIGGER pgvector_hnsw_fragment_epoch "
 +						 "AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON %s "
-+						 "FOR EACH STATEMENT EXECUTE FUNCTION public.vector_hnsw_fragment_epoch_bump_trigger()",
-+						 qualifiedName);
++						 "FOR EACH STATEMENT EXECUTE FUNCTION %s()",
++						 qualifiedName, qualifiedTriggerFunction);
 +		spiStatus = SPI_connect();
 +		if (spiStatus != SPI_OK_CONNECT)
 +			elog(ERROR, "SPI_connect failed: %d", spiStatus);
@@ -8121,7 +8172,7 @@ index b8c2953..b27ce4d 100644
 +			elog(ERROR, "SPI_connect failed: %d", spiStatus);
 +		spiStatus = SPI_execute_with_args(
 +			"UPDATE public.pgvector_hnsw_fragment_epoch "
-+			"SET epoch = epoch + 1, updated_at = now() "
++			"SET epoch = epoch + 1, updated_at = pg_catalog.now() "
 +			"WHERE heap_oid = $1 RETURNING epoch",
 +			1, argTypes, values, nulls, false, 1);
 +		if (spiStatus != SPI_OK_UPDATE_RETURNING || SPI_processed != 1)
@@ -8135,6 +8186,7 @@ index b8c2953..b27ce4d 100644
 +
 +	CommandCounterIncrement();
 +	pfree(qualifiedName);
++	pfree(qualifiedTriggerFunction);
 +	PG_RETURN_INT64(epoch);
 +}
 +
@@ -8351,7 +8403,7 @@ index b8c2953..b27ce4d 100644
 +		"build_epoch = EXCLUDED.build_epoch,"
 +		"relfilenode = EXCLUDED.relfilenode,"
 +		"format_version = EXCLUDED.format_version,"
-+		"built_at = now() "
++		"built_at = pg_catalog.now() "
 +		"WHERE pgvector_hnsw_fragment_store.relfilenode <> EXCLUDED.relfilenode "
 +		"OR pgvector_hnsw_fragment_store.build_epoch <= EXCLUDED.build_epoch",
 +		10, argTypes, values, nulls, false, 0);
