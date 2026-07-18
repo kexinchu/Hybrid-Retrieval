@@ -6,11 +6,16 @@ HNSW_SOURCE = ROOT / "third_party/pgvector-sqlens/src/hnsw.c"
 SMOKE_SQL = ROOT / "experiments/hybrid_vector_db/sql/pgvector_traversal_guidance_binding_smoke.sql"
 
 
-def test_traversal_guided_guc_help_describes_candidate_admission() -> None:
+def test_traversal_guided_guc_help_separates_default_validation_from_prioritization() -> None:
     source = HNSW_SOURCE.read_text(encoding="utf-8")
 
     assert "native graph expansion and vector distance computation followed by" in source
     assert "predicate-aware result-heap admission and pre-heap TID suppression" in source
+    assert "hnsw.traversal_guided_prioritization=false" in source
+    assert "distance-ordered candidate-admission/validation-only traversal" in source
+    assert "true enables bounded approximate layer-0 traversal prioritization" in source
+    assert "The default false retains distance-ordered candidate-admission/validation-only behavior" in source
+    assert "keeps predicate-NO nodes as expandable graph bridges" in source
     assert "pre-distance filtering" not in source
     assert "bounded bridge expansion" not in source
 

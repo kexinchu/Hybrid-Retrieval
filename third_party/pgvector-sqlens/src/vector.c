@@ -656,8 +656,10 @@ HnswTraversalFinalPathName(HnswTraversalFinalPath path)
 			return "validation_only";
 		case HNSW_TRAVERSAL_PATH_LEGACY_GUIDED:
 			return "legacy_guided";
-		case HNSW_TRAVERSAL_PATH_GUIDED:
-			return "guided";
+		case HNSW_TRAVERSAL_PATH_CANDIDATE_ADMISSION:
+			return "candidate_admission_validation_only";
+		case HNSW_TRAVERSAL_PATH_APPROXIMATE_PRIORITIZATION:
+			return "approximate_traversal_prioritization";
 		case HNSW_TRAVERSAL_PATH_STOCK_BYPASS:
 			return "stock_bypass";
 		case HNSW_TRAVERSAL_PATH_FRESH_STOCK_FALLBACK:
@@ -683,6 +685,43 @@ HnswTraversalStockBypassReasonName(HnswTraversalStockBypassReason reason)
 			return "iterative_scan";
 	}
 	return "unknown";
+}
+
+static const char *
+HnswTraversalAdmissionReasonName(HnswTraversalAdmissionReason reason)
+{
+	switch (reason)
+	{
+		case HNSW_TRAVERSAL_ADMISSION_NOT_REQUESTED:
+			return "not_requested";
+		case HNSW_TRAVERSAL_ADMISSION_NO_PROVEN_GUIDE:
+			return "no_proven_guide";
+		case HNSW_TRAVERSAL_ADMISSION_ITERATIVE_SCAN:
+			return "iterative_scan";
+		case HNSW_TRAVERSAL_ADMISSION_SKIP_ESTIMATE_UNAVAILABLE:
+			return "skip_estimate_unavailable";
+		case HNSW_TRAVERSAL_ADMISSION_LOW_ESTIMATED_SKIP_RATE:
+			return "low_estimated_skip_rate";
+		case HNSW_TRAVERSAL_ADMISSION_DEFAULT_VALIDATION_ONLY:
+			return "default_candidate_admission_validation_only";
+		case HNSW_TRAVERSAL_ADMISSION_ADMITTED:
+			return "planner_proven_guidance_and_explicit_guc";
+	}
+	return "unknown";
+}
+
+static const char *
+HnswTraversalGuidanceScopeName(HnswTraversalFinalPath path)
+{
+	if (path == HNSW_TRAVERSAL_PATH_APPROXIMATE_PRIORITIZATION)
+		return "approximate_traversal_prioritization_and_candidate_admission";
+	if (path == HNSW_TRAVERSAL_PATH_CANDIDATE_ADMISSION)
+		return "candidate_admission_and_pre_heap_tid_validation";
+	if (path == HNSW_TRAVERSAL_PATH_VALIDATION_ONLY)
+		return "pre_heap_tid_validation";
+	if (path == HNSW_TRAVERSAL_PATH_LEGACY_GUIDED)
+		return "legacy_experimental_guidance";
+	return "none";
 }
 
 static const char *
@@ -766,6 +805,7 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 	appendStringInfo(output,
 					"{\"valid\":%s,"
 					"\"profile_semantics_version\":7,"
+					"\"traversal_prioritization_semantics_version\":1,"
 					"\"total_scan_ms\":%.6f,"
 					"\"hnsw_search_ms\":%.6f,"
 					"\"heap_fetch_ms\":%.6f,"
@@ -778,6 +818,10 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 					"\"graph_elements_visited\":" INT64_FORMAT ","
 					"\"raw_index_tids_returned\":" INT64_FORMAT ","
 					"\"distance_compute_count\":" INT64_FORMAT ","
+					"\"expanded_nodes\":" INT64_FORMAT ","
+					"\"distance_computations\":" INT64_FORMAT ","
+					"\"expanded_nodes_scope\":\"layer0_total_including_fresh_fallback\","
+					"\"distance_computations_scope\":\"all_hnsw_layers_total_including_fresh_fallback\","
 					"\"page_access_batches\":" INT64_FORMAT ","
 					"\"page_access_candidates\":" INT64_FORMAT ","
 					"\"page_access_prefetches\":" INT64_FORMAT ","
@@ -796,6 +840,16 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 						"\"neighbor_expansion_guidance_misses\":" INT64_FORMAT ","
 						"\"traversal_matching_expanded\":" INT64_FORMAT ","
 						"\"traversal_bridge_expanded\":" INT64_FORMAT ","
+						"\"match_frontier_pops\":" INT64_FORMAT ","
+						"\"no_bridge_frontier_pops\":" INT64_FORMAT ","
+						"\"no_bridge_deferred\":" INT64_FORMAT ","
+						"\"max_no_bridge_debt\":" INT64_FORMAT ","
+						"\"no_bridge_expansions\":" INT64_FORMAT ","
+						"\"no_bridge_expansions_scope\":\"approximate_prioritization_layer0_predicate_no_frontier_pops\","
+						"\"dual_frontier_termination_checks\":" INT64_FORMAT ","
+						"\"dual_frontier_termination_checks_with_both\":" INT64_FORMAT ","
+						"\"dual_frontier_terminations\":" INT64_FORMAT ","
+						"\"dual_frontier_terminations_with_both\":" INT64_FORMAT ","
 						"\"traversal_candidate_admissions\":" INT64_FORMAT ","
 						"\"traversal_result_admissions\":" INT64_FORMAT ","
 						"\"traversal_guided_admissions\":" INT64_FORMAT ","
@@ -845,6 +899,8 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 					profile->visitedTuples,
 					profile->returnedTuples,
 					profile->distanceComputations,
+					profile->traversal.expandedNodes,
+					profile->distanceComputations,
 					profile->pageAccessBatches,
 					profile->pageAccessCandidates,
 					profile->pageAccessPrefetches,
@@ -863,6 +919,15 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 						profile->traversal.neighborGuidanceMisses,
 						profile->traversal.matchingExpanded,
 						profile->traversal.bridgeExpanded,
+						profile->traversal.matchFrontierPops,
+						profile->traversal.noBridgeFrontierPops,
+						profile->traversal.noBridgeDeferred,
+						profile->traversal.maxNoBridgeDebt,
+						profile->traversal.noBridgeExpansions,
+						profile->traversal.dualFrontierTerminationChecks,
+						profile->traversal.dualFrontierTerminationChecksWithBoth,
+						profile->traversal.dualFrontierTerminations,
+						profile->traversal.dualFrontierTerminationsWithBoth,
 						profile->traversal.candidateAdmissions,
 						profile->traversal.resultAdmissions,
 						profile->traversal.guidedAdmissions,
@@ -939,6 +1004,7 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 					",\"stock_phase_distance_computations\":" INT64_FORMAT
 					",\"stock_bypass_requests\":" INT64_FORMAT
 					",\"stock_bypass_reason\":\"%s\""
+					",\"traversal_admission_reason\":\"%s\""
 					",\"fallback_requests\":" INT64_FORMAT
 					",\"fallback_reason\":\"%s\""
 						",\"fallback_stock_expanded_nodes\":" INT64_FORMAT
@@ -947,11 +1013,15 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 						",\"net_distance_saved\":" INT64_FORMAT
 						",\"traversal_estimated_skip_rate_valid\":%s"
 						",\"traversal_estimated_skip_rate\":%.6f"
+						",\"traversal_prioritization_burst\":%d"
 						",\"iterative_scan\":\"%s\""
 						",\"filter_strategy\":\"%s\""
-						",\"traversal_guidance_scope\":\"candidate_admission_and_validation\""
+						",\"traversal_guidance_scope\":\"%s\""
 						",\"graph_expansion_pruned\":false"
 						",\"distance_computations_pruned\":false"
+						",\"approximate_prioritization_attempted\":%s"
+						",\"traversal_order_changed\":%s"
+						",\"approximate_ann_path\":%s"
 						",\"final_path\":\"%s\""
 					",\"planner_proof_attempted\":%s"
 					",\"planner_proof_succeeded\":%s"
@@ -996,6 +1066,8 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 					profile->traversal.stockBypassRequests,
 					HnswTraversalStockBypassReasonName(
 						profile->traversalStockBypassReason),
+					HnswTraversalAdmissionReasonName(
+						profile->traversalAdmissionReason),
 					profile->traversal.fallbackRequests,
 					HnswTraversalFallbackReasonName(
 						profile->traversalFallbackReason),
@@ -1006,8 +1078,20 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 						HnswTraversalNetDistanceSaved(profile),
 						profile->traversalEstimatedSkipRateValid ? "true" : "false",
 						profile->traversalEstimatedSkipRate,
+						profile->traversalPrioritizationBurst,
 						HnswIterativeScanModeName(profile->iterativeScan),
 						HnswFilterStrategyModeName(profile->filterStrategy),
+						HnswTraversalGuidanceScopeName(
+							profile->traversalFinalPath),
+						(profile->traversal.matchFrontierPops > 0 ||
+						 profile->traversal.noBridgeFrontierPops > 0) ?
+							"true" : "false",
+						profile->traversalFinalPath ==
+							HNSW_TRAVERSAL_PATH_APPROXIMATE_PRIORITIZATION ?
+							"true" : "false",
+						profile->traversalFinalPath ==
+							HNSW_TRAVERSAL_PATH_APPROXIMATE_PRIORITIZATION ?
+							"true" : "false",
 						HnswTraversalFinalPathName(profile->traversalFinalPath),
 					profile->plannerProof.attempted ? "true" : "false",
 					profile->plannerProof.succeeded ? "true" : "false",

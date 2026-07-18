@@ -1,0 +1,226 @@
+SET enable_seqscan = off;
+SET enable_sort = off;
+SET hnsw.ef_search = 16;
+SET hnsw.iterative_scan = off;
+SET hnsw.page_access = off;
+SET hnsw.index_page_access = off;
+SET hnsw.traversal_guided_min_skip_rate = 0;
+
+SELECT vector_sqlens_build_id() LIKE
+       'sqlens-v12-dual-frontier-prioritization-%' AS r11_loaded;
+SHOW hnsw.traversal_guided_prioritization;
+SHOW hnsw.traversal_guided_burst;
+SET hnsw.traversal_guided_burst = 0;
+SET hnsw.traversal_guided_burst = 1025;
+SET hnsw.traversal_guided_burst = 1;
+
+CREATE TABLE hnsw_traversal_priority_t (
+    id integer PRIMARY KEY,
+    eligible boolean NOT NULL,
+    val vector(2) NOT NULL
+);
+INSERT INTO hnsw_traversal_priority_t
+SELECT i,
+       i % 3 = 0,
+       ARRAY[
+           (((i * 37) % 997)::double precision + i / 100000.0)::real,
+           (((i * 97) % 991)::double precision + i / 70000.0)::real
+       ]::vector
+FROM generate_series(1, 768) AS rows(i);
+SET hnsw.build_seed = 57;
+CREATE INDEX hnsw_traversal_priority_idx
+ON hnsw_traversal_priority_t USING hnsw (val vector_l2_ops)
+WITH (m = 8, ef_construction = 80);
+ANALYZE hnsw_traversal_priority_t;
+SELECT vector_hnsw_fragment_tracking_enable(
+    'hnsw_traversal_priority_t'::regclass
+) IS NOT NULL AS tracking_enabled;
+
+CREATE TEMP TABLE hnsw_traversal_observed (
+    ordinal bigserial,
+    mode text NOT NULL,
+    id integer NOT NULL,
+    distance double precision NOT NULL
+);
+CREATE TEMP TABLE hnsw_traversal_profiles (
+    mode text PRIMARY KEY,
+    profile jsonb NOT NULL
+);
+
+SET hnsw.filter_strategy = off;
+SET hnsw.traversal_guided_prioritization = off;
+SELECT vector_hnsw_guidance_reset();
+SELECT vector_hnsw_reset_scan_profile();
+INSERT INTO hnsw_traversal_observed (mode, id, distance)
+SELECT 'stock', id, distance
+FROM (
+    SELECT id, val <-> '[500,500]'::vector AS distance
+    FROM hnsw_traversal_priority_t
+    WHERE eligible
+    ORDER BY val <-> '[500,500]'::vector
+    LIMIT 10
+) AS stock;
+INSERT INTO hnsw_traversal_profiles
+VALUES ('stock', vector_hnsw_last_scan_profile()::jsonb);
+
+SELECT vector_hnsw_guidance_activate(
+    'hnsw_traversal_priority_idx'::regclass,
+    ARRAY['exact:sql:eligible'],
+    'exact'
+) AS activated_atoms;
+SET hnsw.filter_strategy = traversal_guided;
+SET hnsw.traversal_guided_prioritization = off;
+SELECT vector_hnsw_reset_scan_profile();
+INSERT INTO hnsw_traversal_observed (mode, id, distance)
+SELECT 'validation_only', id, distance
+FROM (
+    SELECT id, val <-> '[500,500]'::vector AS distance
+    FROM hnsw_traversal_priority_t
+    WHERE (SELECT vector_hnsw_guidance_bind(
+               'hnsw_traversal_priority_idx'::regclass,
+               ARRAY['exact:sql:eligible'],
+               'exact'
+           ) OFFSET 0)
+      AND eligible
+    ORDER BY val <-> '[500,500]'::vector
+    LIMIT 10
+) AS validation_only;
+INSERT INTO hnsw_traversal_profiles
+VALUES ('validation_only', vector_hnsw_last_scan_profile()::jsonb);
+
+SET hnsw.traversal_guided_prioritization = on;
+SELECT vector_hnsw_reset_scan_profile();
+INSERT INTO hnsw_traversal_observed (mode, id, distance)
+SELECT 'prioritized', id, distance
+FROM (
+    SELECT id, val <-> '[500,500]'::vector AS distance
+    FROM hnsw_traversal_priority_t
+    WHERE (SELECT vector_hnsw_guidance_bind(
+               'hnsw_traversal_priority_idx'::regclass,
+               ARRAY['exact:sql:eligible'],
+               'exact'
+           ) OFFSET 0)
+      AND eligible
+    ORDER BY val <-> '[500,500]'::vector
+    LIMIT 10
+) AS prioritized;
+INSERT INTO hnsw_traversal_profiles
+VALUES ('prioritized', vector_hnsw_last_scan_profile()::jsonb);
+
+WITH profiles AS (
+    SELECT
+        (SELECT profile FROM hnsw_traversal_profiles WHERE mode = 'stock') AS stock,
+        (SELECT profile FROM hnsw_traversal_profiles WHERE mode = 'validation_only') AS validation_only,
+        (SELECT profile FROM hnsw_traversal_profiles WHERE mode = 'prioritized') AS prioritized
+), ordered AS (
+    SELECT mode,
+           bool_and(next_distance IS NULL OR distance <= next_distance) AS distance_ordered
+    FROM (
+        SELECT mode, distance,
+               lead(distance) OVER (PARTITION BY mode ORDER BY ordinal) AS next_distance
+        FROM hnsw_traversal_observed
+    ) AS sequence
+    GROUP BY mode
+)
+SELECT
+    stock->>'final_path' = 'stock' AND
+        (stock->>'match_frontier_pops')::bigint = 0 AND
+        (stock->>'no_bridge_frontier_pops')::bigint = 0 AS guc_off_stock,
+    validation_only->>'final_path' = 'candidate_admission_validation_only' AND
+        validation_only->>'traversal_admission_reason' =
+            'default_candidate_admission_validation_only' AND
+        NOT (validation_only->>'traversal_order_changed')::boolean AND
+        (validation_only->>'match_frontier_pops')::bigint = 0 AND
+        (validation_only->>'no_bridge_frontier_pops')::bigint = 0 AS default_validation_only,
+    prioritized->>'final_path' = 'approximate_traversal_prioritization' AND
+        prioritized->>'traversal_admission_reason' =
+            'planner_proven_guidance_and_explicit_guc' AND
+        (prioritized->>'traversal_order_changed')::boolean AND
+        (prioritized->>'approximate_ann_path')::boolean AS explicit_approximate_path,
+    (prioritized->>'match_frontier_pops')::bigint > 0 AND
+        (prioritized->>'no_bridge_frontier_pops')::bigint > 0 AND
+        (prioritized->>'no_bridge_expansions')::bigint =
+            (prioritized->>'no_bridge_frontier_pops')::bigint AS no_bridge_expands,
+    (prioritized->>'no_bridge_deferred')::bigint > 0 AND
+        (prioritized->>'max_no_bridge_debt')::bigint BETWEEN 1 AND 1 AS burst_fair,
+    (prioritized->>'dual_frontier_termination_checks')::bigint > 0 AND
+        (prioritized->>'dual_frontier_termination_checks_with_both')::bigint > 0 AND
+        (prioritized->>'dual_frontier_terminations')::bigint > 0 AND
+        (prioritized->>'dual_frontier_terminations_with_both')::bigint >= 0 AS global_head_termination,
+    (SELECT bool_and(distance_ordered) FROM ordered) AS output_distance_ordered
+FROM profiles;
+
+SELECT vector_hnsw_guidance_activate(
+    'hnsw_traversal_priority_idx'::regclass,
+    ARRAY['exact:sql:id <= 2'],
+    'exact'
+) AS activated_rare_atom;
+SELECT vector_hnsw_reset_scan_profile();
+SELECT count(*) BETWEEN 0 AND 2 AS rare_rows_bounded
+FROM (
+    SELECT id
+    FROM hnsw_traversal_priority_t
+    WHERE (SELECT vector_hnsw_guidance_bind(
+               'hnsw_traversal_priority_idx'::regclass,
+               ARRAY['exact:sql:id <= 2'],
+               'exact'
+           ) OFFSET 0)
+      AND id <= 2
+    ORDER BY val <-> (
+        SELECT val FROM hnsw_traversal_priority_t WHERE id = 1
+    )
+    LIMIT 2
+) AS rare;
+WITH profile AS (
+    SELECT vector_hnsw_last_scan_profile()::jsonb AS value
+)
+SELECT value->>'final_path' = 'fresh_stock_fallback' AND
+       value->>'fallback_reason' = 'insufficient_guided_matches' AND
+       (value->>'fallback_requests')::bigint = 1 AND
+       (value->>'guided_attempt_distance_computations')::bigint > 0 AND
+       (value->>'fallback_stock_distance_computations')::bigint > 0 AS fresh_underfill_fallback
+FROM profile;
+
+SELECT vector_hnsw_guidance_activate(
+    'hnsw_traversal_priority_idx'::regclass,
+    ARRAY['exact:sql:eligible'],
+    'exact'
+) AS reactivated_atoms;
+SET hnsw.iterative_scan = strict_order;
+SELECT vector_hnsw_reset_scan_profile();
+SELECT count(*) = 4 AS strict_rows_returned
+FROM (
+    SELECT id
+    FROM hnsw_traversal_priority_t
+    WHERE (SELECT vector_hnsw_guidance_bind(
+               'hnsw_traversal_priority_idx'::regclass,
+               ARRAY['exact:sql:eligible'],
+               'exact'
+           ) OFFSET 0)
+      AND eligible
+    ORDER BY val <-> '[500,500]'::vector
+    LIMIT 4
+) AS strict_rows;
+WITH profile AS (
+    SELECT vector_hnsw_last_scan_profile()::jsonb AS value
+)
+SELECT value->>'final_path' = 'stock_bypass' AND
+       value->>'stock_bypass_reason' = 'iterative_scan' AND
+       value->>'traversal_admission_reason' = 'iterative_scan' AND
+       (value->>'match_frontier_pops')::bigint = 0 AND
+       (value->>'no_bridge_frontier_pops')::bigint = 0 AS strict_iterative_bypass
+FROM profile;
+
+SELECT vector_hnsw_guidance_reset();
+RESET enable_seqscan;
+RESET enable_sort;
+RESET hnsw.ef_search;
+RESET hnsw.iterative_scan;
+RESET hnsw.page_access;
+RESET hnsw.index_page_access;
+RESET hnsw.filter_strategy;
+RESET hnsw.traversal_guided_min_skip_rate;
+RESET hnsw.traversal_guided_prioritization;
+RESET hnsw.traversal_guided_burst;
+RESET hnsw.build_seed;
+DROP TABLE hnsw_traversal_priority_t;

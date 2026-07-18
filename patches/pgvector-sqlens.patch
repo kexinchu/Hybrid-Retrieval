@@ -1,5 +1,5 @@
 diff --git a/Dockerfile b/Dockerfile
-index 821fa23..6c4cc18 100644
+index 821fa23870da2dc9b54a3d7ed1924b4b23730691..6c4cc182c1c6530b1607251f8ebc96f51261b764 100644
 --- a/Dockerfile
 +++ b/Dockerfile
 @@ -5,7 +5,7 @@ ARG DEBIAN_CODENAME=bookworm
@@ -12,7 +12,7 @@ index 821fa23..6c4cc18 100644
  RUN apt-get update && \
  		apt-mark hold locales && \
 diff --git a/Makefile b/Makefile
-index 8bedb89..8ccb1e8 100644
+index 8bedb890ab193e665a8937591fd79b0a341049c4..8ccb1e8752e33eaebc100b4ca39fd26c730a3a24 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -4,12 +4,14 @@ EXTVERSION = 0.8.2
@@ -58,7 +58,7 @@ index 8bedb89..8ccb1e8 100644
  ifeq ($(PROVE),)
  	PROVE = prove
 diff --git a/sql/vector--0.8.1--0.8.2.sql b/sql/vector--0.8.1--0.8.2.sql
-index f7730a1..d12321b 100644
+index f7730a18ae0b2c6b3ceca6aa7d3ccbde2366fce7..d12321b2c6b7170ec2080dfabf88141abb936544 100644
 --- a/sql/vector--0.8.1--0.8.2.sql
 +++ b/sql/vector--0.8.1--0.8.2.sql
 @@ -1,2 +1,27 @@
@@ -90,7 +90,7 @@ index f7730a1..d12321b 100644
 +REVOKE ALL ON FUNCTION vector_hnsw_graph_fingerprint(regclass) FROM PUBLIC;
 +REVOKE ALL ON FUNCTION vector_hnsw_graph_compare(regclass, regclass) FROM PUBLIC;
 diff --git a/sql/vector.sql b/sql/vector.sql
-index 7fc3671..e286039 100644
+index 7fc36712b31dc3b58d6c0c5caa8fa6097f30471d..e286039461a716ac3361a42fe83a798a46853484 100644
 --- a/sql/vector.sql
 +++ b/sql/vector.sql
 @@ -102,6 +102,91 @@ CREATE FUNCTION vector_negative_inner_product(vector, vector) RETURNS float8
@@ -186,7 +186,7 @@ index 7fc3671..e286039 100644
  	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
  
 diff --git a/src/hnsw.c b/src/hnsw.c
-index bfc92a1..19b4ebf 100644
+index bfc92a1c754cec6cff8c4114273146cae7716768..9375525bf36f19532a00f60b0338eed353bb4293 100644
 --- a/src/hnsw.c
 +++ b/src/hnsw.c
 @@ -6,7 +6,12 @@
@@ -220,7 +220,7 @@ index bfc92a1..19b4ebf 100644
  #include "vector.h"
  
  #if PG_VERSION_NUM < 150000
-@@ -31,12 +43,168 @@ static const struct config_enum_entry hnsw_iterative_scan_options[] = {
+@@ -31,12 +43,170 @@ static const struct config_enum_entry hnsw_iterative_scan_options[] = {
  	{NULL, 0, false}
  };
  
@@ -271,6 +271,8 @@ index bfc92a1..19b4ebf 100644
 +int			hnsw_traversal_guided_max_bridge_hops;
 +int			hnsw_traversal_guided_max_bridge_work;
 +double		hnsw_traversal_guided_min_skip_rate;
++bool		hnsw_traversal_guided_prioritization;
++int			hnsw_traversal_guided_burst;
  double		hnsw_scan_mem_multiplier;
  int			hnsw_lock_tranche_id;
  static relopt_kind hnsw_relopt_kind;
@@ -389,7 +391,7 @@ index bfc92a1..19b4ebf 100644
  
  /*
   * Assign a tranche ID for our LWLocks. This only needs to be done by one
-@@ -90,7 +258,7 @@ HnswInit(void)
+@@ -90,7 +260,7 @@ HnswInit(void)
  					  HNSW_DEFAULT_EF_CONSTRUCTION, HNSW_MIN_EF_CONSTRUCTION, HNSW_MAX_EF_CONSTRUCTION, AccessExclusiveLock);
  
  	DefineCustomIntVariable("hnsw.ef_search", "Sets the size of the dynamic candidate list for search",
@@ -398,7 +400,7 @@ index bfc92a1..19b4ebf 100644
  							HNSW_DEFAULT_EF_SEARCH, HNSW_MIN_EF_SEARCH, HNSW_MAX_EF_SEARCH, PGC_USERSET, 0, NULL, NULL, NULL);
  
  	DefineCustomEnumVariable("hnsw.iterative_scan", "Sets the mode for iterative scans",
-@@ -102,6 +270,86 @@ HnswInit(void)
+@@ -102,6 +272,96 @@ HnswInit(void)
  							NULL, &hnsw_max_scan_tuples,
  							20000, 1, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
  
@@ -453,7 +455,7 @@ index bfc92a1..19b4ebf 100644
 +							   HnswPreferredIndexAssign, NULL);
 +
 +	DefineCustomEnumVariable("hnsw.filter_strategy", "Sets predicate-aware HNSW traversal strategy",
-+							 "off preserves pgvector behavior; safe_guided is validation-only and preserves stock graph traversal; traversal_guided performs native graph expansion and vector distance computation followed by planner-proven predicate-aware result-heap admission and pre-heap TID suppression when iterative_scan is off, and otherwise bypasses to stock; acorn1 and guided_collect are experimental heuristic modes.",
++							 "off preserves pgvector behavior; safe_guided is validation-only and preserves stock graph traversal; traversal_guided performs native graph expansion and vector distance computation followed by planner-proven predicate-aware result-heap admission and pre-heap TID suppression. With hnsw.traversal_guided_prioritization=false, it retains distance-ordered candidate-admission/validation-only traversal; true enables bounded approximate layer-0 traversal prioritization. acorn1 and guided_collect are experimental heuristic modes.",
 +							 &hnsw_filter_strategy,
 +							 HNSW_FILTER_STRATEGY_OFF, hnsw_filter_strategy_options, PGC_USERSET, 0, NULL, NULL, NULL);
 +
@@ -482,10 +484,20 @@ index bfc92a1..19b4ebf 100644
 +							 &hnsw_traversal_guided_min_skip_rate,
 +							 0.20, 0, 1, PGC_USERSET, 0, NULL, NULL, NULL);
 +
++	DefineCustomBoolVariable("hnsw.traversal_guided_prioritization", "Enables bounded predicate-guided layer-0 traversal prioritization",
++							 "The default false retains distance-ordered candidate-admission/validation-only behavior. True requires planner-proven guidance, keeps predicate-NO nodes as expandable graph bridges, and enables bounded approximate traversal prioritization that may change ANN recall relative to stock traversal.",
++							 &hnsw_traversal_guided_prioritization,
++							 false, PGC_USERSET, 0, NULL, NULL, NULL);
++
++	DefineCustomIntVariable("hnsw.traversal_guided_burst", "Sets the maximum consecutive MAYBE frontier pops while a predicate-NO bridge is pending",
++							 "After this many MAYBE pops, traversal must expand the current nearest predicate-NO bridge before prioritizing another MAYBE node.",
++							 &hnsw_traversal_guided_burst,
++							 8, 1, 1024, PGC_USERSET, 0, NULL, NULL, NULL);
++
  	/* Same range as hash_mem_multiplier */
  	DefineCustomRealVariable("hnsw.scan_mem_multiplier", "Sets the multiple of work_mem to use for iterative scans",
  							 NULL, &hnsw_scan_mem_multiplier,
-@@ -142,6 +390,31 @@ hnswcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
+@@ -142,6 +402,31 @@ hnswcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
  	double		startupPages;
  	double		spc_seq_page_cost;
  	Relation	index;
@@ -518,7 +530,7 @@ index bfc92a1..19b4ebf 100644
  	/* Never use index without order */
  	if (path->indexorderbys == NIL)
 diff --git a/src/hnsw.h b/src/hnsw.h
-index 841af0f..a4bea8e 100644
+index 841af0fa71b292f304e63cbf4007f6dcd6ebe346..d322ad4a4bc808632821fdf554066736f3bf5ec5 100644
 --- a/src/hnsw.h
 +++ b/src/hnsw.h
 @@ -7,13 +7,17 @@
@@ -534,7 +546,7 @@ index 841af0f..a4bea8e 100644
  #include "utils/sampling.h"
  #include "vector.h"
  
-+#define SQLENS_BUILD_ID "sqlens-v11-bfs-locality-proof-ef100000-20260718-r10"
++#define SQLENS_BUILD_ID "sqlens-v12-dual-frontier-prioritization-20260718-r11"
 +
  #if PG_VERSION_NUM >= 190000
  typedef Pointer Item;
@@ -559,7 +571,7 @@ index 841af0f..a4bea8e 100644
  
  #define HNSW_ELEMENT_TUPLE_SIZE(size)	MAXALIGN(offsetof(HnswElementTupleData, data) + (size))
  #define HNSW_NEIGHBOR_TUPLE_SIZE(level, m)	MAXALIGN(offsetof(HnswNeighborTupleData, indextids) + ((level) + 2) * (m) * sizeof(ItemPointerData))
-@@ -117,6 +125,22 @@ typedef Pointer Item;
+@@ -117,6 +125,24 @@ typedef Pointer Item;
  extern int	hnsw_ef_search;
  extern int	hnsw_iterative_scan;
  extern int	hnsw_max_scan_tuples;
@@ -579,10 +591,12 @@ index 841af0f..a4bea8e 100644
 +extern int	hnsw_traversal_guided_max_bridge_hops;
 +extern int	hnsw_traversal_guided_max_bridge_work;
 +extern double hnsw_traversal_guided_min_skip_rate;
++extern bool hnsw_traversal_guided_prioritization;
++extern int	hnsw_traversal_guided_burst;
  extern double hnsw_scan_mem_multiplier;
  extern int	hnsw_lock_tranche_id;
  
-@@ -127,8 +151,67 @@ typedef enum HnswIterativeScanMode
+@@ -127,8 +153,79 @@ typedef enum HnswIterativeScanMode
  	HNSW_ITERATIVE_SCAN_STRICT
  }			HnswIterativeScanMode;
  
@@ -619,7 +633,8 @@ index 841af0f..a4bea8e 100644
 +	HNSW_TRAVERSAL_PATH_STOCK,
 +	HNSW_TRAVERSAL_PATH_VALIDATION_ONLY,
 +	HNSW_TRAVERSAL_PATH_LEGACY_GUIDED,
-+	HNSW_TRAVERSAL_PATH_GUIDED,
++	HNSW_TRAVERSAL_PATH_CANDIDATE_ADMISSION,
++	HNSW_TRAVERSAL_PATH_APPROXIMATE_PRIORITIZATION,
 +	HNSW_TRAVERSAL_PATH_STOCK_BYPASS,
 +	HNSW_TRAVERSAL_PATH_FRESH_STOCK_FALLBACK
 +} HnswTraversalFinalPath;
@@ -632,6 +647,17 @@ index 841af0f..a4bea8e 100644
 +	HNSW_TRAVERSAL_BYPASS_LOW_ESTIMATED_SKIP_RATE,
 +	HNSW_TRAVERSAL_BYPASS_ITERATIVE_SCAN
 +} HnswTraversalStockBypassReason;
++
++typedef enum HnswTraversalAdmissionReason
++{
++	HNSW_TRAVERSAL_ADMISSION_NOT_REQUESTED,
++	HNSW_TRAVERSAL_ADMISSION_NO_PROVEN_GUIDE,
++	HNSW_TRAVERSAL_ADMISSION_ITERATIVE_SCAN,
++	HNSW_TRAVERSAL_ADMISSION_SKIP_ESTIMATE_UNAVAILABLE,
++	HNSW_TRAVERSAL_ADMISSION_LOW_ESTIMATED_SKIP_RATE,
++	HNSW_TRAVERSAL_ADMISSION_DEFAULT_VALIDATION_ONLY,
++	HNSW_TRAVERSAL_ADMISSION_ADMITTED
++} HnswTraversalAdmissionReason;
 +
 +typedef enum HnswTraversalFallbackReason
 +{
@@ -650,7 +676,7 @@ index 841af0f..a4bea8e 100644
  
  #define HnswPtrDeclare(type, relptrtype, ptrtype) \
  	relptr_declare(type, relptrtype); \
-@@ -179,10 +262,218 @@ typedef struct HnswSearchCandidate
+@@ -179,10 +276,231 @@ typedef struct HnswSearchCandidate
  {
  	pairingheap_node c_node;
  	pairingheap_node w_node;
@@ -697,7 +723,7 @@ index 841af0f..a4bea8e 100644
 +typedef struct HnswTraversalGuidanceState
 +{
 +	bool		requested;
-+	bool		phaseEnabled;
++	bool		prioritizationEnabled;
 +	bool		estimatedSkipRateValid;
 +	double		estimatedSkipRate;
 +	int			target;
@@ -714,10 +740,12 @@ index 841af0f..a4bea8e 100644
 +	bool		invalidNeighbor;
 +	int			guidedResultCount;
 +	int			bridgePendingAtTermination;
++	int			burst;
 +	HnswIterativeScanMode iterativeScan;
 +	HnswFilterStrategyMode filterStrategy;
 +	HnswTraversalFinalPath finalPath;
 +	HnswTraversalStockBypassReason stockBypassReason;
++	HnswTraversalAdmissionReason admissionReason;
 +	HnswTraversalFallbackReason fallbackReason;
 +} HnswTraversalGuidanceState;
 +
@@ -750,6 +778,15 @@ index 841af0f..a4bea8e 100644
 +	int64		fallbackStockDistanceComputations;
 +	int64		matchingExpanded;
 +	int64		bridgeExpanded;
++	int64		matchFrontierPops;
++	int64		noBridgeFrontierPops;
++	int64		noBridgeDeferred;
++	int64		maxNoBridgeDebt;
++	int64		noBridgeExpansions;
++	int64		dualFrontierTerminationChecks;
++	int64		dualFrontierTerminationChecksWithBoth;
++	int64		dualFrontierTerminations;
++	int64		dualFrontierTerminationsWithBoth;
 +	int64		candidateAdmissions;
 +	int64		resultAdmissions;
 +	int64		guidedAdmissions;
@@ -815,9 +852,11 @@ index 841af0f..a4bea8e 100644
 +	HnswPlannerProofOutcome plannerProof;
 +	HnswTraversalFinalPath traversalFinalPath;
 +	HnswTraversalStockBypassReason traversalStockBypassReason;
++	HnswTraversalAdmissionReason traversalAdmissionReason;
 +	HnswTraversalFallbackReason traversalFallbackReason;
 +	bool		traversalEstimatedSkipRateValid;
 +	double		traversalEstimatedSkipRate;
++	int			traversalPrioritizationBurst;
 +	HnswIterativeScanMode iterativeScan;
 +	HnswFilterStrategyMode filterStrategy;
 +	int			plannerProofCount;
@@ -869,7 +908,7 @@ index 841af0f..a4bea8e 100644
  /* HNSW index options */
  typedef struct HnswOptions
  {
-@@ -378,9 +669,49 @@ typedef struct HnswScanOpaqueData
+@@ -378,9 +696,49 @@ typedef struct HnswScanOpaqueData
  	HnswQuery	q;
  	int			m;
  	int64		tuples;
@@ -919,7 +958,7 @@ index 841af0f..a4bea8e 100644
  
  	/* Support functions */
  	HnswSupport support;
-@@ -423,14 +754,16 @@ bool		HnswCheckNorm(HnswSupport * support, Datum value);
+@@ -423,14 +781,16 @@ bool		HnswCheckNorm(HnswSupport * support, Datum value);
  Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
  void		HnswInitPage(Buffer buf, Page page);
  void		HnswInit(void);
@@ -937,7 +976,7 @@ index 841af0f..a4bea8e 100644
  void		HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building);
  void		HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m);
  void		HnswAddHeapTid(HnswElement element, ItemPointer heaptid);
-@@ -451,6 +784,7 @@ PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);
+@@ -451,6 +811,7 @@ PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);
  /* Index access methods */
  IndexBuildResult *hnswbuild(Relation heap, Relation index, IndexInfo *indexInfo);
  void		hnswbuildempty(Relation index);
@@ -945,7 +984,7 @@ index 841af0f..a4bea8e 100644
  bool		hnswinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid, Relation heap, IndexUniqueCheck checkUnique
  #if PG_VERSION_NUM >= 140000
  					   ,bool indexUnchanged
-@@ -463,6 +797,24 @@ IndexScanDesc hnswbeginscan(Relation index, int nkeys, int norderbys);
+@@ -463,6 +824,24 @@ IndexScanDesc hnswbeginscan(Relation index, int nkeys, int norderbys);
  void		hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys);
  bool		hnswgettuple(IndexScanDesc scan, ScanDirection dir);
  void		hnswendscan(IndexScanDesc scan);
@@ -971,7 +1010,7 @@ index 841af0f..a4bea8e 100644
  static inline HnswNeighborArray *
  HnswGetNeighbors(char *base, HnswElement element, int lc)
 diff --git a/src/hnswbuild.c b/src/hnswbuild.c
-index b15c144..0a1a5f8 100644
+index b15c144e04899d644dc79e9c19c8e97ad81d66c3..0a1a5f8f39340d0c339a9e91c9a54bec2915cec5 100644
 --- a/src/hnswbuild.c
 +++ b/src/hnswbuild.c
 @@ -54,6 +54,7 @@
@@ -1215,7 +1254,7 @@ index b15c144..0a1a5f8 100644
  
 diff --git a/src/hnswclone.c b/src/hnswclone.c
 new file mode 100644
-index 0000000..9913c10
+index 0000000000000000000000000000000000000000..9913c1035765e7d831dabe509fbc2a5d56213c78
 --- /dev/null
 +++ b/src/hnswclone.c
 @@ -0,0 +1,1792 @@
@@ -3012,7 +3051,7 @@ index 0000000..9913c10
 +												  CStringGetDatum(json.data))));
 +}
 diff --git a/src/hnswscan.c b/src/hnswscan.c
-index 61a8d63..f4d10c0 100644
+index 61a8d63e893cff093c2f9ac9c070946186ea0971..0f5da272faf7b5fb4a8fcde77ab79e3f737ad822 100644
 --- a/src/hnswscan.c
 +++ b/src/hnswscan.c
 @@ -2,16 +2,19 @@
@@ -3102,7 +3141,7 @@ index 61a8d63..f4d10c0 100644
  
  	q->value = value;
  	so->m = m;
-@@ -42,15 +93,228 @@ GetScanItems(IndexScanDesc scan, Datum value)
+@@ -42,15 +93,250 @@ GetScanItems(IndexScanDesc scan, Datum value)
  	if (entryPoint == NULL)
  		return NIL;
  
@@ -3152,6 +3191,7 @@ index 61a8d63..f4d10c0 100644
 +	state->iterativeScan = (HnswIterativeScanMode) hnsw_iterative_scan;
 +	state->filterStrategy = (HnswFilterStrategyMode) hnsw_filter_strategy;
 +	state->finalPath = HNSW_TRAVERSAL_PATH_STOCK;
++	state->admissionReason = HNSW_TRAVERSAL_ADMISSION_NOT_REQUESTED;
 +	guidanceActive = HnswGuidanceIsActiveForScan(so->guidance);
 +
 +	if (hnsw_filter_strategy == HNSW_FILTER_STRATEGY_OFF)
@@ -3185,33 +3225,55 @@ index 61a8d63..f4d10c0 100644
 +	Assert(hnsw_filter_strategy == HNSW_FILTER_STRATEGY_TRAVERSAL_GUIDED);
 +
 +	state->requested = true;
-+	/* The GUC is not a SQL LIMIT; never certify less than the layer-0 ef. */
-+	state->target = Max(hnsw_traversal_guided_target, hnsw_ef_search);
++	/* The deprecated target GUC cannot change the layer-0 result contract. */
++	state->target = hnsw_ef_search;
 +	state->maxBridgeHops = hnsw_traversal_guided_max_bridge_hops;
 +	state->maxBridgeWork = hnsw_traversal_guided_max_bridge_work;
 +	state->maxScanTuples = hnsw_max_scan_tuples;
 +	state->maxMemory = so->maxMemory;
++	state->burst = hnsw_traversal_guided_burst;
 +	state->estimatedSkipRateValid = HnswGuidanceGetEstimatedSkipRate(
 +		so->guidance, &state->estimatedSkipRate);
 +
 +	if (!guidanceActive)
++	{
 +		state->stockBypassReason = HNSW_TRAVERSAL_BYPASS_NO_PROVEN_GUIDE;
++		state->admissionReason = HNSW_TRAVERSAL_ADMISSION_NO_PROVEN_GUIDE;
++	}
 +	else if (hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF)
++	{
 +		state->stockBypassReason = HNSW_TRAVERSAL_BYPASS_ITERATIVE_SCAN;
++		state->admissionReason = HNSW_TRAVERSAL_ADMISSION_ITERATIVE_SCAN;
++	}
 +	else if (!state->estimatedSkipRateValid)
++	{
 +		state->stockBypassReason = HNSW_TRAVERSAL_BYPASS_SKIP_ESTIMATE_UNAVAILABLE;
++		state->admissionReason = HNSW_TRAVERSAL_ADMISSION_SKIP_ESTIMATE_UNAVAILABLE;
++	}
 +	else if (state->estimatedSkipRate < hnsw_traversal_guided_min_skip_rate)
++	{
 +		state->stockBypassReason = HNSW_TRAVERSAL_BYPASS_LOW_ESTIMATED_SKIP_RATE;
++		state->admissionReason = HNSW_TRAVERSAL_ADMISSION_LOW_ESTIMATED_SKIP_RATE;
++	}
 +	else
 +	{
++		if (!hnsw_traversal_guided_prioritization)
++		{
++			state->finalPath = HNSW_TRAVERSAL_PATH_CANDIDATE_ADMISSION;
++			state->admissionReason =
++				HNSW_TRAVERSAL_ADMISSION_DEFAULT_VALIDATION_ONLY;
++			return;
++		}
++
 +		/*
-+		 * Guidance participates in the native distance-ordered traversal and
-+		 * controls result admission.  It never starts the legacy pre-distance
-+		 * pruning phase, whose unresolved bridge frontier cannot be certified
-+		 * without degenerating into an all-graph walk.
++		 * Both frontiers remain distance ordered internally.  The bounded pop
++		 * schedule prioritizes MAYBE nodes without starving predicate-NO graph
++		 * bridges; this is approximate ANN prioritization, not exact-safe graph
++		 * pruning or a stock-equivalent traversal.
 +		 */
-+		state->phaseEnabled = false;
-+		state->finalPath = HNSW_TRAVERSAL_PATH_GUIDED;
++		state->prioritizationEnabled = true;
++		state->finalPath = HNSW_TRAVERSAL_PATH_APPROXIMATE_PRIORITIZATION;
++		state->admissionReason = HNSW_TRAVERSAL_ADMISSION_ADMITTED;
 +		return;
 +	}
 +
@@ -3245,12 +3307,12 @@ index 61a8d63..f4d10c0 100644
 +	int64		avoidedStart = so->traversal.distanceComputationsAvoided;
 +	List	   *items;
 +
-+	if (!state->phaseEnabled)
++	if (!state->prioritizationEnabled)
 +	{
 +		bool		continuingFallback =
 +			state->finalPath == HNSW_TRAVERSAL_PATH_FRESH_STOCK_FALLBACK;
 +		bool		guidedAdmission =
-+			state->finalPath == HNSW_TRAVERSAL_PATH_GUIDED;
++			state->finalPath == HNSW_TRAVERSAL_PATH_CANDIDATE_ADMISSION;
 +
 +		if (continuingFallback)
 +			so->traversal.fallbackRequests++;
@@ -3294,17 +3356,16 @@ index 61a8d63..f4d10c0 100644
 +
 +		so->traversal.guidedPhaseDistanceComputations +=
 +			so->distanceComputations - distanceStart;
++		so->traversal.guidedExpandedNodes +=
++			so->traversal.expandedNodes - expandedStart;
 +		guidedUsable = state->guidedResultCount >= state->target &&
-+			state->bridgePendingAtTermination == 0 &&
-+			!state->maxScanReached && !state->memoryLimitReached &&
-+			!state->invalidNeighbor && !state->workLimitReached &&
-+			!state->hopLimitReached;
++			!state->invalidNeighbor;
 +		if (guidedUsable)
 +			return items;
 +
 +		state->fallbackReason = HnswTraversalGuidanceFallbackReason(state);
 +		state->finalPath = HNSW_TRAVERSAL_PATH_FRESH_STOCK_FALLBACK;
-+		state->phaseEnabled = false;
++		state->prioritizationEnabled = false;
 +		state->phaseContext = NULL;
 +		so->traversal.fallbackRequests++;
 +		/* Abandoned pre-distance skips are attempted work, not net savings. */
@@ -3334,7 +3395,7 @@ index 61a8d63..f4d10c0 100644
  }
  
  /*
-@@ -77,11 +341,94 @@ ResumeScanItems(IndexScanDesc scan)
+@@ -77,11 +363,98 @@ ResumeScanItems(IndexScanDesc scan)
  			break;
  
  		sc = HnswGetSearchCandidate(w_node, pairingheap_remove_first(so->discarded));
@@ -3411,9 +3472,13 @@ index 61a8d63..f4d10c0 100644
 +	hnsw_last_profile.plannerProof.bypassReason = HNSW_PROOF_BYPASS_SCAN_NOT_STARTED;
 +	hnsw_last_profile.traversalFinalPath = HNSW_TRAVERSAL_PATH_STOCK;
 +	hnsw_last_profile.traversalStockBypassReason = HNSW_TRAVERSAL_BYPASS_NONE;
++	hnsw_last_profile.traversalAdmissionReason =
++		HNSW_TRAVERSAL_ADMISSION_NOT_REQUESTED;
 +	hnsw_last_profile.traversalFallbackReason = HNSW_TRAVERSAL_FALLBACK_NONE;
 +	hnsw_last_profile.traversalEstimatedSkipRateValid = false;
 +	hnsw_last_profile.traversalEstimatedSkipRate = 0;
++	hnsw_last_profile.traversalPrioritizationBurst =
++		hnsw_traversal_guided_burst;
 +	hnsw_last_profile.iterativeScan = (HnswIterativeScanMode) hnsw_iterative_scan;
 +	hnsw_last_profile.filterStrategy = (HnswFilterStrategyMode) hnsw_filter_strategy;
 +	hnsw_last_profile.plannerProofCount = 0;
@@ -3430,7 +3495,7 @@ index 61a8d63..f4d10c0 100644
  }
  
  /*
-@@ -111,6 +458,245 @@ GetScanValue(IndexScanDesc scan)
+@@ -111,6 +484,248 @@ GetScanValue(IndexScanDesc scan)
  	return value;
  }
  
@@ -3535,7 +3600,10 @@ index 61a8d63..f4d10c0 100644
 +HnswScanUsesGuidanceValidation(HnswScanOpaque so)
 +{
 +	if (so->traversalGuidance.requested)
-+		return so->traversalGuidance.finalPath == HNSW_TRAVERSAL_PATH_GUIDED &&
++		return (so->traversalGuidance.finalPath ==
++				HNSW_TRAVERSAL_PATH_CANDIDATE_ADMISSION ||
++			so->traversalGuidance.finalPath ==
++				HNSW_TRAVERSAL_PATH_APPROXIMATE_PRIORITIZATION) &&
 +			HnswGuidanceIsActiveForScan(so->guidance);
 +
 +	return HnswGuidanceIsActiveForScan(so->guidance);
@@ -3676,7 +3744,7 @@ index 61a8d63..f4d10c0 100644
  #if defined(HNSW_MEMORY)
  /*
   * Show memory usage
-@@ -145,8 +731,44 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
+@@ -145,8 +760,44 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
  	 * tuples for iterative search before exceeding work_mem
  	 */
  	so->tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
@@ -3723,7 +3791,7 @@ index 61a8d63..f4d10c0 100644
  
  	/* Calculate max memory */
  	/* Add 256 extra bytes to fill last block when close */
-@@ -154,6 +776,7 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
+@@ -154,6 +805,7 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
  	so->maxMemory = Min(maxMemory, (double) SIZE_MAX);
  
  	scan->opaque = so;
@@ -3731,7 +3799,7 @@ index 61a8d63..f4d10c0 100644
  
  	return scan;
  }
-@@ -171,8 +794,54 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
+@@ -171,8 +823,59 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
  	so->v.tids = NULL;
  	so->discarded = NULL;
  	so->tuples = 0;
@@ -3746,6 +3814,11 @@ index 61a8d63..f4d10c0 100644
 +	so->idxBlksRead = 0;
 +	so->topkTidCount = 0;
  	so->previousDistance = -get_float8_infinity();
++	if (so->traversalGuidance.phaseContext != NULL)
++	{
++		MemoryContextDelete(so->traversalGuidance.phaseContext);
++		so->traversalGuidance.phaseContext = NULL;
++	}
  	MemoryContextReset(so->tmpCtx);
 +	MemoryContextReset(so->profileCtx);
 +	HnswInitIndexPageProfile(&so->indexPageProfile, so->profileCtx);
@@ -3771,7 +3844,6 @@ index 61a8d63..f4d10c0 100644
 +	so->heapTidDistinctPagesExact = true;
 +	MemSet(&so->traversal, 0, sizeof(HnswTraversalProfile));
 +	so->abandonedGuidedTuples = 0;
-+	so->traversalGuidance.phaseContext = NULL;
 +	so->traversalGuidance.bridgeWork = 0;
 +	so->traversalGuidance.hopLimitReached = false;
 +	so->traversalGuidance.workLimitReached = false;
@@ -3780,13 +3852,14 @@ index 61a8d63..f4d10c0 100644
 +	so->traversalGuidance.invalidNeighbor = false;
 +	so->traversalGuidance.guidedResultCount = 0;
 +	so->traversalGuidance.bridgePendingAtTermination = 0;
-+	/* traversal_guided always reuses the native distance-ordered scan. */
-+	so->traversalGuidance.phaseEnabled = false;
++	so->traversalGuidance.prioritizationEnabled =
++		so->traversalGuidance.finalPath ==
++		HNSW_TRAVERSAL_PATH_APPROXIMATE_PRIORITIZATION;
 +	HnswResetScanProfile();
  
  	if (keys && scan->numberOfKeys > 0)
  		memmove(scan->keyData, keys, scan->numberOfKeys * sizeof(ScanKeyData));
-@@ -184,11 +853,27 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
+@@ -184,11 +887,27 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
  /*
   * Fetch the next tuple in the given scan
   */
@@ -3815,7 +3888,7 @@ index 61a8d63..f4d10c0 100644
  
  	/*
  	 * Index can be used to scan backward, but Postgres doesn't support
-@@ -196,10 +881,19 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
+@@ -196,10 +915,19 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
  	 */
  	Assert(ScanDirectionIsForward(dir));
  
@@ -3829,15 +3902,15 @@ index 61a8d63..f4d10c0 100644
 +											 &so->plannerProof);
 +		HnswInitializeTraversalGuidance(so);
 +	}
-+
-+	oldCtx = MemoryContextSwitchTo(so->tmpCtx);
  
++	oldCtx = MemoryContextSwitchTo(so->tmpCtx);
++
 +	if (so->first)
 +	{
  		/* Count index scan for stats */
  		pgstat_count_index_scan(scan->indexRelation);
  #if PG_VERSION_NUM >= 180000
-@@ -216,16 +910,13 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
+@@ -216,16 +944,13 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
  		if (!IsMVCCSnapshot(scan->xs_snapshot))
  			elog(ERROR, "non-MVCC snapshots are not supported with hnsw");
  
@@ -3855,7 +3928,7 @@ index 61a8d63..f4d10c0 100644
  
  		/* Release shared lock */
  		UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
-@@ -239,92 +930,74 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
+@@ -239,92 +964,74 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
  
  	for (;;)
  	{
@@ -3913,9 +3986,9 @@ index 61a8d63..f4d10c0 100644
 -				 * element version must be checked.
 -				 */
 -				LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
--
--				so->w = ResumeScanItems(scan);
  
+-				so->w = ResumeScanItems(scan);
+-
 -				UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
 +			{
 +				HnswPageAccessItem *item = &so->pageItems[so->pageItemIndex++];
@@ -3992,7 +4065,7 @@ index 61a8d63..f4d10c0 100644
  	return false;
  }
  
-@@ -336,7 +1009,157 @@ hnswendscan(IndexScanDesc scan)
+@@ -336,7 +1043,176 @@ hnswendscan(IndexScanDesc scan)
  {
  	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
  
@@ -4073,6 +4146,21 @@ index 61a8d63..f4d10c0 100644
 +		hnsw_last_profile.traversal.fallbackStockDistanceComputations += so->traversal.fallbackStockDistanceComputations;
 +		hnsw_last_profile.traversal.matchingExpanded += so->traversal.matchingExpanded;
 +		hnsw_last_profile.traversal.bridgeExpanded += so->traversal.bridgeExpanded;
++		hnsw_last_profile.traversal.matchFrontierPops += so->traversal.matchFrontierPops;
++		hnsw_last_profile.traversal.noBridgeFrontierPops += so->traversal.noBridgeFrontierPops;
++		hnsw_last_profile.traversal.noBridgeDeferred += so->traversal.noBridgeDeferred;
++		hnsw_last_profile.traversal.maxNoBridgeDebt = Max(
++			hnsw_last_profile.traversal.maxNoBridgeDebt,
++			so->traversal.maxNoBridgeDebt);
++		hnsw_last_profile.traversal.noBridgeExpansions += so->traversal.noBridgeExpansions;
++		hnsw_last_profile.traversal.dualFrontierTerminationChecks +=
++			so->traversal.dualFrontierTerminationChecks;
++		hnsw_last_profile.traversal.dualFrontierTerminationChecksWithBoth +=
++			so->traversal.dualFrontierTerminationChecksWithBoth;
++		hnsw_last_profile.traversal.dualFrontierTerminations +=
++			so->traversal.dualFrontierTerminations;
++		hnsw_last_profile.traversal.dualFrontierTerminationsWithBoth +=
++			so->traversal.dualFrontierTerminationsWithBoth;
 +		hnsw_last_profile.traversal.candidateAdmissions += so->traversal.candidateAdmissions;
 +		hnsw_last_profile.traversal.resultAdmissions += so->traversal.resultAdmissions;
 +		hnsw_last_profile.traversal.guidedAdmissions += so->traversal.guidedAdmissions;
@@ -4132,12 +4220,16 @@ index 61a8d63..f4d10c0 100644
 +	hnsw_last_profile.traversalFinalPath = so->traversalGuidance.finalPath;
 +	hnsw_last_profile.traversalStockBypassReason =
 +		so->traversalGuidance.stockBypassReason;
++	hnsw_last_profile.traversalAdmissionReason =
++		so->traversalGuidance.admissionReason;
 +	hnsw_last_profile.traversalFallbackReason =
 +		so->traversalGuidance.fallbackReason;
 +	hnsw_last_profile.traversalEstimatedSkipRateValid =
 +		so->traversalGuidance.estimatedSkipRateValid;
 +	hnsw_last_profile.traversalEstimatedSkipRate =
 +		so->traversalGuidance.estimatedSkipRate;
++	hnsw_last_profile.traversalPrioritizationBurst =
++		so->traversalGuidance.burst;
 +	hnsw_last_profile.iterativeScan = so->traversalGuidance.iterativeScan;
 +	hnsw_last_profile.filterStrategy = so->traversalGuidance.filterStrategy;
 +	if (hnsw_last_profile.plannerProofCount < HNSW_PROFILE_MAX_PROOFS)
@@ -4151,7 +4243,7 @@ index 61a8d63..f4d10c0 100644
  	pfree(so);
  	scan->opaque = NULL;
 diff --git a/src/hnswutils.c b/src/hnswutils.c
-index f4e4d82..e5f1802 100644
+index f4e4d824bfec373716febc373c5919319f83f87c..d031f6dfc23d8cdcef06a60f3e0219d42649d903 100644
 --- a/src/hnswutils.c
 +++ b/src/hnswutils.c
 @@ -8,6 +8,7 @@
@@ -4610,7 +4702,7 @@ index f4e4d82..e5f1802 100644
  
  	for (int i = 0; i < lm; i++)
  	{
-@@ -811,26 +1115,497 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
+@@ -811,26 +1115,170 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
  		if (!found)
  			unvisited[(*unvisitedLength)++].indextid = *indextid;
  	}
@@ -4618,428 +4710,103 @@ index f4e4d82..e5f1802 100644
 +	return true;
 +}
 +
-+typedef struct HnswMissBridgeCandidate
++typedef struct HnswDualFrontier
 +{
-+	struct HnswMissBridgeCandidate *next;
-+	HnswElement element;
-+	int			hops;
-+} HnswMissBridgeCandidate;
-+
-+typedef struct HnswTraversalGuidedSearch
-+{
-+	HnswQuery  *query;
-+	Relation	index;
-+	HnswSupport *support;
-+	int			ef;
-+	int			m;
-+	int			lm;
-+	visited_hash *visited;
-+	int64	   *tuples;
-+	int64	   *distanceComputations;
++	pairingheap *match;
++	pairingheap *noBridge;
++	int			noBridgePending;
++	int			noBridgeDebt;
++	int			burst;
 +	HnswTraversalProfile *profile;
-+	HnswIndexPageProfileState *indexPageProfile;
-+	HnswScanGuidance *guidance;
-+	HnswTraversalGuidanceState *state;
-+	pairingheap *candidates;
-+	pairingheap *results;
-+	int			resultCount;
-+	int			bridgePending;
-+	HnswUnvisited *unvisited;
-+	HnswMissBridgeCandidate *bridgeHead;
-+	HnswMissBridgeCandidate *bridgeTail;
-+} HnswTraversalGuidedSearch;
++} HnswDualFrontier;
++
++static void
++HnswDualFrontierInit(HnswDualFrontier *frontier, void *heapCompareArg,
++						 int burst, HnswTraversalProfile *profile)
++{
++	Assert(burst >= 1);
++	frontier->match = pairingheap_allocate(CompareNearestCandidates,
++										  heapCompareArg);
++	frontier->noBridge = pairingheap_allocate(CompareNearestCandidates,
++											 heapCompareArg);
++	frontier->noBridgePending = 0;
++	frontier->noBridgeDebt = 0;
++	frontier->burst = burst;
++	frontier->profile = profile;
++}
 +
 +static bool
-+HnswTraversalGuidedCheckUncertainty(HnswTraversalGuidedSearch *search);
-+
-+static HnswElement
-+HnswTraversalGuidedLoadElement(ItemPointer indextid,
-+							   HnswTraversalGuidedSearch *search,
-+							   bool *matches, double *distance)
++HnswDualFrontierIsEmpty(HnswDualFrontier *frontier)
 +{
-+	BlockNumber blkno = ItemPointerGetBlockNumber(indextid);
-+	OffsetNumber offno = ItemPointerGetOffsetNumber(indextid);
-+	Buffer		buf;
-+	Page		page;
-+	ItemId		itemId;
-+	HnswElementTuple etup;
-+	HnswElement element;
-+
-+	if (blkno == HNSW_METAPAGE_BLKNO ||
-+		blkno >= RelationGetNumberOfBlocks(search->index) ||
-+		!OffsetNumberIsValid(offno))
-+	{
-+		search->state->invalidNeighbor = true;
-+		return NULL;
-+	}
-+
-+	buf = ReadBuffer(search->index, blkno);
-+	HnswRecordIndexPage(search->indexPageProfile, blkno);
-+	LockBuffer(buf, BUFFER_LOCK_SHARE);
-+	page = BufferGetPage(buf);
-+	if (PageGetSpecialSize(page) != MAXALIGN(sizeof(HnswPageOpaqueData)) ||
-+		HnswPageGetOpaque(page)->page_id != HNSW_PAGE_ID ||
-+		offno > PageGetMaxOffsetNumber(page))
-+		goto invalid;
-+	itemId = PageGetItemId(page, offno);
-+	if (!ItemIdIsNormal(itemId))
-+		goto invalid;
-+	etup = (HnswElementTuple) PageGetItem(page, itemId);
-+	if (!HnswIsElementTuple(etup))
-+		goto invalid;
-+
-+	element = HnswInitElementFromBlock(blkno, offno);
-+	HnswLoadElementFromTuple(element, etup, true, false);
-+	if (HnswTraversalGuidedCheckUncertainty(search))
-+	{
-+		UnlockReleaseBuffer(buf);
-+		return NULL;
-+	}
-+	*matches = HnswElementMatchesGuidance(element, search->guidance,
-+										 search->profile, true);
-+	if (*matches)
-+	{
-+		if (DatumGetPointer(search->query->value) == NULL)
-+			*distance = 0;
-+		else
-+			*distance = HnswGetDistance(search->query->value,
-+									  PointerGetDatum(&etup->data), search->support);
-+		if (search->distanceComputations != NULL)
-+			(*search->distanceComputations)++;
-+	}
-+	else if (search->profile != NULL)
-+	{
-+		search->profile->attemptedDistanceComputationsAvoided++;
-+		search->profile->distanceComputationsAvoided++;
-+	}
-+
-+	UnlockReleaseBuffer(buf);
-+	return element;
-+
-+invalid:
-+	UnlockReleaseBuffer(buf);
-+	search->state->invalidNeighbor = true;
-+	return NULL;
++	return pairingheap_is_empty(frontier->match) &&
++		pairingheap_is_empty(frontier->noBridge);
 +}
 +
 +static void
-+HnswTraversalGuidedEnqueueBridge(HnswTraversalGuidedSearch *search,
-+								 HnswElement element, int hops)
++HnswDualFrontierAdd(HnswDualFrontier *frontier,
++					HnswSearchCandidate *candidate)
 +{
-+	HnswMissBridgeCandidate *bridge;
-+
-+	/* Count unresolved misses before checking whether they can be queued. */
-+	search->bridgePending++;
-+	if (HnswTraversalGuidedCheckUncertainty(search))
-+		return;
-+	if (hops > search->state->maxBridgeHops)
-+	{
-+		search->state->hopLimitReached = true;
-+		return;
-+	}
-+
-+	bridge = MemoryContextAlloc(search->state->phaseContext, sizeof(*bridge));
-+	bridge->next = NULL;
-+	bridge->element = element;
-+	bridge->hops = hops;
-+	if (search->bridgeTail == NULL)
-+		search->bridgeHead = bridge;
++	if (candidate->matchesGuidance)
++		pairingheap_add(frontier->match, &candidate->c_node);
 +	else
-+		search->bridgeTail->next = bridge;
-+	search->bridgeTail = bridge;
-+}
-+
-+static void
-+HnswTraversalGuidedAdmitMatch(HnswTraversalGuidedSearch *search,
-+								  HnswElement element, double distance)
-+{
-+	HnswSearchCandidate *furthest = pairingheap_is_empty(search->results) ?
-+		NULL : HnswGetSearchCandidate(w_node, pairingheap_first(search->results));
-+	bool		alwaysAdd = search->resultCount < search->ef;
-+	HnswSearchCandidate *candidate;
-+
-+	if (!alwaysAdd && furthest != NULL && distance >= furthest->distance)
-+		return;
-+
-+	candidate = HnswInitSearchCandidate(NULL, element, distance);
-+	candidate->matchesGuidance = true;
-+	pairingheap_add(search->candidates, &candidate->c_node);
-+	pairingheap_add(search->results, &candidate->w_node);
-+	search->resultCount++;
-+	if (search->profile != NULL)
 +	{
-+		search->profile->candidateAdmissions++;
-+		search->profile->resultAdmissions++;
-+		search->profile->guidedAdmissions++;
-+	}
-+
-+	if (search->resultCount > search->ef)
-+	{
-+		(void) pairingheap_remove_first(search->results);
-+		search->resultCount--;
++		pairingheap_add(frontier->noBridge, &candidate->c_node);
++		frontier->noBridgePending++;
 +	}
 +}
 +
-+static void
-+HnswTraversalGuidedInspectNeighbor(HnswTraversalGuidedSearch *search,
-+								   ItemPointer indextid, int missHops)
++static double
++HnswDualFrontierMinDistance(HnswDualFrontier *frontier)
 +{
-+	HnswElement element;
-+	bool		matches;
-+	double		distance = 0;
++	HnswSearchCandidate *match = pairingheap_is_empty(frontier->match) ?
++		NULL : HnswGetSearchCandidate(c_node, pairingheap_first(frontier->match));
++	HnswSearchCandidate *noBridge = pairingheap_is_empty(frontier->noBridge) ?
++		NULL : HnswGetSearchCandidate(c_node, pairingheap_first(frontier->noBridge));
 +
-+	if (HnswTraversalGuidedCheckUncertainty(search))
-+		return;
-+	element = HnswTraversalGuidedLoadElement(indextid, search, &matches,
-+											 &distance);
-+	if (element == NULL)
-+		return;
-+	if (matches)
-+		HnswTraversalGuidedAdmitMatch(search, element, distance);
-+	else
-+		HnswTraversalGuidedEnqueueBridge(search, element, missHops);
++	Assert(match != NULL || noBridge != NULL);
++	if (match == NULL)
++		return noBridge->distance;
++	if (noBridge == NULL)
++		return match->distance;
++	return Min(match->distance, noBridge->distance);
 +}
 +
-+static bool
-+HnswTraversalGuidedCheckUncertainty(HnswTraversalGuidedSearch *search)
++static HnswSearchCandidate *
++HnswDualFrontierPop(HnswDualFrontier *frontier)
 +{
-+	if (search->tuples != NULL && search->state->maxScanTuples > 0 &&
-+		*search->tuples >= search->state->maxScanTuples)
-+		search->state->maxScanReached = true;
-+	if (search->state->phaseContext != NULL &&
-+		MemoryContextMemAllocated(search->state->phaseContext, true) >
-+		search->state->maxMemory)
-+		search->state->memoryLimitReached = true;
++	bool		hasMatch = !pairingheap_is_empty(frontier->match);
++	bool		hasNoBridge = !pairingheap_is_empty(frontier->noBridge);
 +
-+	return search->state->maxScanReached || search->state->memoryLimitReached ||
-+		search->state->invalidNeighbor || search->state->workLimitReached ||
-+		search->state->hopLimitReached;
-+}
-+
-+static bool
-+HnswTraversalGuidedExpand(HnswTraversalGuidedSearch *search,
-+							  HnswElement element, bool bridge, int bridgeHops)
-+{
-+	int			unvisitedLength = 0;
-+
-+	if (HnswTraversalGuidedCheckUncertainty(search))
-+		return false;
-+	if (bridge)
++	Assert(hasMatch || hasNoBridge);
++	if (hasMatch && (!hasNoBridge || frontier->noBridgeDebt < frontier->burst))
 +	{
-+		if (search->state->bridgeWork + 1 + search->lm >
-+			search->state->maxBridgeWork)
++		if (frontier->profile != NULL)
++			frontier->profile->matchFrontierPops++;
++		if (hasNoBridge)
 +		{
-+			search->state->workLimitReached = true;
-+			return false;
-+		}
-+		search->state->bridgeWork += 1 + search->lm;
-+	}
-+
-+	HnswRecordIndexNeighborPage(search->indexPageProfile,
-+								element->neighborPage);
-+	if (!HnswLoadUnvisitedFromDisk(element, search->unvisited, &unvisitedLength,
-+									 search->visited, search->index,
-+									 search->m, search->lm, 0, search->indexPageProfile))
-+	{
-+		search->state->invalidNeighbor = true;
-+		return false;
-+	}
-+	HnswPrefetchUnvisitedIndexPages(search->index, search->unvisited,
-+		unvisitedLength,
-+		search->indexPageProfile);
-+
-+	if (search->tuples != NULL)
-+		*search->tuples += unvisitedLength;
-+	if (search->profile != NULL)
-+	{
-+		search->profile->expandedNodes++;
-+		search->profile->guidedExpandedNodes++;
-+		search->profile->neighborsExamined += unvisitedLength;
-+		if (bridge)
-+		{
-+			search->profile->bridgeExpanded++;
-+			search->profile->missBridgeNodes++;
-+			search->profile->missBridgeEdges += unvisitedLength;
-+			search->profile->maxMissBridgeHops = Max(
-+				search->profile->maxMissBridgeHops, bridgeHops);
-+		}
-+		else
-+			search->profile->matchingExpanded++;
-+	}
-+
-+	if (HnswTraversalGuidedCheckUncertainty(search))
-+		return false;
-+
-+	for (int i = 0; i < unvisitedLength; i++)
-+	{
-+		HnswTraversalGuidedInspectNeighbor(search,
-+			&search->unvisited[i].indextid,
-+			bridge ? bridgeHops + 1 : 1);
-+		if (HnswTraversalGuidedCheckUncertainty(search))
-+			return false;
-+	}
-+
-+	return true;
-+}
-+
-+static bool
-+HnswTraversalGuidedExpandNextBridge(HnswTraversalGuidedSearch *search)
-+{
-+	HnswMissBridgeCandidate *bridge = search->bridgeHead;
-+
-+	Assert(bridge != NULL);
-+	search->bridgeHead = bridge->next;
-+	if (search->bridgeHead == NULL)
-+		search->bridgeTail = NULL;
-+	if (!HnswTraversalGuidedExpand(search, bridge->element, true,
-+									bridge->hops))
-+		return false;
-+
-+	Assert(search->bridgePending > 0);
-+	search->bridgePending--;
-+	return true;
-+}
-+
-+static List *
-+HnswSearchLayerTraversalGuided(List *ep, int ef, Relation index,
-+							   HnswQuery *query, HnswSupport *support, int m,
-+								   visited_hash *visited, int64 *tuples,
-+								   int64 *distanceComputations,
-+								   HnswTraversalProfile *profile,
-+								   HnswScanGuidance *guidance,
-+								   HnswTraversalGuidanceState *state,
-+								   HnswIndexPageProfileState *indexPageProfile)
-+{
-+	HnswTraversalGuidedSearch search;
-+	char	   *base = NULL;
-+	ListCell   *cell;
-+	List	   *result = NIL;
-+	bool		terminated = false;
-+
-+	if (state->phaseContext == NULL ||
-+		CurrentMemoryContext != state->phaseContext)
-+	{
-+		state->invalidNeighbor = true;
-+		return NIL;
-+	}
-+
-+	MemSet(&search, 0, sizeof(search));
-+	search.query = query;
-+	search.index = index;
-+	search.support = support;
-+	state->target = Max(state->target, ef);
-+	search.ef = state->target;
-+	search.m = m;
-+	search.lm = HnswGetLayerM(m, 0);
-+	search.visited = visited;
-+	search.tuples = tuples;
-+	search.distanceComputations = distanceComputations;
-+	search.profile = profile;
-+	search.indexPageProfile = indexPageProfile;
-+	search.guidance = guidance;
-+	search.state = state;
-+	search.candidates = pairingheap_allocate(CompareNearestCandidates, NULL);
-+	search.results = pairingheap_allocate(CompareFurthestCandidates, NULL);
-+	search.unvisited = palloc(search.lm * sizeof(HnswUnvisited));
-+	InitVisited(NULL, visited, false, search.ef, m);
-+
-+	foreach(cell, ep)
-+	{
-+		HnswSearchCandidate *candidate = (HnswSearchCandidate *) lfirst(cell);
-+		HnswElement element = HnswPtrAccess(base, candidate->element);
-+		bool		found;
-+		bool		matches;
-+
-+		if (HnswTraversalGuidedCheckUncertainty(&search))
-+			break;
-+		AddToVisited(NULL, visited, candidate->element, false, &found);
-+		if (HnswTraversalGuidedCheckUncertainty(&search))
-+			break;
-+		if (tuples != NULL)
-+			(*tuples)++;
-+		matches = HnswElementMatchesGuidance(element, guidance, profile, false);
-+		candidate->matchesGuidance = matches;
-+		if (matches)
-+		{
-+			pairingheap_add(search.candidates, &candidate->c_node);
-+			pairingheap_add(search.results, &candidate->w_node);
-+			search.resultCount++;
-+			if (profile != NULL)
++			frontier->noBridgeDebt++;
++			if (frontier->profile != NULL)
 +			{
-+				profile->candidateAdmissions++;
-+				profile->resultAdmissions++;
-+				profile->guidedAdmissions++;
++				frontier->profile->noBridgeDeferred++;
++				frontier->profile->maxNoBridgeDebt = Max(
++					frontier->profile->maxNoBridgeDebt,
++					frontier->noBridgeDebt);
 +			}
 +		}
 +		else
-+			HnswTraversalGuidedEnqueueBridge(&search, element, 0);
-+		if (HnswTraversalGuidedCheckUncertainty(&search))
-+			break;
++			frontier->noBridgeDebt = 0;
++		return HnswGetSearchCandidate(c_node,
++			pairingheap_remove_first(frontier->match));
 +	}
 +
-+	while (!pairingheap_is_empty(search.candidates) || search.bridgeHead != NULL)
-+	{
-+		CHECK_FOR_INTERRUPTS();
-+
-+		if (HnswTraversalGuidedCheckUncertainty(&search))
-+			break;
-+
-+		if (!pairingheap_is_empty(search.candidates))
-+		{
-+			HnswSearchCandidate *candidate = HnswGetSearchCandidate(c_node,
-+				pairingheap_remove_first(search.candidates));
-+			HnswSearchCandidate *furthest = pairingheap_is_empty(search.results) ?
-+				NULL : HnswGetSearchCandidate(w_node,
-+					pairingheap_first(search.results));
-+
-+			if (furthest != NULL && search.resultCount >= state->target &&
-+				candidate->distance > furthest->distance)
-+			{
-+				if (search.bridgeHead == NULL)
-+				{
-+					terminated = true;
-+					break;
-+				}
-+				if (profile != NULL)
-+					profile->stopDeferrals++;
-+				if (!HnswTraversalGuidedExpandNextBridge(&search))
-+					break;
-+				continue;
-+			}
-+			if (!HnswTraversalGuidedExpand(&search,
-+					HnswPtrAccess(base, candidate->element), false, 0))
-+				break;
-+			continue;
-+		}
-+
-+		if (search.bridgeHead != NULL)
-+		{
-+			if (search.resultCount >= state->target && profile != NULL)
-+				profile->stopDeferrals++;
-+			if (!HnswTraversalGuidedExpandNextBridge(&search))
-+				break;
-+		}
-+	}
-+
-+	state->guidedResultCount = search.resultCount;
-+	state->bridgePendingAtTermination = search.bridgePending;
-+	if (profile != NULL)
-+		profile->bridgePendingAtTermination = search.bridgePending;
-+	if (profile != NULL && !terminated &&
-+		!state->maxScanReached && !state->memoryLimitReached &&
-+		!state->invalidNeighbor && !state->workLimitReached &&
-+		!state->hopLimitReached)
-+		profile->exhaustedTerminations++;
-+
-+	while (!pairingheap_is_empty(search.results))
-+	{
-+		HnswSearchCandidate *candidate = HnswGetSearchCandidate(w_node,
-+			pairingheap_remove_first(search.results));
-+
-+		result = lappend(result, candidate);
-+	}
-+
-+	return result;
++	Assert(hasNoBridge);
++	Assert(frontier->noBridgePending > 0);
++	frontier->noBridgePending--;
++	frontier->noBridgeDebt = 0;
++	if (frontier->profile != NULL)
++		frontier->profile->noBridgeFrontierPops++;
++	return HnswGetSearchCandidate(c_node,
++		pairingheap_remove_first(frontier->noBridge));
  }
  
  /*
@@ -5056,6 +4823,7 @@ index f4e4d82..e5f1802 100644
 -	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
 -	pairingheap *W = pairingheap_allocate(CompareFurthestCandidates, NULL);
 +	pairingheap *C = NULL;
++	HnswDualFrontier dualFrontier = {0};
 +	pairingheap *W = NULL;
 +	pairingheap *G = NULL;
 +	List	   *guidedCandidates = NIL;
@@ -5073,33 +4841,30 @@ index f4e4d82..e5f1802 100644
  	bool		inMemory = index == NULL;
 +	bool		useAcorn1 = !inserting && lc == 0 && hnsw_filter_strategy == HNSW_FILTER_STRATEGY_ACORN1 && HnswGuidanceIsActiveForScan(guidance);
 +	bool		useGuidedCollect = !inserting && lc == 0 && hnsw_filter_strategy == HNSW_FILTER_STRATEGY_GUIDED_COLLECT && HnswGuidanceIsActiveForScan(guidance);
-+	bool		useTraversalGuided = !inserting && lc == 0 &&
++	bool		useTraversalPrioritization = !inserting && lc == 0 &&
 +		hnsw_filter_strategy == HNSW_FILTER_STRATEGY_TRAVERSAL_GUIDED &&
-+		traversalGuidance != NULL && traversalGuidance->phaseEnabled &&
++		traversalGuidance != NULL &&
++		traversalGuidance->prioritizationEnabled &&
++		traversalGuidance->finalPath ==
++			HNSW_TRAVERSAL_PATH_APPROXIMATE_PRIORITIZATION &&
 +		HnswGuidanceIsActiveForScan(guidance);
 +	bool		useTraversalAdmission = !inserting && lc == 0 &&
 +		hnsw_filter_strategy == HNSW_FILTER_STRATEGY_TRAVERSAL_GUIDED &&
 +		traversalGuidance != NULL &&
-+		traversalGuidance->finalPath == HNSW_TRAVERSAL_PATH_GUIDED &&
++		(traversalGuidance->finalPath ==
++			HNSW_TRAVERSAL_PATH_CANDIDATE_ADMISSION ||
++		 useTraversalPrioritization) &&
 +		HnswGuidanceIsActiveForScan(guidance);
 +	bool		useAdmissionGuidance = useAcorn1 || useTraversalAdmission;
 +	bool		trackTraversal = !inserting && lc == 0 && traversalProfile != NULL;
 +	bool		terminationRecorded = false;
 +	int			guidedTarget = hnsw_guided_collect_target;
 +
-+	if (useTraversalGuided)
-+	{
-+		if (inMemory || !initVisited || v == NULL || discarded != NULL)
-+		{
-+			traversalGuidance->invalidNeighbor = true;
-+			return NIL;
-+		}
-+		return HnswSearchLayerTraversalGuided(ep, ef, index, q, support, m,
-+			v, tuples, distanceComputations, traversalProfile, guidance,
-+			traversalGuidance, indexPageProfile);
-+	}
-+
-+	C = pairingheap_allocate(CompareNearestCandidates, heapCompareArg);
++	if (useTraversalPrioritization)
++		HnswDualFrontierInit(&dualFrontier, heapCompareArg,
++			traversalGuidance->burst, traversalProfile);
++	else
++		C = pairingheap_allocate(CompareNearestCandidates, heapCompareArg);
 +	W = pairingheap_allocate(CompareFurthestCandidates, heapCompareArg);
 +	unvisited = palloc(lm * sizeof(HnswUnvisited));
 +
@@ -5112,7 +4877,7 @@ index f4e4d82..e5f1802 100644
  
  	if (v == NULL)
  	{
-@@ -858,6 +1633,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+@@ -858,6 +1306,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
  	{
  		HnswSearchCandidate *sc = (HnswSearchCandidate *) lfirst(lc2);
  		bool		found;
@@ -5120,16 +4885,21 @@ index f4e4d82..e5f1802 100644
  
  		if (initVisited)
  		{
-@@ -869,36 +1645,107 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+@@ -868,37 +1317,155 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 				(*tuples)++;
  		}
  
- 		pairingheap_add(C, &sc->c_node);
+-		pairingheap_add(C, &sc->c_node);
 -		pairingheap_add(W, &sc->w_node);
-+		if (trackTraversal)
-+			traversalProfile->candidateAdmissions++;
 +		if (useAdmissionGuidance || useGuidedCollect)
 +			matchesGuidance = HnswElementMatchesGuidance(HnswPtrAccess(base, sc->element), guidance, traversalProfile, false);
 +		sc->matchesGuidance = matchesGuidance;
++		if (useTraversalPrioritization)
++			HnswDualFrontierAdd(&dualFrontier, sc);
++		else
++			pairingheap_add(C, &sc->c_node);
++		if (trackTraversal)
++			traversalProfile->candidateAdmissions++;
 +		if (!useAdmissionGuidance || matchesGuidance)
 +		{
 +			pairingheap_add(W, &sc->w_node);
@@ -5162,36 +4932,75 @@ index f4e4d82..e5f1802 100644
  			wlen++;
  	}
  
- 	while (!pairingheap_is_empty(C))
+-	while (!pairingheap_is_empty(C))
++	while (useTraversalPrioritization ?
++		   !HnswDualFrontierIsEmpty(&dualFrontier) :
++		   !pairingheap_is_empty(C))
  	{
- 		HnswSearchCandidate *c = HnswGetSearchCandidate(c_node, pairingheap_remove_first(C));
+-		HnswSearchCandidate *c = HnswGetSearchCandidate(c_node, pairingheap_remove_first(C));
 -		HnswSearchCandidate *f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
-+		HnswSearchCandidate *f = pairingheap_is_empty(W) ? NULL : HnswGetSearchCandidate(w_node, pairingheap_first(W));
++		HnswSearchCandidate *c;
++		HnswSearchCandidate *f = pairingheap_is_empty(W) ?
++			NULL : HnswGetSearchCandidate(w_node, pairingheap_first(W));
  		HnswElement cElement;
  
 -		if (c->distance > f->distance)
 -			break;
 +		CHECK_FOR_INTERRUPTS();
 +
-+		if (f != NULL && wlen >= ef && c->distance > f->distance)
++		if (useTraversalPrioritization)
 +		{
-+			if (!useGuidedCollect || glen >= guidedTarget)
++			if (f != NULL && wlen >= ef)
 +			{
-+				if (trackTraversal)
-+					traversalProfile->stockTerminations++;
-+				terminationRecorded = true;
-+				break;
-+			}
++				double		frontierMin =
++					HnswDualFrontierMinDistance(&dualFrontier);
 +
-+			if (tuples != NULL && hnsw_max_scan_tuples > 0 && *tuples >= hnsw_max_scan_tuples)
-+			{
 +				if (trackTraversal)
-+					traversalProfile->maxScanTerminations++;
-+				terminationRecorded = true;
-+				break;
++				{
++					traversalProfile->dualFrontierTerminationChecks++;
++					if (!pairingheap_is_empty(dualFrontier.match) &&
++						!pairingheap_is_empty(dualFrontier.noBridge))
++						traversalProfile->dualFrontierTerminationChecksWithBoth++;
++				}
++				if (frontierMin > f->distance)
++				{
++					if (trackTraversal)
++					{
++						traversalProfile->stockTerminations++;
++						traversalProfile->dualFrontierTerminations++;
++						if (!pairingheap_is_empty(dualFrontier.match) &&
++							!pairingheap_is_empty(dualFrontier.noBridge))
++							traversalProfile->dualFrontierTerminationsWithBoth++;
++					}
++					terminationRecorded = true;
++					break;
++				}
 +			}
-+			if (trackTraversal)
-+				traversalProfile->stopDeferrals++;
++			c = HnswDualFrontierPop(&dualFrontier);
++		}
++		else
++		{
++			c = HnswGetSearchCandidate(c_node, pairingheap_remove_first(C));
++			if (f != NULL && wlen >= ef && c->distance > f->distance)
++			{
++				if (!useGuidedCollect || glen >= guidedTarget)
++				{
++					if (trackTraversal)
++						traversalProfile->stockTerminations++;
++					terminationRecorded = true;
++					break;
++				}
++
++				if (tuples != NULL && hnsw_max_scan_tuples > 0 && *tuples >= hnsw_max_scan_tuples)
++				{
++					if (trackTraversal)
++						traversalProfile->maxScanTerminations++;
++					terminationRecorded = true;
++					break;
++				}
++				if (trackTraversal)
++					traversalProfile->stopDeferrals++;
++			}
 +		}
  
  		cElement = HnswPtrAccess(base, c->element);
@@ -5203,7 +5012,11 @@ index f4e4d82..e5f1802 100644
 +				if (c->matchesGuidance)
 +					traversalProfile->matchingExpanded++;
 +				else
++				{
 +					traversalProfile->bridgeExpanded++;
++					if (useTraversalPrioritization)
++						traversalProfile->noBridgeExpansions++;
++				}
 +			}
 +		}
  
@@ -5215,7 +5028,10 @@ index f4e4d82..e5f1802 100644
 +			if (!inserting)
 +					HnswRecordIndexNeighborPage(indexPageProfile,
 +						cElement->neighborPage);
-+			(void) HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc, indexPageProfile);
++			if (!HnswLoadUnvisitedFromDisk(cElement, unvisited,
++					&unvisitedLength, v, index, m, lm, lc,
++					indexPageProfile) && useTraversalPrioritization)
++				traversalGuidance->invalidNeighbor = true;
 +			if (!inserting)
 +					HnswPrefetchUnvisitedIndexPages(index, unvisited,
 +						unvisitedLength, indexPageProfile);
@@ -5234,15 +5050,15 @@ index f4e4d82..e5f1802 100644
  
  		for (int i = 0; i < unvisitedLength; i++)
  		{
-@@ -906,13 +1753,18 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+@@ -906,13 +1473,18 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
  			HnswSearchCandidate *e;
  			double		eDistance;
  			bool		alwaysAdd = wlen < ef;
 +			bool		matchesGuidance = true;
++
++			CHECK_FOR_INTERRUPTS();
  
 -			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
-+			CHECK_FOR_INTERRUPTS();
-+
 +			f = pairingheap_is_empty(W) ? NULL : HnswGetSearchCandidate(w_node, pairingheap_first(W));
  
  			if (inMemory)
@@ -5254,7 +5070,7 @@ index f4e4d82..e5f1802 100644
  			}
  			else
  			{
-@@ -922,19 +1774,55 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+@@ -922,19 +1494,58 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
  
  				/* Avoid any allocations if not adding */
  				eElement = NULL;
@@ -5278,7 +5094,10 @@ index f4e4d82..e5f1802 100644
 +				{
 +					e = HnswInitSearchCandidate(base, eElement, eDistance);
 +					e->matchesGuidance = false;
-+					pairingheap_add(C, &e->c_node);
++					if (useTraversalPrioritization)
++						HnswDualFrontierAdd(&dualFrontier, e);
++					else
++						pairingheap_add(C, &e->c_node);
 +					if (trackTraversal)
 +					{
 +						traversalProfile->candidateAdmissions++;
@@ -5314,12 +5133,16 @@ index f4e4d82..e5f1802 100644
  				}
  
  				continue;
-@@ -946,8 +1834,21 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+@@ -946,8 +1557,24 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
  
  			/* Create a new candidate */
  			e = HnswInitSearchCandidate(base, eElement, eDistance);
+-			pairingheap_add(C, &e->c_node);
 +			e->matchesGuidance = matchesGuidance;
- 			pairingheap_add(C, &e->c_node);
++			if (useTraversalPrioritization)
++				HnswDualFrontierAdd(&dualFrontier, e);
++			else
++				pairingheap_add(C, &e->c_node);
  			pairingheap_add(W, &e->w_node);
 +			if (useGuidedCollect)
 +				wCandidates = lappend(wCandidates, e);
@@ -5336,7 +5159,7 @@ index f4e4d82..e5f1802 100644
  
  			/*
  			 * Do not count elements being deleted towards ef when vacuuming.
-@@ -963,12 +1864,54 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+@@ -963,12 +1590,63 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
  				{
  					HnswSearchCandidate *d = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
  
@@ -5357,6 +5180,15 @@ index f4e4d82..e5f1802 100644
  	}
 +	if (trackTraversal && !terminationRecorded)
 +		traversalProfile->exhaustedTerminations++;
++	if (useTraversalPrioritization)
++	{
++		traversalGuidance->guidedResultCount = Min(wlen, ef);
++		traversalGuidance->bridgePendingAtTermination =
++			dualFrontier.noBridgePending;
++		if (trackTraversal)
++			traversalProfile->bridgePendingAtTermination +=
++				dualFrontier.noBridgePending;
++	}
 +
 +	if (useGuidedCollect && G != NULL && !pairingheap_is_empty(G))
 +	{
@@ -5392,7 +5224,7 @@ index f4e4d82..e5f1802 100644
  
  	/* Add each element of W to w */
  	while (!pairingheap_is_empty(W))
-@@ -981,14 +1924,69 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+@@ -981,14 +1659,69 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
  	return w;
  }
  
@@ -5463,7 +5295,7 @@ index f4e4d82..e5f1802 100644
  
  	if (hca->distance < hcb->distance)
  		return 1;
-@@ -996,6 +1994,14 @@ CompareCandidateDistances(const ListCell *a, const ListCell *b)
+@@ -996,6 +1729,14 @@ CompareCandidateDistances(const ListCell *a, const ListCell *b)
  	if (hca->distance > hcb->distance)
  		return -1;
  
@@ -5478,7 +5310,7 @@ index f4e4d82..e5f1802 100644
  	if (HnswPtrPointer(hca->element) < HnswPtrPointer(hcb->element))
  		return 1;
  
-@@ -1068,12 +2074,7 @@ SelectNeighbors(char *base, List *c, int lm, HnswSupport * support, bool *closer
+@@ -1068,12 +1809,7 @@ SelectNeighbors(char *base, List *c, int lm, HnswSupport * support, bool *closer
  	List	   *added = NIL;
  	bool		removedAny = false;
  
@@ -5492,7 +5324,7 @@ index f4e4d82..e5f1802 100644
  	if (sortCandidates)
  	{
  		if (base == NULL)
-@@ -1082,6 +2083,11 @@ SelectNeighbors(char *base, List *c, int lm, HnswSupport * support, bool *closer
+@@ -1082,6 +1818,11 @@ SelectNeighbors(char *base, List *c, int lm, HnswSupport * support, bool *closer
  			list_sort(w, CompareCandidateDistancesOffset);
  	}
  
@@ -5504,7 +5336,7 @@ index f4e4d82..e5f1802 100644
  	while (list_length(w) > 0 && list_length(r) < lm)
  	{
  		/* Assumes w is already ordered desc */
-@@ -1300,7 +2306,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
+@@ -1300,7 +2041,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
  	/* 1st phase: greedy search to insert level */
  	for (int lc = entryLevel; lc >= level + 1; lc--)
  	{
@@ -5513,7 +5345,7 @@ index f4e4d82..e5f1802 100644
  		ep = w;
  	}
  
-@@ -1319,7 +2325,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
+@@ -1319,7 +2060,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
  		List	   *lw = NIL;
  		ListCell   *lc2;
  
@@ -5522,7 +5354,7 @@ index f4e4d82..e5f1802 100644
  
  		/* Convert search candidates to candidates */
  		foreach(lc2, w)
-@@ -1338,12 +2344,8 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
+@@ -1338,12 +2079,8 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
  		if (!inMemory)
  			lw = RemoveElements(base, lw, skipElement);
  
@@ -5538,7 +5370,7 @@ index f4e4d82..e5f1802 100644
  		AddConnections(base, element, neighbors, lc);
  
 diff --git a/src/vector.c b/src/vector.c
-index b8c2953..c7ce8bb 100644
+index b8c295395e9dfcac4532a892c2abcb009d9d46ea..5603f4a7d9158a02d1b4d95214127b8487eea600 100644
 --- a/src/vector.c
 +++ b/src/vector.c
 @@ -2,26 +2,564 @@
@@ -6106,7 +5938,7 @@ index b8c2953..c7ce8bb 100644
  #if PG_VERSION_NUM >= 160000
  #include "varatt.h"
  #endif
-@@ -56,6 +594,5067 @@ _PG_init(void)
+@@ -56,6 +594,5151 @@ _PG_init(void)
  	HalfvecInit();
  	HnswInit();
  	IvfflatInit();
@@ -6172,8 +6004,10 @@ index b8c2953..c7ce8bb 100644
 +			return "validation_only";
 +		case HNSW_TRAVERSAL_PATH_LEGACY_GUIDED:
 +			return "legacy_guided";
-+		case HNSW_TRAVERSAL_PATH_GUIDED:
-+			return "guided";
++		case HNSW_TRAVERSAL_PATH_CANDIDATE_ADMISSION:
++			return "candidate_admission_validation_only";
++		case HNSW_TRAVERSAL_PATH_APPROXIMATE_PRIORITIZATION:
++			return "approximate_traversal_prioritization";
 +		case HNSW_TRAVERSAL_PATH_STOCK_BYPASS:
 +			return "stock_bypass";
 +		case HNSW_TRAVERSAL_PATH_FRESH_STOCK_FALLBACK:
@@ -6199,6 +6033,43 @@ index b8c2953..c7ce8bb 100644
 +			return "iterative_scan";
 +	}
 +	return "unknown";
++}
++
++static const char *
++HnswTraversalAdmissionReasonName(HnswTraversalAdmissionReason reason)
++{
++	switch (reason)
++	{
++		case HNSW_TRAVERSAL_ADMISSION_NOT_REQUESTED:
++			return "not_requested";
++		case HNSW_TRAVERSAL_ADMISSION_NO_PROVEN_GUIDE:
++			return "no_proven_guide";
++		case HNSW_TRAVERSAL_ADMISSION_ITERATIVE_SCAN:
++			return "iterative_scan";
++		case HNSW_TRAVERSAL_ADMISSION_SKIP_ESTIMATE_UNAVAILABLE:
++			return "skip_estimate_unavailable";
++		case HNSW_TRAVERSAL_ADMISSION_LOW_ESTIMATED_SKIP_RATE:
++			return "low_estimated_skip_rate";
++		case HNSW_TRAVERSAL_ADMISSION_DEFAULT_VALIDATION_ONLY:
++			return "default_candidate_admission_validation_only";
++		case HNSW_TRAVERSAL_ADMISSION_ADMITTED:
++			return "planner_proven_guidance_and_explicit_guc";
++	}
++	return "unknown";
++}
++
++static const char *
++HnswTraversalGuidanceScopeName(HnswTraversalFinalPath path)
++{
++	if (path == HNSW_TRAVERSAL_PATH_APPROXIMATE_PRIORITIZATION)
++		return "approximate_traversal_prioritization_and_candidate_admission";
++	if (path == HNSW_TRAVERSAL_PATH_CANDIDATE_ADMISSION)
++		return "candidate_admission_and_pre_heap_tid_validation";
++	if (path == HNSW_TRAVERSAL_PATH_VALIDATION_ONLY)
++		return "pre_heap_tid_validation";
++	if (path == HNSW_TRAVERSAL_PATH_LEGACY_GUIDED)
++		return "legacy_experimental_guidance";
++	return "none";
 +}
 +
 +static const char *
@@ -6282,6 +6153,7 @@ index b8c2953..c7ce8bb 100644
 +	appendStringInfo(output,
 +					"{\"valid\":%s,"
 +					"\"profile_semantics_version\":7,"
++					"\"traversal_prioritization_semantics_version\":1,"
 +					"\"total_scan_ms\":%.6f,"
 +					"\"hnsw_search_ms\":%.6f,"
 +					"\"heap_fetch_ms\":%.6f,"
@@ -6294,6 +6166,10 @@ index b8c2953..c7ce8bb 100644
 +					"\"graph_elements_visited\":" INT64_FORMAT ","
 +					"\"raw_index_tids_returned\":" INT64_FORMAT ","
 +					"\"distance_compute_count\":" INT64_FORMAT ","
++					"\"expanded_nodes\":" INT64_FORMAT ","
++					"\"distance_computations\":" INT64_FORMAT ","
++					"\"expanded_nodes_scope\":\"layer0_total_including_fresh_fallback\","
++					"\"distance_computations_scope\":\"all_hnsw_layers_total_including_fresh_fallback\","
 +					"\"page_access_batches\":" INT64_FORMAT ","
 +					"\"page_access_candidates\":" INT64_FORMAT ","
 +					"\"page_access_prefetches\":" INT64_FORMAT ","
@@ -6312,6 +6188,16 @@ index b8c2953..c7ce8bb 100644
 +						"\"neighbor_expansion_guidance_misses\":" INT64_FORMAT ","
 +						"\"traversal_matching_expanded\":" INT64_FORMAT ","
 +						"\"traversal_bridge_expanded\":" INT64_FORMAT ","
++						"\"match_frontier_pops\":" INT64_FORMAT ","
++						"\"no_bridge_frontier_pops\":" INT64_FORMAT ","
++						"\"no_bridge_deferred\":" INT64_FORMAT ","
++						"\"max_no_bridge_debt\":" INT64_FORMAT ","
++						"\"no_bridge_expansions\":" INT64_FORMAT ","
++						"\"no_bridge_expansions_scope\":\"approximate_prioritization_layer0_predicate_no_frontier_pops\","
++						"\"dual_frontier_termination_checks\":" INT64_FORMAT ","
++						"\"dual_frontier_termination_checks_with_both\":" INT64_FORMAT ","
++						"\"dual_frontier_terminations\":" INT64_FORMAT ","
++						"\"dual_frontier_terminations_with_both\":" INT64_FORMAT ","
 +						"\"traversal_candidate_admissions\":" INT64_FORMAT ","
 +						"\"traversal_result_admissions\":" INT64_FORMAT ","
 +						"\"traversal_guided_admissions\":" INT64_FORMAT ","
@@ -6361,6 +6247,8 @@ index b8c2953..c7ce8bb 100644
 +					profile->visitedTuples,
 +					profile->returnedTuples,
 +					profile->distanceComputations,
++					profile->traversal.expandedNodes,
++					profile->distanceComputations,
 +					profile->pageAccessBatches,
 +					profile->pageAccessCandidates,
 +					profile->pageAccessPrefetches,
@@ -6379,6 +6267,15 @@ index b8c2953..c7ce8bb 100644
 +						profile->traversal.neighborGuidanceMisses,
 +						profile->traversal.matchingExpanded,
 +						profile->traversal.bridgeExpanded,
++						profile->traversal.matchFrontierPops,
++						profile->traversal.noBridgeFrontierPops,
++						profile->traversal.noBridgeDeferred,
++						profile->traversal.maxNoBridgeDebt,
++						profile->traversal.noBridgeExpansions,
++						profile->traversal.dualFrontierTerminationChecks,
++						profile->traversal.dualFrontierTerminationChecksWithBoth,
++						profile->traversal.dualFrontierTerminations,
++						profile->traversal.dualFrontierTerminationsWithBoth,
 +						profile->traversal.candidateAdmissions,
 +						profile->traversal.resultAdmissions,
 +						profile->traversal.guidedAdmissions,
@@ -6455,6 +6352,7 @@ index b8c2953..c7ce8bb 100644
 +					",\"stock_phase_distance_computations\":" INT64_FORMAT
 +					",\"stock_bypass_requests\":" INT64_FORMAT
 +					",\"stock_bypass_reason\":\"%s\""
++					",\"traversal_admission_reason\":\"%s\""
 +					",\"fallback_requests\":" INT64_FORMAT
 +					",\"fallback_reason\":\"%s\""
 +						",\"fallback_stock_expanded_nodes\":" INT64_FORMAT
@@ -6463,11 +6361,15 @@ index b8c2953..c7ce8bb 100644
 +						",\"net_distance_saved\":" INT64_FORMAT
 +						",\"traversal_estimated_skip_rate_valid\":%s"
 +						",\"traversal_estimated_skip_rate\":%.6f"
++						",\"traversal_prioritization_burst\":%d"
 +						",\"iterative_scan\":\"%s\""
 +						",\"filter_strategy\":\"%s\""
-+						",\"traversal_guidance_scope\":\"candidate_admission_and_validation\""
++						",\"traversal_guidance_scope\":\"%s\""
 +						",\"graph_expansion_pruned\":false"
 +						",\"distance_computations_pruned\":false"
++						",\"approximate_prioritization_attempted\":%s"
++						",\"traversal_order_changed\":%s"
++						",\"approximate_ann_path\":%s"
 +						",\"final_path\":\"%s\""
 +					",\"planner_proof_attempted\":%s"
 +					",\"planner_proof_succeeded\":%s"
@@ -6512,6 +6414,8 @@ index b8c2953..c7ce8bb 100644
 +					profile->traversal.stockBypassRequests,
 +					HnswTraversalStockBypassReasonName(
 +						profile->traversalStockBypassReason),
++					HnswTraversalAdmissionReasonName(
++						profile->traversalAdmissionReason),
 +					profile->traversal.fallbackRequests,
 +					HnswTraversalFallbackReasonName(
 +						profile->traversalFallbackReason),
@@ -6522,8 +6426,20 @@ index b8c2953..c7ce8bb 100644
 +						HnswTraversalNetDistanceSaved(profile),
 +						profile->traversalEstimatedSkipRateValid ? "true" : "false",
 +						profile->traversalEstimatedSkipRate,
++						profile->traversalPrioritizationBurst,
 +						HnswIterativeScanModeName(profile->iterativeScan),
 +						HnswFilterStrategyModeName(profile->filterStrategy),
++						HnswTraversalGuidanceScopeName(
++							profile->traversalFinalPath),
++						(profile->traversal.matchFrontierPops > 0 ||
++						 profile->traversal.noBridgeFrontierPops > 0) ?
++							"true" : "false",
++						profile->traversalFinalPath ==
++							HNSW_TRAVERSAL_PATH_APPROXIMATE_PRIORITIZATION ?
++							"true" : "false",
++						profile->traversalFinalPath ==
++							HNSW_TRAVERSAL_PATH_APPROXIMATE_PRIORITIZATION ?
++							"true" : "false",
 +						HnswTraversalFinalPathName(profile->traversalFinalPath),
 +					profile->plannerProof.attempted ? "true" : "false",
 +					profile->plannerProof.succeeded ? "true" : "false",
@@ -11176,7 +11092,7 @@ index b8c2953..c7ce8bb 100644
  /*
 diff --git a/test/expected/hnsw_clone_hot.out b/test/expected/hnsw_clone_hot.out
 new file mode 100644
-index 0000000..e69e865
+index 0000000000000000000000000000000000000000..e69e8650aa0d687a0d6cc6618a8fd8e5f43c69ad
 --- /dev/null
 +++ b/test/expected/hnsw_clone_hot.out
 @@ -0,0 +1,77 @@
@@ -11259,7 +11175,7 @@ index 0000000..e69e865
 +
 diff --git a/test/expected/hnsw_profile.out b/test/expected/hnsw_profile.out
 new file mode 100644
-index 0000000..355f13e
+index 0000000000000000000000000000000000000000..355f13ec5840c890ab88daf769c52b6ff2e7e5ea
 --- /dev/null
 +++ b/test/expected/hnsw_profile.out
 @@ -0,0 +1,44 @@
@@ -11307,8 +11223,328 @@ index 0000000..355f13e
 +(1 row)
 +
 +DROP TABLE hnsw_profile_t;
+diff --git a/test/expected/hnsw_traversal_prioritization.out b/test/expected/hnsw_traversal_prioritization.out
+new file mode 100644
+index 0000000000000000000000000000000000000000..8d1fae8370310153933aa458afc05be3da6f4806
+--- /dev/null
++++ b/test/expected/hnsw_traversal_prioritization.out
+@@ -0,0 +1,314 @@
++SET enable_seqscan = off;
++SET enable_sort = off;
++SET hnsw.ef_search = 16;
++SET hnsw.iterative_scan = off;
++SET hnsw.page_access = off;
++SET hnsw.index_page_access = off;
++SET hnsw.traversal_guided_min_skip_rate = 0;
++SELECT vector_sqlens_build_id() LIKE
++       'sqlens-v12-dual-frontier-prioritization-%' AS r11_loaded;
++ r11_loaded 
++------------
++ t
++(1 row)
++
++SHOW hnsw.traversal_guided_prioritization;
++ hnsw.traversal_guided_prioritization 
++--------------------------------------
++ off
++(1 row)
++
++SHOW hnsw.traversal_guided_burst;
++ hnsw.traversal_guided_burst 
++-----------------------------
++ 8
++(1 row)
++
++SET hnsw.traversal_guided_burst = 0;
++ERROR:  0 is outside the valid range for parameter "hnsw.traversal_guided_burst" (1 .. 1024)
++SET hnsw.traversal_guided_burst = 1025;
++ERROR:  1025 is outside the valid range for parameter "hnsw.traversal_guided_burst" (1 .. 1024)
++SET hnsw.traversal_guided_burst = 1;
++CREATE TABLE hnsw_traversal_priority_t (
++    id integer PRIMARY KEY,
++    eligible boolean NOT NULL,
++    val vector(2) NOT NULL
++);
++INSERT INTO hnsw_traversal_priority_t
++SELECT i,
++       i % 3 = 0,
++       ARRAY[
++           (((i * 37) % 997)::double precision + i / 100000.0)::real,
++           (((i * 97) % 991)::double precision + i / 70000.0)::real
++       ]::vector
++FROM generate_series(1, 768) AS rows(i);
++SET hnsw.build_seed = 57;
++CREATE INDEX hnsw_traversal_priority_idx
++ON hnsw_traversal_priority_t USING hnsw (val vector_l2_ops)
++WITH (m = 8, ef_construction = 80);
++ANALYZE hnsw_traversal_priority_t;
++SELECT vector_hnsw_fragment_tracking_enable(
++    'hnsw_traversal_priority_t'::regclass
++) IS NOT NULL AS tracking_enabled;
++NOTICE:  column "format_version" of relation "pgvector_hnsw_fragment_store" already exists, skipping
++ tracking_enabled 
++------------------
++ t
++(1 row)
++
++CREATE TEMP TABLE hnsw_traversal_observed (
++    ordinal bigserial,
++    mode text NOT NULL,
++    id integer NOT NULL,
++    distance double precision NOT NULL
++);
++CREATE TEMP TABLE hnsw_traversal_profiles (
++    mode text PRIMARY KEY,
++    profile jsonb NOT NULL
++);
++SET hnsw.filter_strategy = off;
++SET hnsw.traversal_guided_prioritization = off;
++SELECT vector_hnsw_guidance_reset();
++ vector_hnsw_guidance_reset 
++----------------------------
++ 
++(1 row)
++
++SELECT vector_hnsw_reset_scan_profile();
++ vector_hnsw_reset_scan_profile 
++--------------------------------
++ 
++(1 row)
++
++INSERT INTO hnsw_traversal_observed (mode, id, distance)
++SELECT 'stock', id, distance
++FROM (
++    SELECT id, val <-> '[500,500]'::vector AS distance
++    FROM hnsw_traversal_priority_t
++    WHERE eligible
++    ORDER BY val <-> '[500,500]'::vector
++    LIMIT 10
++) AS stock;
++INSERT INTO hnsw_traversal_profiles
++VALUES ('stock', vector_hnsw_last_scan_profile()::jsonb);
++SELECT vector_hnsw_guidance_activate(
++    'hnsw_traversal_priority_idx'::regclass,
++    ARRAY['exact:sql:eligible'],
++    'exact'
++) AS activated_atoms;
++ activated_atoms 
++-----------------
++               1
++(1 row)
++
++SET hnsw.filter_strategy = traversal_guided;
++SET hnsw.traversal_guided_prioritization = off;
++SELECT vector_hnsw_reset_scan_profile();
++ vector_hnsw_reset_scan_profile 
++--------------------------------
++ 
++(1 row)
++
++INSERT INTO hnsw_traversal_observed (mode, id, distance)
++SELECT 'validation_only', id, distance
++FROM (
++    SELECT id, val <-> '[500,500]'::vector AS distance
++    FROM hnsw_traversal_priority_t
++    WHERE (SELECT vector_hnsw_guidance_bind(
++               'hnsw_traversal_priority_idx'::regclass,
++               ARRAY['exact:sql:eligible'],
++               'exact'
++           ) OFFSET 0)
++      AND eligible
++    ORDER BY val <-> '[500,500]'::vector
++    LIMIT 10
++) AS validation_only;
++INSERT INTO hnsw_traversal_profiles
++VALUES ('validation_only', vector_hnsw_last_scan_profile()::jsonb);
++SET hnsw.traversal_guided_prioritization = on;
++SELECT vector_hnsw_reset_scan_profile();
++ vector_hnsw_reset_scan_profile 
++--------------------------------
++ 
++(1 row)
++
++INSERT INTO hnsw_traversal_observed (mode, id, distance)
++SELECT 'prioritized', id, distance
++FROM (
++    SELECT id, val <-> '[500,500]'::vector AS distance
++    FROM hnsw_traversal_priority_t
++    WHERE (SELECT vector_hnsw_guidance_bind(
++               'hnsw_traversal_priority_idx'::regclass,
++               ARRAY['exact:sql:eligible'],
++               'exact'
++           ) OFFSET 0)
++      AND eligible
++    ORDER BY val <-> '[500,500]'::vector
++    LIMIT 10
++) AS prioritized;
++INSERT INTO hnsw_traversal_profiles
++VALUES ('prioritized', vector_hnsw_last_scan_profile()::jsonb);
++WITH profiles AS (
++    SELECT
++        (SELECT profile FROM hnsw_traversal_profiles WHERE mode = 'stock') AS stock,
++        (SELECT profile FROM hnsw_traversal_profiles WHERE mode = 'validation_only') AS validation_only,
++        (SELECT profile FROM hnsw_traversal_profiles WHERE mode = 'prioritized') AS prioritized
++), ordered AS (
++    SELECT mode,
++           bool_and(next_distance IS NULL OR distance <= next_distance) AS distance_ordered
++    FROM (
++        SELECT mode, distance,
++               lead(distance) OVER (PARTITION BY mode ORDER BY ordinal) AS next_distance
++        FROM hnsw_traversal_observed
++    ) AS sequence
++    GROUP BY mode
++)
++SELECT
++    stock->>'final_path' = 'stock' AND
++        (stock->>'match_frontier_pops')::bigint = 0 AND
++        (stock->>'no_bridge_frontier_pops')::bigint = 0 AS guc_off_stock,
++    validation_only->>'final_path' = 'candidate_admission_validation_only' AND
++        validation_only->>'traversal_admission_reason' =
++            'default_candidate_admission_validation_only' AND
++        NOT (validation_only->>'traversal_order_changed')::boolean AND
++        (validation_only->>'match_frontier_pops')::bigint = 0 AND
++        (validation_only->>'no_bridge_frontier_pops')::bigint = 0 AS default_validation_only,
++    prioritized->>'final_path' = 'approximate_traversal_prioritization' AND
++        prioritized->>'traversal_admission_reason' =
++            'planner_proven_guidance_and_explicit_guc' AND
++        (prioritized->>'traversal_order_changed')::boolean AND
++        (prioritized->>'approximate_ann_path')::boolean AS explicit_approximate_path,
++    (prioritized->>'match_frontier_pops')::bigint > 0 AND
++        (prioritized->>'no_bridge_frontier_pops')::bigint > 0 AND
++        (prioritized->>'no_bridge_expansions')::bigint =
++            (prioritized->>'no_bridge_frontier_pops')::bigint AS no_bridge_expands,
++    (prioritized->>'no_bridge_deferred')::bigint > 0 AND
++        (prioritized->>'max_no_bridge_debt')::bigint BETWEEN 1 AND 1 AS burst_fair,
++    (prioritized->>'dual_frontier_termination_checks')::bigint > 0 AND
++        (prioritized->>'dual_frontier_termination_checks_with_both')::bigint > 0 AND
++        (prioritized->>'dual_frontier_terminations')::bigint > 0 AND
++        (prioritized->>'dual_frontier_terminations_with_both')::bigint >= 0 AS global_head_termination,
++    (SELECT bool_and(distance_ordered) FROM ordered) AS output_distance_ordered
++FROM profiles;
++ guc_off_stock | default_validation_only | explicit_approximate_path | no_bridge_expands | burst_fair | global_head_termination | output_distance_ordered 
++---------------+-------------------------+---------------------------+-------------------+------------+-------------------------+-------------------------
++ t             | t                       | t                         | t                 | t          | t                       | t
++(1 row)
++
++SELECT vector_hnsw_guidance_activate(
++    'hnsw_traversal_priority_idx'::regclass,
++    ARRAY['exact:sql:id <= 2'],
++    'exact'
++) AS activated_rare_atom;
++ activated_rare_atom 
++---------------------
++                   1
++(1 row)
++
++SELECT vector_hnsw_reset_scan_profile();
++ vector_hnsw_reset_scan_profile 
++--------------------------------
++ 
++(1 row)
++
++SELECT count(*) BETWEEN 0 AND 2 AS rare_rows_bounded
++FROM (
++    SELECT id
++    FROM hnsw_traversal_priority_t
++    WHERE (SELECT vector_hnsw_guidance_bind(
++               'hnsw_traversal_priority_idx'::regclass,
++               ARRAY['exact:sql:id <= 2'],
++               'exact'
++           ) OFFSET 0)
++      AND id <= 2
++    ORDER BY val <-> (
++        SELECT val FROM hnsw_traversal_priority_t WHERE id = 1
++    )
++    LIMIT 2
++) AS rare;
++ rare_rows_bounded 
++-------------------
++ t
++(1 row)
++
++WITH profile AS (
++    SELECT vector_hnsw_last_scan_profile()::jsonb AS value
++)
++SELECT value->>'final_path' = 'fresh_stock_fallback' AND
++       value->>'fallback_reason' = 'insufficient_guided_matches' AND
++       (value->>'fallback_requests')::bigint = 1 AND
++       (value->>'guided_attempt_distance_computations')::bigint > 0 AND
++       (value->>'fallback_stock_distance_computations')::bigint > 0 AS fresh_underfill_fallback
++FROM profile;
++ fresh_underfill_fallback 
++--------------------------
++ t
++(1 row)
++
++SELECT vector_hnsw_guidance_activate(
++    'hnsw_traversal_priority_idx'::regclass,
++    ARRAY['exact:sql:eligible'],
++    'exact'
++) AS reactivated_atoms;
++ reactivated_atoms 
++-------------------
++                 1
++(1 row)
++
++SET hnsw.iterative_scan = strict_order;
++SELECT vector_hnsw_reset_scan_profile();
++ vector_hnsw_reset_scan_profile 
++--------------------------------
++ 
++(1 row)
++
++SELECT count(*) = 4 AS strict_rows_returned
++FROM (
++    SELECT id
++    FROM hnsw_traversal_priority_t
++    WHERE (SELECT vector_hnsw_guidance_bind(
++               'hnsw_traversal_priority_idx'::regclass,
++               ARRAY['exact:sql:eligible'],
++               'exact'
++           ) OFFSET 0)
++      AND eligible
++    ORDER BY val <-> '[500,500]'::vector
++    LIMIT 4
++) AS strict_rows;
++ strict_rows_returned 
++----------------------
++ t
++(1 row)
++
++WITH profile AS (
++    SELECT vector_hnsw_last_scan_profile()::jsonb AS value
++)
++SELECT value->>'final_path' = 'stock_bypass' AND
++       value->>'stock_bypass_reason' = 'iterative_scan' AND
++       value->>'traversal_admission_reason' = 'iterative_scan' AND
++       (value->>'match_frontier_pops')::bigint = 0 AND
++       (value->>'no_bridge_frontier_pops')::bigint = 0 AS strict_iterative_bypass
++FROM profile;
++ strict_iterative_bypass 
++-------------------------
++ t
++(1 row)
++
++SELECT vector_hnsw_guidance_reset();
++ vector_hnsw_guidance_reset 
++----------------------------
++ 
++(1 row)
++
++RESET enable_seqscan;
++RESET enable_sort;
++RESET hnsw.ef_search;
++RESET hnsw.iterative_scan;
++RESET hnsw.page_access;
++RESET hnsw.index_page_access;
++RESET hnsw.filter_strategy;
++RESET hnsw.traversal_guided_min_skip_rate;
++RESET hnsw.traversal_guided_prioritization;
++RESET hnsw.traversal_guided_burst;
++RESET hnsw.build_seed;
++DROP TABLE hnsw_traversal_priority_t;
 diff --git a/test/expected/hnsw_vector.out b/test/expected/hnsw_vector.out
-index cb4d8b9..1625a73 100644
+index cb4d8b97b33823bb5be00b83e6a5e671d634f0dd..1625a739713bf86a87ce3c05b8c31995ca435887 100644
 --- a/test/expected/hnsw_vector.out
 +++ b/test/expected/hnsw_vector.out
 @@ -168,9 +168,9 @@ SHOW hnsw.ef_search;
@@ -11326,7 +11562,7 @@ index cb4d8b9..1625a73 100644
  ---------------------
 diff --git a/test/specs/hnsw_clone_hot.spec b/test/specs/hnsw_clone_hot.spec
 new file mode 100644
-index 0000000..1999f0c
+index 0000000000000000000000000000000000000000..1999f0ce9d1a3d29a43d8b7b214916da3d62c880
 --- /dev/null
 +++ b/test/specs/hnsw_clone_hot.spec
 @@ -0,0 +1,100 @@
@@ -11432,7 +11668,7 @@ index 0000000..1999f0c
 +permutation "prepare_table" "take_old_snapshot" "hot_update" "build_source" "build_clone" "plan_with_old_snapshot" "finish_old_snapshot" "plan_with_fresh_snapshot"
 diff --git a/test/sql/hnsw_profile.sql b/test/sql/hnsw_profile.sql
 new file mode 100644
-index 0000000..50faf0b
+index 0000000000000000000000000000000000000000..50faf0b15695468b110c6ec6979a0e822bfd0ec7
 --- /dev/null
 +++ b/test/sql/hnsw_profile.sql
 @@ -0,0 +1,35 @@
@@ -11471,8 +11707,240 @@ index 0000000..50faf0b
 +FROM p;
 +
 +DROP TABLE hnsw_profile_t;
+diff --git a/test/sql/hnsw_traversal_prioritization.sql b/test/sql/hnsw_traversal_prioritization.sql
+new file mode 100644
+index 0000000000000000000000000000000000000000..f2387f5cbe9e2b82fc132c49676ccda8615ec3bf
+--- /dev/null
++++ b/test/sql/hnsw_traversal_prioritization.sql
+@@ -0,0 +1,226 @@
++SET enable_seqscan = off;
++SET enable_sort = off;
++SET hnsw.ef_search = 16;
++SET hnsw.iterative_scan = off;
++SET hnsw.page_access = off;
++SET hnsw.index_page_access = off;
++SET hnsw.traversal_guided_min_skip_rate = 0;
++
++SELECT vector_sqlens_build_id() LIKE
++       'sqlens-v12-dual-frontier-prioritization-%' AS r11_loaded;
++SHOW hnsw.traversal_guided_prioritization;
++SHOW hnsw.traversal_guided_burst;
++SET hnsw.traversal_guided_burst = 0;
++SET hnsw.traversal_guided_burst = 1025;
++SET hnsw.traversal_guided_burst = 1;
++
++CREATE TABLE hnsw_traversal_priority_t (
++    id integer PRIMARY KEY,
++    eligible boolean NOT NULL,
++    val vector(2) NOT NULL
++);
++INSERT INTO hnsw_traversal_priority_t
++SELECT i,
++       i % 3 = 0,
++       ARRAY[
++           (((i * 37) % 997)::double precision + i / 100000.0)::real,
++           (((i * 97) % 991)::double precision + i / 70000.0)::real
++       ]::vector
++FROM generate_series(1, 768) AS rows(i);
++SET hnsw.build_seed = 57;
++CREATE INDEX hnsw_traversal_priority_idx
++ON hnsw_traversal_priority_t USING hnsw (val vector_l2_ops)
++WITH (m = 8, ef_construction = 80);
++ANALYZE hnsw_traversal_priority_t;
++SELECT vector_hnsw_fragment_tracking_enable(
++    'hnsw_traversal_priority_t'::regclass
++) IS NOT NULL AS tracking_enabled;
++
++CREATE TEMP TABLE hnsw_traversal_observed (
++    ordinal bigserial,
++    mode text NOT NULL,
++    id integer NOT NULL,
++    distance double precision NOT NULL
++);
++CREATE TEMP TABLE hnsw_traversal_profiles (
++    mode text PRIMARY KEY,
++    profile jsonb NOT NULL
++);
++
++SET hnsw.filter_strategy = off;
++SET hnsw.traversal_guided_prioritization = off;
++SELECT vector_hnsw_guidance_reset();
++SELECT vector_hnsw_reset_scan_profile();
++INSERT INTO hnsw_traversal_observed (mode, id, distance)
++SELECT 'stock', id, distance
++FROM (
++    SELECT id, val <-> '[500,500]'::vector AS distance
++    FROM hnsw_traversal_priority_t
++    WHERE eligible
++    ORDER BY val <-> '[500,500]'::vector
++    LIMIT 10
++) AS stock;
++INSERT INTO hnsw_traversal_profiles
++VALUES ('stock', vector_hnsw_last_scan_profile()::jsonb);
++
++SELECT vector_hnsw_guidance_activate(
++    'hnsw_traversal_priority_idx'::regclass,
++    ARRAY['exact:sql:eligible'],
++    'exact'
++) AS activated_atoms;
++SET hnsw.filter_strategy = traversal_guided;
++SET hnsw.traversal_guided_prioritization = off;
++SELECT vector_hnsw_reset_scan_profile();
++INSERT INTO hnsw_traversal_observed (mode, id, distance)
++SELECT 'validation_only', id, distance
++FROM (
++    SELECT id, val <-> '[500,500]'::vector AS distance
++    FROM hnsw_traversal_priority_t
++    WHERE (SELECT vector_hnsw_guidance_bind(
++               'hnsw_traversal_priority_idx'::regclass,
++               ARRAY['exact:sql:eligible'],
++               'exact'
++           ) OFFSET 0)
++      AND eligible
++    ORDER BY val <-> '[500,500]'::vector
++    LIMIT 10
++) AS validation_only;
++INSERT INTO hnsw_traversal_profiles
++VALUES ('validation_only', vector_hnsw_last_scan_profile()::jsonb);
++
++SET hnsw.traversal_guided_prioritization = on;
++SELECT vector_hnsw_reset_scan_profile();
++INSERT INTO hnsw_traversal_observed (mode, id, distance)
++SELECT 'prioritized', id, distance
++FROM (
++    SELECT id, val <-> '[500,500]'::vector AS distance
++    FROM hnsw_traversal_priority_t
++    WHERE (SELECT vector_hnsw_guidance_bind(
++               'hnsw_traversal_priority_idx'::regclass,
++               ARRAY['exact:sql:eligible'],
++               'exact'
++           ) OFFSET 0)
++      AND eligible
++    ORDER BY val <-> '[500,500]'::vector
++    LIMIT 10
++) AS prioritized;
++INSERT INTO hnsw_traversal_profiles
++VALUES ('prioritized', vector_hnsw_last_scan_profile()::jsonb);
++
++WITH profiles AS (
++    SELECT
++        (SELECT profile FROM hnsw_traversal_profiles WHERE mode = 'stock') AS stock,
++        (SELECT profile FROM hnsw_traversal_profiles WHERE mode = 'validation_only') AS validation_only,
++        (SELECT profile FROM hnsw_traversal_profiles WHERE mode = 'prioritized') AS prioritized
++), ordered AS (
++    SELECT mode,
++           bool_and(next_distance IS NULL OR distance <= next_distance) AS distance_ordered
++    FROM (
++        SELECT mode, distance,
++               lead(distance) OVER (PARTITION BY mode ORDER BY ordinal) AS next_distance
++        FROM hnsw_traversal_observed
++    ) AS sequence
++    GROUP BY mode
++)
++SELECT
++    stock->>'final_path' = 'stock' AND
++        (stock->>'match_frontier_pops')::bigint = 0 AND
++        (stock->>'no_bridge_frontier_pops')::bigint = 0 AS guc_off_stock,
++    validation_only->>'final_path' = 'candidate_admission_validation_only' AND
++        validation_only->>'traversal_admission_reason' =
++            'default_candidate_admission_validation_only' AND
++        NOT (validation_only->>'traversal_order_changed')::boolean AND
++        (validation_only->>'match_frontier_pops')::bigint = 0 AND
++        (validation_only->>'no_bridge_frontier_pops')::bigint = 0 AS default_validation_only,
++    prioritized->>'final_path' = 'approximate_traversal_prioritization' AND
++        prioritized->>'traversal_admission_reason' =
++            'planner_proven_guidance_and_explicit_guc' AND
++        (prioritized->>'traversal_order_changed')::boolean AND
++        (prioritized->>'approximate_ann_path')::boolean AS explicit_approximate_path,
++    (prioritized->>'match_frontier_pops')::bigint > 0 AND
++        (prioritized->>'no_bridge_frontier_pops')::bigint > 0 AND
++        (prioritized->>'no_bridge_expansions')::bigint =
++            (prioritized->>'no_bridge_frontier_pops')::bigint AS no_bridge_expands,
++    (prioritized->>'no_bridge_deferred')::bigint > 0 AND
++        (prioritized->>'max_no_bridge_debt')::bigint BETWEEN 1 AND 1 AS burst_fair,
++    (prioritized->>'dual_frontier_termination_checks')::bigint > 0 AND
++        (prioritized->>'dual_frontier_termination_checks_with_both')::bigint > 0 AND
++        (prioritized->>'dual_frontier_terminations')::bigint > 0 AND
++        (prioritized->>'dual_frontier_terminations_with_both')::bigint >= 0 AS global_head_termination,
++    (SELECT bool_and(distance_ordered) FROM ordered) AS output_distance_ordered
++FROM profiles;
++
++SELECT vector_hnsw_guidance_activate(
++    'hnsw_traversal_priority_idx'::regclass,
++    ARRAY['exact:sql:id <= 2'],
++    'exact'
++) AS activated_rare_atom;
++SELECT vector_hnsw_reset_scan_profile();
++SELECT count(*) BETWEEN 0 AND 2 AS rare_rows_bounded
++FROM (
++    SELECT id
++    FROM hnsw_traversal_priority_t
++    WHERE (SELECT vector_hnsw_guidance_bind(
++               'hnsw_traversal_priority_idx'::regclass,
++               ARRAY['exact:sql:id <= 2'],
++               'exact'
++           ) OFFSET 0)
++      AND id <= 2
++    ORDER BY val <-> (
++        SELECT val FROM hnsw_traversal_priority_t WHERE id = 1
++    )
++    LIMIT 2
++) AS rare;
++WITH profile AS (
++    SELECT vector_hnsw_last_scan_profile()::jsonb AS value
++)
++SELECT value->>'final_path' = 'fresh_stock_fallback' AND
++       value->>'fallback_reason' = 'insufficient_guided_matches' AND
++       (value->>'fallback_requests')::bigint = 1 AND
++       (value->>'guided_attempt_distance_computations')::bigint > 0 AND
++       (value->>'fallback_stock_distance_computations')::bigint > 0 AS fresh_underfill_fallback
++FROM profile;
++
++SELECT vector_hnsw_guidance_activate(
++    'hnsw_traversal_priority_idx'::regclass,
++    ARRAY['exact:sql:eligible'],
++    'exact'
++) AS reactivated_atoms;
++SET hnsw.iterative_scan = strict_order;
++SELECT vector_hnsw_reset_scan_profile();
++SELECT count(*) = 4 AS strict_rows_returned
++FROM (
++    SELECT id
++    FROM hnsw_traversal_priority_t
++    WHERE (SELECT vector_hnsw_guidance_bind(
++               'hnsw_traversal_priority_idx'::regclass,
++               ARRAY['exact:sql:eligible'],
++               'exact'
++           ) OFFSET 0)
++      AND eligible
++    ORDER BY val <-> '[500,500]'::vector
++    LIMIT 4
++) AS strict_rows;
++WITH profile AS (
++    SELECT vector_hnsw_last_scan_profile()::jsonb AS value
++)
++SELECT value->>'final_path' = 'stock_bypass' AND
++       value->>'stock_bypass_reason' = 'iterative_scan' AND
++       value->>'traversal_admission_reason' = 'iterative_scan' AND
++       (value->>'match_frontier_pops')::bigint = 0 AND
++       (value->>'no_bridge_frontier_pops')::bigint = 0 AS strict_iterative_bypass
++FROM profile;
++
++SELECT vector_hnsw_guidance_reset();
++RESET enable_seqscan;
++RESET enable_sort;
++RESET hnsw.ef_search;
++RESET hnsw.iterative_scan;
++RESET hnsw.page_access;
++RESET hnsw.index_page_access;
++RESET hnsw.filter_strategy;
++RESET hnsw.traversal_guided_min_skip_rate;
++RESET hnsw.traversal_guided_prioritization;
++RESET hnsw.traversal_guided_burst;
++RESET hnsw.build_seed;
++DROP TABLE hnsw_traversal_priority_t;
 diff --git a/test/sql/hnsw_vector.sql b/test/sql/hnsw_vector.sql
-index a928ba4..b31b622 100644
+index a928ba44e1a59af3533e630316ba71da52607e67..b31b6227e20070e1cb0faefd2adc85e4a6efb0a6 100644
 --- a/test/sql/hnsw_vector.sql
 +++ b/test/sql/hnsw_vector.sql
 @@ -99,7 +99,7 @@ CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (m = 16, ef_construction =

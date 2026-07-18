@@ -1119,428 +1119,103 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 	return true;
 }
 
-typedef struct HnswMissBridgeCandidate
+typedef struct HnswDualFrontier
 {
-	struct HnswMissBridgeCandidate *next;
-	HnswElement element;
-	int			hops;
-} HnswMissBridgeCandidate;
-
-typedef struct HnswTraversalGuidedSearch
-{
-	HnswQuery  *query;
-	Relation	index;
-	HnswSupport *support;
-	int			ef;
-	int			m;
-	int			lm;
-	visited_hash *visited;
-	int64	   *tuples;
-	int64	   *distanceComputations;
+	pairingheap *match;
+	pairingheap *noBridge;
+	int			noBridgePending;
+	int			noBridgeDebt;
+	int			burst;
 	HnswTraversalProfile *profile;
-	HnswIndexPageProfileState *indexPageProfile;
-	HnswScanGuidance *guidance;
-	HnswTraversalGuidanceState *state;
-	pairingheap *candidates;
-	pairingheap *results;
-	int			resultCount;
-	int			bridgePending;
-	HnswUnvisited *unvisited;
-	HnswMissBridgeCandidate *bridgeHead;
-	HnswMissBridgeCandidate *bridgeTail;
-} HnswTraversalGuidedSearch;
+} HnswDualFrontier;
+
+static void
+HnswDualFrontierInit(HnswDualFrontier *frontier, void *heapCompareArg,
+						 int burst, HnswTraversalProfile *profile)
+{
+	Assert(burst >= 1);
+	frontier->match = pairingheap_allocate(CompareNearestCandidates,
+										  heapCompareArg);
+	frontier->noBridge = pairingheap_allocate(CompareNearestCandidates,
+											 heapCompareArg);
+	frontier->noBridgePending = 0;
+	frontier->noBridgeDebt = 0;
+	frontier->burst = burst;
+	frontier->profile = profile;
+}
 
 static bool
-HnswTraversalGuidedCheckUncertainty(HnswTraversalGuidedSearch *search);
-
-static HnswElement
-HnswTraversalGuidedLoadElement(ItemPointer indextid,
-							   HnswTraversalGuidedSearch *search,
-							   bool *matches, double *distance)
+HnswDualFrontierIsEmpty(HnswDualFrontier *frontier)
 {
-	BlockNumber blkno = ItemPointerGetBlockNumber(indextid);
-	OffsetNumber offno = ItemPointerGetOffsetNumber(indextid);
-	Buffer		buf;
-	Page		page;
-	ItemId		itemId;
-	HnswElementTuple etup;
-	HnswElement element;
-
-	if (blkno == HNSW_METAPAGE_BLKNO ||
-		blkno >= RelationGetNumberOfBlocks(search->index) ||
-		!OffsetNumberIsValid(offno))
-	{
-		search->state->invalidNeighbor = true;
-		return NULL;
-	}
-
-	buf = ReadBuffer(search->index, blkno);
-	HnswRecordIndexPage(search->indexPageProfile, blkno);
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	page = BufferGetPage(buf);
-	if (PageGetSpecialSize(page) != MAXALIGN(sizeof(HnswPageOpaqueData)) ||
-		HnswPageGetOpaque(page)->page_id != HNSW_PAGE_ID ||
-		offno > PageGetMaxOffsetNumber(page))
-		goto invalid;
-	itemId = PageGetItemId(page, offno);
-	if (!ItemIdIsNormal(itemId))
-		goto invalid;
-	etup = (HnswElementTuple) PageGetItem(page, itemId);
-	if (!HnswIsElementTuple(etup))
-		goto invalid;
-
-	element = HnswInitElementFromBlock(blkno, offno);
-	HnswLoadElementFromTuple(element, etup, true, false);
-	if (HnswTraversalGuidedCheckUncertainty(search))
-	{
-		UnlockReleaseBuffer(buf);
-		return NULL;
-	}
-	*matches = HnswElementMatchesGuidance(element, search->guidance,
-										 search->profile, true);
-	if (*matches)
-	{
-		if (DatumGetPointer(search->query->value) == NULL)
-			*distance = 0;
-		else
-			*distance = HnswGetDistance(search->query->value,
-									  PointerGetDatum(&etup->data), search->support);
-		if (search->distanceComputations != NULL)
-			(*search->distanceComputations)++;
-	}
-	else if (search->profile != NULL)
-	{
-		search->profile->attemptedDistanceComputationsAvoided++;
-		search->profile->distanceComputationsAvoided++;
-	}
-
-	UnlockReleaseBuffer(buf);
-	return element;
-
-invalid:
-	UnlockReleaseBuffer(buf);
-	search->state->invalidNeighbor = true;
-	return NULL;
+	return pairingheap_is_empty(frontier->match) &&
+		pairingheap_is_empty(frontier->noBridge);
 }
 
 static void
-HnswTraversalGuidedEnqueueBridge(HnswTraversalGuidedSearch *search,
-								 HnswElement element, int hops)
+HnswDualFrontierAdd(HnswDualFrontier *frontier,
+					HnswSearchCandidate *candidate)
 {
-	HnswMissBridgeCandidate *bridge;
-
-	/* Count unresolved misses before checking whether they can be queued. */
-	search->bridgePending++;
-	if (HnswTraversalGuidedCheckUncertainty(search))
-		return;
-	if (hops > search->state->maxBridgeHops)
-	{
-		search->state->hopLimitReached = true;
-		return;
-	}
-
-	bridge = MemoryContextAlloc(search->state->phaseContext, sizeof(*bridge));
-	bridge->next = NULL;
-	bridge->element = element;
-	bridge->hops = hops;
-	if (search->bridgeTail == NULL)
-		search->bridgeHead = bridge;
+	if (candidate->matchesGuidance)
+		pairingheap_add(frontier->match, &candidate->c_node);
 	else
-		search->bridgeTail->next = bridge;
-	search->bridgeTail = bridge;
-}
-
-static void
-HnswTraversalGuidedAdmitMatch(HnswTraversalGuidedSearch *search,
-								  HnswElement element, double distance)
-{
-	HnswSearchCandidate *furthest = pairingheap_is_empty(search->results) ?
-		NULL : HnswGetSearchCandidate(w_node, pairingheap_first(search->results));
-	bool		alwaysAdd = search->resultCount < search->ef;
-	HnswSearchCandidate *candidate;
-
-	if (!alwaysAdd && furthest != NULL && distance >= furthest->distance)
-		return;
-
-	candidate = HnswInitSearchCandidate(NULL, element, distance);
-	candidate->matchesGuidance = true;
-	pairingheap_add(search->candidates, &candidate->c_node);
-	pairingheap_add(search->results, &candidate->w_node);
-	search->resultCount++;
-	if (search->profile != NULL)
 	{
-		search->profile->candidateAdmissions++;
-		search->profile->resultAdmissions++;
-		search->profile->guidedAdmissions++;
-	}
-
-	if (search->resultCount > search->ef)
-	{
-		(void) pairingheap_remove_first(search->results);
-		search->resultCount--;
+		pairingheap_add(frontier->noBridge, &candidate->c_node);
+		frontier->noBridgePending++;
 	}
 }
 
-static void
-HnswTraversalGuidedInspectNeighbor(HnswTraversalGuidedSearch *search,
-								   ItemPointer indextid, int missHops)
+static double
+HnswDualFrontierMinDistance(HnswDualFrontier *frontier)
 {
-	HnswElement element;
-	bool		matches;
-	double		distance = 0;
+	HnswSearchCandidate *match = pairingheap_is_empty(frontier->match) ?
+		NULL : HnswGetSearchCandidate(c_node, pairingheap_first(frontier->match));
+	HnswSearchCandidate *noBridge = pairingheap_is_empty(frontier->noBridge) ?
+		NULL : HnswGetSearchCandidate(c_node, pairingheap_first(frontier->noBridge));
 
-	if (HnswTraversalGuidedCheckUncertainty(search))
-		return;
-	element = HnswTraversalGuidedLoadElement(indextid, search, &matches,
-											 &distance);
-	if (element == NULL)
-		return;
-	if (matches)
-		HnswTraversalGuidedAdmitMatch(search, element, distance);
-	else
-		HnswTraversalGuidedEnqueueBridge(search, element, missHops);
+	Assert(match != NULL || noBridge != NULL);
+	if (match == NULL)
+		return noBridge->distance;
+	if (noBridge == NULL)
+		return match->distance;
+	return Min(match->distance, noBridge->distance);
 }
 
-static bool
-HnswTraversalGuidedCheckUncertainty(HnswTraversalGuidedSearch *search)
+static HnswSearchCandidate *
+HnswDualFrontierPop(HnswDualFrontier *frontier)
 {
-	if (search->tuples != NULL && search->state->maxScanTuples > 0 &&
-		*search->tuples >= search->state->maxScanTuples)
-		search->state->maxScanReached = true;
-	if (search->state->phaseContext != NULL &&
-		MemoryContextMemAllocated(search->state->phaseContext, true) >
-		search->state->maxMemory)
-		search->state->memoryLimitReached = true;
+	bool		hasMatch = !pairingheap_is_empty(frontier->match);
+	bool		hasNoBridge = !pairingheap_is_empty(frontier->noBridge);
 
-	return search->state->maxScanReached || search->state->memoryLimitReached ||
-		search->state->invalidNeighbor || search->state->workLimitReached ||
-		search->state->hopLimitReached;
-}
-
-static bool
-HnswTraversalGuidedExpand(HnswTraversalGuidedSearch *search,
-							  HnswElement element, bool bridge, int bridgeHops)
-{
-	int			unvisitedLength = 0;
-
-	if (HnswTraversalGuidedCheckUncertainty(search))
-		return false;
-	if (bridge)
+	Assert(hasMatch || hasNoBridge);
+	if (hasMatch && (!hasNoBridge || frontier->noBridgeDebt < frontier->burst))
 	{
-		if (search->state->bridgeWork + 1 + search->lm >
-			search->state->maxBridgeWork)
+		if (frontier->profile != NULL)
+			frontier->profile->matchFrontierPops++;
+		if (hasNoBridge)
 		{
-			search->state->workLimitReached = true;
-			return false;
-		}
-		search->state->bridgeWork += 1 + search->lm;
-	}
-
-	HnswRecordIndexNeighborPage(search->indexPageProfile,
-								element->neighborPage);
-	if (!HnswLoadUnvisitedFromDisk(element, search->unvisited, &unvisitedLength,
-									 search->visited, search->index,
-									 search->m, search->lm, 0, search->indexPageProfile))
-	{
-		search->state->invalidNeighbor = true;
-		return false;
-	}
-	HnswPrefetchUnvisitedIndexPages(search->index, search->unvisited,
-		unvisitedLength,
-		search->indexPageProfile);
-
-	if (search->tuples != NULL)
-		*search->tuples += unvisitedLength;
-	if (search->profile != NULL)
-	{
-		search->profile->expandedNodes++;
-		search->profile->guidedExpandedNodes++;
-		search->profile->neighborsExamined += unvisitedLength;
-		if (bridge)
-		{
-			search->profile->bridgeExpanded++;
-			search->profile->missBridgeNodes++;
-			search->profile->missBridgeEdges += unvisitedLength;
-			search->profile->maxMissBridgeHops = Max(
-				search->profile->maxMissBridgeHops, bridgeHops);
-		}
-		else
-			search->profile->matchingExpanded++;
-	}
-
-	if (HnswTraversalGuidedCheckUncertainty(search))
-		return false;
-
-	for (int i = 0; i < unvisitedLength; i++)
-	{
-		HnswTraversalGuidedInspectNeighbor(search,
-			&search->unvisited[i].indextid,
-			bridge ? bridgeHops + 1 : 1);
-		if (HnswTraversalGuidedCheckUncertainty(search))
-			return false;
-	}
-
-	return true;
-}
-
-static bool
-HnswTraversalGuidedExpandNextBridge(HnswTraversalGuidedSearch *search)
-{
-	HnswMissBridgeCandidate *bridge = search->bridgeHead;
-
-	Assert(bridge != NULL);
-	search->bridgeHead = bridge->next;
-	if (search->bridgeHead == NULL)
-		search->bridgeTail = NULL;
-	if (!HnswTraversalGuidedExpand(search, bridge->element, true,
-									bridge->hops))
-		return false;
-
-	Assert(search->bridgePending > 0);
-	search->bridgePending--;
-	return true;
-}
-
-static List *
-HnswSearchLayerTraversalGuided(List *ep, int ef, Relation index,
-							   HnswQuery *query, HnswSupport *support, int m,
-								   visited_hash *visited, int64 *tuples,
-								   int64 *distanceComputations,
-								   HnswTraversalProfile *profile,
-								   HnswScanGuidance *guidance,
-								   HnswTraversalGuidanceState *state,
-								   HnswIndexPageProfileState *indexPageProfile)
-{
-	HnswTraversalGuidedSearch search;
-	char	   *base = NULL;
-	ListCell   *cell;
-	List	   *result = NIL;
-	bool		terminated = false;
-
-	if (state->phaseContext == NULL ||
-		CurrentMemoryContext != state->phaseContext)
-	{
-		state->invalidNeighbor = true;
-		return NIL;
-	}
-
-	MemSet(&search, 0, sizeof(search));
-	search.query = query;
-	search.index = index;
-	search.support = support;
-	state->target = Max(state->target, ef);
-	search.ef = state->target;
-	search.m = m;
-	search.lm = HnswGetLayerM(m, 0);
-	search.visited = visited;
-	search.tuples = tuples;
-	search.distanceComputations = distanceComputations;
-	search.profile = profile;
-	search.indexPageProfile = indexPageProfile;
-	search.guidance = guidance;
-	search.state = state;
-	search.candidates = pairingheap_allocate(CompareNearestCandidates, NULL);
-	search.results = pairingheap_allocate(CompareFurthestCandidates, NULL);
-	search.unvisited = palloc(search.lm * sizeof(HnswUnvisited));
-	InitVisited(NULL, visited, false, search.ef, m);
-
-	foreach(cell, ep)
-	{
-		HnswSearchCandidate *candidate = (HnswSearchCandidate *) lfirst(cell);
-		HnswElement element = HnswPtrAccess(base, candidate->element);
-		bool		found;
-		bool		matches;
-
-		if (HnswTraversalGuidedCheckUncertainty(&search))
-			break;
-		AddToVisited(NULL, visited, candidate->element, false, &found);
-		if (HnswTraversalGuidedCheckUncertainty(&search))
-			break;
-		if (tuples != NULL)
-			(*tuples)++;
-		matches = HnswElementMatchesGuidance(element, guidance, profile, false);
-		candidate->matchesGuidance = matches;
-		if (matches)
-		{
-			pairingheap_add(search.candidates, &candidate->c_node);
-			pairingheap_add(search.results, &candidate->w_node);
-			search.resultCount++;
-			if (profile != NULL)
+			frontier->noBridgeDebt++;
+			if (frontier->profile != NULL)
 			{
-				profile->candidateAdmissions++;
-				profile->resultAdmissions++;
-				profile->guidedAdmissions++;
+				frontier->profile->noBridgeDeferred++;
+				frontier->profile->maxNoBridgeDebt = Max(
+					frontier->profile->maxNoBridgeDebt,
+					frontier->noBridgeDebt);
 			}
 		}
 		else
-			HnswTraversalGuidedEnqueueBridge(&search, element, 0);
-		if (HnswTraversalGuidedCheckUncertainty(&search))
-			break;
+			frontier->noBridgeDebt = 0;
+		return HnswGetSearchCandidate(c_node,
+			pairingheap_remove_first(frontier->match));
 	}
 
-	while (!pairingheap_is_empty(search.candidates) || search.bridgeHead != NULL)
-	{
-		CHECK_FOR_INTERRUPTS();
-
-		if (HnswTraversalGuidedCheckUncertainty(&search))
-			break;
-
-		if (!pairingheap_is_empty(search.candidates))
-		{
-			HnswSearchCandidate *candidate = HnswGetSearchCandidate(c_node,
-				pairingheap_remove_first(search.candidates));
-			HnswSearchCandidate *furthest = pairingheap_is_empty(search.results) ?
-				NULL : HnswGetSearchCandidate(w_node,
-					pairingheap_first(search.results));
-
-			if (furthest != NULL && search.resultCount >= state->target &&
-				candidate->distance > furthest->distance)
-			{
-				if (search.bridgeHead == NULL)
-				{
-					terminated = true;
-					break;
-				}
-				if (profile != NULL)
-					profile->stopDeferrals++;
-				if (!HnswTraversalGuidedExpandNextBridge(&search))
-					break;
-				continue;
-			}
-			if (!HnswTraversalGuidedExpand(&search,
-					HnswPtrAccess(base, candidate->element), false, 0))
-				break;
-			continue;
-		}
-
-		if (search.bridgeHead != NULL)
-		{
-			if (search.resultCount >= state->target && profile != NULL)
-				profile->stopDeferrals++;
-			if (!HnswTraversalGuidedExpandNextBridge(&search))
-				break;
-		}
-	}
-
-	state->guidedResultCount = search.resultCount;
-	state->bridgePendingAtTermination = search.bridgePending;
-	if (profile != NULL)
-		profile->bridgePendingAtTermination = search.bridgePending;
-	if (profile != NULL && !terminated &&
-		!state->maxScanReached && !state->memoryLimitReached &&
-		!state->invalidNeighbor && !state->workLimitReached &&
-		!state->hopLimitReached)
-		profile->exhaustedTerminations++;
-
-	while (!pairingheap_is_empty(search.results))
-	{
-		HnswSearchCandidate *candidate = HnswGetSearchCandidate(w_node,
-			pairingheap_remove_first(search.results));
-
-		result = lappend(result, candidate);
-	}
-
-	return result;
+	Assert(hasNoBridge);
+	Assert(frontier->noBridgePending > 0);
+	frontier->noBridgePending--;
+	frontier->noBridgeDebt = 0;
+	if (frontier->profile != NULL)
+		frontier->profile->noBridgeFrontierPops++;
+	return HnswGetSearchCandidate(c_node,
+		pairingheap_remove_first(frontier->noBridge));
 }
 
 /*
@@ -1554,6 +1229,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		hnsw_build_seed >= 0 ? &heapCompareContext : NULL;
 	List	   *w = NIL;
 	pairingheap *C = NULL;
+	HnswDualFrontier dualFrontier = {0};
 	pairingheap *W = NULL;
 	pairingheap *G = NULL;
 	List	   *guidedCandidates = NIL;
@@ -1570,33 +1246,30 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	bool		inMemory = index == NULL;
 	bool		useAcorn1 = !inserting && lc == 0 && hnsw_filter_strategy == HNSW_FILTER_STRATEGY_ACORN1 && HnswGuidanceIsActiveForScan(guidance);
 	bool		useGuidedCollect = !inserting && lc == 0 && hnsw_filter_strategy == HNSW_FILTER_STRATEGY_GUIDED_COLLECT && HnswGuidanceIsActiveForScan(guidance);
-	bool		useTraversalGuided = !inserting && lc == 0 &&
+	bool		useTraversalPrioritization = !inserting && lc == 0 &&
 		hnsw_filter_strategy == HNSW_FILTER_STRATEGY_TRAVERSAL_GUIDED &&
-		traversalGuidance != NULL && traversalGuidance->phaseEnabled &&
+		traversalGuidance != NULL &&
+		traversalGuidance->prioritizationEnabled &&
+		traversalGuidance->finalPath ==
+			HNSW_TRAVERSAL_PATH_APPROXIMATE_PRIORITIZATION &&
 		HnswGuidanceIsActiveForScan(guidance);
 	bool		useTraversalAdmission = !inserting && lc == 0 &&
 		hnsw_filter_strategy == HNSW_FILTER_STRATEGY_TRAVERSAL_GUIDED &&
 		traversalGuidance != NULL &&
-		traversalGuidance->finalPath == HNSW_TRAVERSAL_PATH_GUIDED &&
+		(traversalGuidance->finalPath ==
+			HNSW_TRAVERSAL_PATH_CANDIDATE_ADMISSION ||
+		 useTraversalPrioritization) &&
 		HnswGuidanceIsActiveForScan(guidance);
 	bool		useAdmissionGuidance = useAcorn1 || useTraversalAdmission;
 	bool		trackTraversal = !inserting && lc == 0 && traversalProfile != NULL;
 	bool		terminationRecorded = false;
 	int			guidedTarget = hnsw_guided_collect_target;
 
-	if (useTraversalGuided)
-	{
-		if (inMemory || !initVisited || v == NULL || discarded != NULL)
-		{
-			traversalGuidance->invalidNeighbor = true;
-			return NIL;
-		}
-		return HnswSearchLayerTraversalGuided(ep, ef, index, q, support, m,
-			v, tuples, distanceComputations, traversalProfile, guidance,
-			traversalGuidance, indexPageProfile);
-	}
-
-	C = pairingheap_allocate(CompareNearestCandidates, heapCompareArg);
+	if (useTraversalPrioritization)
+		HnswDualFrontierInit(&dualFrontier, heapCompareArg,
+			traversalGuidance->burst, traversalProfile);
+	else
+		C = pairingheap_allocate(CompareNearestCandidates, heapCompareArg);
 	W = pairingheap_allocate(CompareFurthestCandidates, heapCompareArg);
 	unvisited = palloc(lm * sizeof(HnswUnvisited));
 
@@ -1644,12 +1317,15 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 				(*tuples)++;
 		}
 
-		pairingheap_add(C, &sc->c_node);
-		if (trackTraversal)
-			traversalProfile->candidateAdmissions++;
 		if (useAdmissionGuidance || useGuidedCollect)
 			matchesGuidance = HnswElementMatchesGuidance(HnswPtrAccess(base, sc->element), guidance, traversalProfile, false);
 		sc->matchesGuidance = matchesGuidance;
+		if (useTraversalPrioritization)
+			HnswDualFrontierAdd(&dualFrontier, sc);
+		else
+			pairingheap_add(C, &sc->c_node);
+		if (trackTraversal)
+			traversalProfile->candidateAdmissions++;
 		if (!useAdmissionGuidance || matchesGuidance)
 		{
 			pairingheap_add(W, &sc->w_node);
@@ -1681,33 +1357,70 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			wlen++;
 	}
 
-	while (!pairingheap_is_empty(C))
+	while (useTraversalPrioritization ?
+		   !HnswDualFrontierIsEmpty(&dualFrontier) :
+		   !pairingheap_is_empty(C))
 	{
-		HnswSearchCandidate *c = HnswGetSearchCandidate(c_node, pairingheap_remove_first(C));
-		HnswSearchCandidate *f = pairingheap_is_empty(W) ? NULL : HnswGetSearchCandidate(w_node, pairingheap_first(W));
+		HnswSearchCandidate *c;
+		HnswSearchCandidate *f = pairingheap_is_empty(W) ?
+			NULL : HnswGetSearchCandidate(w_node, pairingheap_first(W));
 		HnswElement cElement;
 
 		CHECK_FOR_INTERRUPTS();
 
-		if (f != NULL && wlen >= ef && c->distance > f->distance)
+		if (useTraversalPrioritization)
 		{
-			if (!useGuidedCollect || glen >= guidedTarget)
+			if (f != NULL && wlen >= ef)
 			{
-				if (trackTraversal)
-					traversalProfile->stockTerminations++;
-				terminationRecorded = true;
-				break;
-			}
+				double		frontierMin =
+					HnswDualFrontierMinDistance(&dualFrontier);
 
-			if (tuples != NULL && hnsw_max_scan_tuples > 0 && *tuples >= hnsw_max_scan_tuples)
-			{
 				if (trackTraversal)
-					traversalProfile->maxScanTerminations++;
-				terminationRecorded = true;
-				break;
+				{
+					traversalProfile->dualFrontierTerminationChecks++;
+					if (!pairingheap_is_empty(dualFrontier.match) &&
+						!pairingheap_is_empty(dualFrontier.noBridge))
+						traversalProfile->dualFrontierTerminationChecksWithBoth++;
+				}
+				if (frontierMin > f->distance)
+				{
+					if (trackTraversal)
+					{
+						traversalProfile->stockTerminations++;
+						traversalProfile->dualFrontierTerminations++;
+						if (!pairingheap_is_empty(dualFrontier.match) &&
+							!pairingheap_is_empty(dualFrontier.noBridge))
+							traversalProfile->dualFrontierTerminationsWithBoth++;
+					}
+					terminationRecorded = true;
+					break;
+				}
 			}
-			if (trackTraversal)
-				traversalProfile->stopDeferrals++;
+			c = HnswDualFrontierPop(&dualFrontier);
+		}
+		else
+		{
+			c = HnswGetSearchCandidate(c_node, pairingheap_remove_first(C));
+			if (f != NULL && wlen >= ef && c->distance > f->distance)
+			{
+				if (!useGuidedCollect || glen >= guidedTarget)
+				{
+					if (trackTraversal)
+						traversalProfile->stockTerminations++;
+					terminationRecorded = true;
+					break;
+				}
+
+				if (tuples != NULL && hnsw_max_scan_tuples > 0 && *tuples >= hnsw_max_scan_tuples)
+				{
+					if (trackTraversal)
+						traversalProfile->maxScanTerminations++;
+					terminationRecorded = true;
+					break;
+				}
+				if (trackTraversal)
+					traversalProfile->stopDeferrals++;
+			}
 		}
 
 		cElement = HnswPtrAccess(base, c->element);
@@ -1719,7 +1432,11 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 				if (c->matchesGuidance)
 					traversalProfile->matchingExpanded++;
 				else
+				{
 					traversalProfile->bridgeExpanded++;
+					if (useTraversalPrioritization)
+						traversalProfile->noBridgeExpansions++;
+				}
 			}
 		}
 
@@ -1730,7 +1447,10 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			if (!inserting)
 					HnswRecordIndexNeighborPage(indexPageProfile,
 						cElement->neighborPage);
-			(void) HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc, indexPageProfile);
+			if (!HnswLoadUnvisitedFromDisk(cElement, unvisited,
+					&unvisitedLength, v, index, m, lm, lc,
+					indexPageProfile) && useTraversalPrioritization)
+				traversalGuidance->invalidNeighbor = true;
 			if (!inserting)
 					HnswPrefetchUnvisitedIndexPages(index, unvisited,
 						unvisitedLength, indexPageProfile);
@@ -1791,7 +1511,10 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 				{
 					e = HnswInitSearchCandidate(base, eElement, eDistance);
 					e->matchesGuidance = false;
-					pairingheap_add(C, &e->c_node);
+					if (useTraversalPrioritization)
+						HnswDualFrontierAdd(&dualFrontier, e);
+					else
+						pairingheap_add(C, &e->c_node);
 					if (trackTraversal)
 					{
 						traversalProfile->candidateAdmissions++;
@@ -1835,7 +1558,10 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			/* Create a new candidate */
 			e = HnswInitSearchCandidate(base, eElement, eDistance);
 			e->matchesGuidance = matchesGuidance;
-			pairingheap_add(C, &e->c_node);
+			if (useTraversalPrioritization)
+				HnswDualFrontierAdd(&dualFrontier, e);
+			else
+				pairingheap_add(C, &e->c_node);
 			pairingheap_add(W, &e->w_node);
 			if (useGuidedCollect)
 				wCandidates = lappend(wCandidates, e);
@@ -1880,6 +1606,15 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	}
 	if (trackTraversal && !terminationRecorded)
 		traversalProfile->exhaustedTerminations++;
+	if (useTraversalPrioritization)
+	{
+		traversalGuidance->guidedResultCount = Min(wlen, ef);
+		traversalGuidance->bridgePendingAtTermination =
+			dualFrontier.noBridgePending;
+		if (trackTraversal)
+			traversalProfile->bridgePendingAtTermination +=
+				dualFrontier.noBridgePending;
+	}
 
 	if (useGuidedCollect && G != NULL && !pairingheap_is_empty(G))
 	{

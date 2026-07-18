@@ -16,7 +16,7 @@
 #include "utils/sampling.h"
 #include "vector.h"
 
-#define SQLENS_BUILD_ID "sqlens-v11-bfs-locality-proof-ef100000-20260718-r10"
+#define SQLENS_BUILD_ID "sqlens-v12-dual-frontier-prioritization-20260718-r11"
 
 #if PG_VERSION_NUM >= 190000
 typedef Pointer Item;
@@ -141,6 +141,8 @@ extern int	hnsw_traversal_guided_target;
 extern int	hnsw_traversal_guided_max_bridge_hops;
 extern int	hnsw_traversal_guided_max_bridge_work;
 extern double hnsw_traversal_guided_min_skip_rate;
+extern bool hnsw_traversal_guided_prioritization;
+extern int	hnsw_traversal_guided_burst;
 extern double hnsw_scan_mem_multiplier;
 extern int	hnsw_lock_tranche_id;
 
@@ -184,7 +186,8 @@ typedef enum HnswTraversalFinalPath
 	HNSW_TRAVERSAL_PATH_STOCK,
 	HNSW_TRAVERSAL_PATH_VALIDATION_ONLY,
 	HNSW_TRAVERSAL_PATH_LEGACY_GUIDED,
-	HNSW_TRAVERSAL_PATH_GUIDED,
+	HNSW_TRAVERSAL_PATH_CANDIDATE_ADMISSION,
+	HNSW_TRAVERSAL_PATH_APPROXIMATE_PRIORITIZATION,
 	HNSW_TRAVERSAL_PATH_STOCK_BYPASS,
 	HNSW_TRAVERSAL_PATH_FRESH_STOCK_FALLBACK
 } HnswTraversalFinalPath;
@@ -197,6 +200,17 @@ typedef enum HnswTraversalStockBypassReason
 	HNSW_TRAVERSAL_BYPASS_LOW_ESTIMATED_SKIP_RATE,
 	HNSW_TRAVERSAL_BYPASS_ITERATIVE_SCAN
 } HnswTraversalStockBypassReason;
+
+typedef enum HnswTraversalAdmissionReason
+{
+	HNSW_TRAVERSAL_ADMISSION_NOT_REQUESTED,
+	HNSW_TRAVERSAL_ADMISSION_NO_PROVEN_GUIDE,
+	HNSW_TRAVERSAL_ADMISSION_ITERATIVE_SCAN,
+	HNSW_TRAVERSAL_ADMISSION_SKIP_ESTIMATE_UNAVAILABLE,
+	HNSW_TRAVERSAL_ADMISSION_LOW_ESTIMATED_SKIP_RATE,
+	HNSW_TRAVERSAL_ADMISSION_DEFAULT_VALIDATION_ONLY,
+	HNSW_TRAVERSAL_ADMISSION_ADMITTED
+} HnswTraversalAdmissionReason;
 
 typedef enum HnswTraversalFallbackReason
 {
@@ -305,7 +319,7 @@ typedef struct HnswPlannerProofOutcome
 typedef struct HnswTraversalGuidanceState
 {
 	bool		requested;
-	bool		phaseEnabled;
+	bool		prioritizationEnabled;
 	bool		estimatedSkipRateValid;
 	double		estimatedSkipRate;
 	int			target;
@@ -322,10 +336,12 @@ typedef struct HnswTraversalGuidanceState
 	bool		invalidNeighbor;
 	int			guidedResultCount;
 	int			bridgePendingAtTermination;
+	int			burst;
 	HnswIterativeScanMode iterativeScan;
 	HnswFilterStrategyMode filterStrategy;
 	HnswTraversalFinalPath finalPath;
 	HnswTraversalStockBypassReason stockBypassReason;
+	HnswTraversalAdmissionReason admissionReason;
 	HnswTraversalFallbackReason fallbackReason;
 } HnswTraversalGuidanceState;
 
@@ -358,6 +374,15 @@ typedef struct HnswTraversalProfile
 	int64		fallbackStockDistanceComputations;
 	int64		matchingExpanded;
 	int64		bridgeExpanded;
+	int64		matchFrontierPops;
+	int64		noBridgeFrontierPops;
+	int64		noBridgeDeferred;
+	int64		maxNoBridgeDebt;
+	int64		noBridgeExpansions;
+	int64		dualFrontierTerminationChecks;
+	int64		dualFrontierTerminationChecksWithBoth;
+	int64		dualFrontierTerminations;
+	int64		dualFrontierTerminationsWithBoth;
 	int64		candidateAdmissions;
 	int64		resultAdmissions;
 	int64		guidedAdmissions;
@@ -423,9 +448,11 @@ typedef struct HnswScanProfile
 	HnswPlannerProofOutcome plannerProof;
 	HnswTraversalFinalPath traversalFinalPath;
 	HnswTraversalStockBypassReason traversalStockBypassReason;
+	HnswTraversalAdmissionReason traversalAdmissionReason;
 	HnswTraversalFallbackReason traversalFallbackReason;
 	bool		traversalEstimatedSkipRateValid;
 	double		traversalEstimatedSkipRate;
+	int			traversalPrioritizationBurst;
 	HnswIterativeScanMode iterativeScan;
 	HnswFilterStrategyMode filterStrategy;
 	int			plannerProofCount;

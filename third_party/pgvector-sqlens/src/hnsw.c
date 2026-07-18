@@ -90,6 +90,8 @@ int			hnsw_traversal_guided_target;
 int			hnsw_traversal_guided_max_bridge_hops;
 int			hnsw_traversal_guided_max_bridge_work;
 double		hnsw_traversal_guided_min_skip_rate;
+bool		hnsw_traversal_guided_prioritization;
+int			hnsw_traversal_guided_burst;
 double		hnsw_scan_mem_multiplier;
 int			hnsw_lock_tranche_id;
 static relopt_kind hnsw_relopt_kind;
@@ -321,7 +323,7 @@ HnswInit(void)
 							   HnswPreferredIndexAssign, NULL);
 
 	DefineCustomEnumVariable("hnsw.filter_strategy", "Sets predicate-aware HNSW traversal strategy",
-							 "off preserves pgvector behavior; safe_guided is validation-only and preserves stock graph traversal; traversal_guided performs native graph expansion and vector distance computation followed by planner-proven predicate-aware result-heap admission and pre-heap TID suppression when iterative_scan is off, and otherwise bypasses to stock; acorn1 and guided_collect are experimental heuristic modes.",
+							 "off preserves pgvector behavior; safe_guided is validation-only and preserves stock graph traversal; traversal_guided performs native graph expansion and vector distance computation followed by planner-proven predicate-aware result-heap admission and pre-heap TID suppression. With hnsw.traversal_guided_prioritization=false, it retains distance-ordered candidate-admission/validation-only traversal; true enables bounded approximate layer-0 traversal prioritization. acorn1 and guided_collect are experimental heuristic modes.",
 							 &hnsw_filter_strategy,
 							 HNSW_FILTER_STRATEGY_OFF, hnsw_filter_strategy_options, PGC_USERSET, 0, NULL, NULL, NULL);
 
@@ -349,6 +351,16 @@ HnswInit(void)
 							 "Requests below this estimated benefit threshold bypass directly to stock traversal without membership checks.",
 							 &hnsw_traversal_guided_min_skip_rate,
 							 0.20, 0, 1, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("hnsw.traversal_guided_prioritization", "Enables bounded predicate-guided layer-0 traversal prioritization",
+							 "The default false retains distance-ordered candidate-admission/validation-only behavior. True requires planner-proven guidance, keeps predicate-NO nodes as expandable graph bridges, and enables bounded approximate traversal prioritization that may change ANN recall relative to stock traversal.",
+							 &hnsw_traversal_guided_prioritization,
+							 false, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("hnsw.traversal_guided_burst", "Sets the maximum consecutive MAYBE frontier pops while a predicate-NO bridge is pending",
+							 "After this many MAYBE pops, traversal must expand the current nearest predicate-NO bridge before prioritizing another MAYBE node.",
+							 &hnsw_traversal_guided_burst,
+							 8, 1, 1024, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	/* Same range as hash_mem_multiplier */
 	DefineCustomRealVariable("hnsw.scan_mem_multiplier", "Sets the multiple of work_mem to use for iterative scans",

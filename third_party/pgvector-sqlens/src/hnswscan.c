@@ -136,6 +136,7 @@ HnswInitializeTraversalGuidance(HnswScanOpaque so)
 	state->iterativeScan = (HnswIterativeScanMode) hnsw_iterative_scan;
 	state->filterStrategy = (HnswFilterStrategyMode) hnsw_filter_strategy;
 	state->finalPath = HNSW_TRAVERSAL_PATH_STOCK;
+	state->admissionReason = HNSW_TRAVERSAL_ADMISSION_NOT_REQUESTED;
 	guidanceActive = HnswGuidanceIsActiveForScan(so->guidance);
 
 	if (hnsw_filter_strategy == HNSW_FILTER_STRATEGY_OFF)
@@ -169,33 +170,55 @@ HnswInitializeTraversalGuidance(HnswScanOpaque so)
 	Assert(hnsw_filter_strategy == HNSW_FILTER_STRATEGY_TRAVERSAL_GUIDED);
 
 	state->requested = true;
-	/* The GUC is not a SQL LIMIT; never certify less than the layer-0 ef. */
-	state->target = Max(hnsw_traversal_guided_target, hnsw_ef_search);
+	/* The deprecated target GUC cannot change the layer-0 result contract. */
+	state->target = hnsw_ef_search;
 	state->maxBridgeHops = hnsw_traversal_guided_max_bridge_hops;
 	state->maxBridgeWork = hnsw_traversal_guided_max_bridge_work;
 	state->maxScanTuples = hnsw_max_scan_tuples;
 	state->maxMemory = so->maxMemory;
+	state->burst = hnsw_traversal_guided_burst;
 	state->estimatedSkipRateValid = HnswGuidanceGetEstimatedSkipRate(
 		so->guidance, &state->estimatedSkipRate);
 
 	if (!guidanceActive)
+	{
 		state->stockBypassReason = HNSW_TRAVERSAL_BYPASS_NO_PROVEN_GUIDE;
+		state->admissionReason = HNSW_TRAVERSAL_ADMISSION_NO_PROVEN_GUIDE;
+	}
 	else if (hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF)
+	{
 		state->stockBypassReason = HNSW_TRAVERSAL_BYPASS_ITERATIVE_SCAN;
+		state->admissionReason = HNSW_TRAVERSAL_ADMISSION_ITERATIVE_SCAN;
+	}
 	else if (!state->estimatedSkipRateValid)
+	{
 		state->stockBypassReason = HNSW_TRAVERSAL_BYPASS_SKIP_ESTIMATE_UNAVAILABLE;
+		state->admissionReason = HNSW_TRAVERSAL_ADMISSION_SKIP_ESTIMATE_UNAVAILABLE;
+	}
 	else if (state->estimatedSkipRate < hnsw_traversal_guided_min_skip_rate)
+	{
 		state->stockBypassReason = HNSW_TRAVERSAL_BYPASS_LOW_ESTIMATED_SKIP_RATE;
+		state->admissionReason = HNSW_TRAVERSAL_ADMISSION_LOW_ESTIMATED_SKIP_RATE;
+	}
 	else
 	{
+		if (!hnsw_traversal_guided_prioritization)
+		{
+			state->finalPath = HNSW_TRAVERSAL_PATH_CANDIDATE_ADMISSION;
+			state->admissionReason =
+				HNSW_TRAVERSAL_ADMISSION_DEFAULT_VALIDATION_ONLY;
+			return;
+		}
+
 		/*
-		 * Guidance participates in the native distance-ordered traversal and
-		 * controls result admission.  It never starts the legacy pre-distance
-		 * pruning phase, whose unresolved bridge frontier cannot be certified
-		 * without degenerating into an all-graph walk.
+		 * Both frontiers remain distance ordered internally.  The bounded pop
+		 * schedule prioritizes MAYBE nodes without starving predicate-NO graph
+		 * bridges; this is approximate ANN prioritization, not exact-safe graph
+		 * pruning or a stock-equivalent traversal.
 		 */
-		state->phaseEnabled = false;
-		state->finalPath = HNSW_TRAVERSAL_PATH_GUIDED;
+		state->prioritizationEnabled = true;
+		state->finalPath = HNSW_TRAVERSAL_PATH_APPROXIMATE_PRIORITIZATION;
+		state->admissionReason = HNSW_TRAVERSAL_ADMISSION_ADMITTED;
 		return;
 	}
 
@@ -229,12 +252,12 @@ GetScanItems(IndexScanDesc scan)
 	int64		avoidedStart = so->traversal.distanceComputationsAvoided;
 	List	   *items;
 
-	if (!state->phaseEnabled)
+	if (!state->prioritizationEnabled)
 	{
 		bool		continuingFallback =
 			state->finalPath == HNSW_TRAVERSAL_PATH_FRESH_STOCK_FALLBACK;
 		bool		guidedAdmission =
-			state->finalPath == HNSW_TRAVERSAL_PATH_GUIDED;
+			state->finalPath == HNSW_TRAVERSAL_PATH_CANDIDATE_ADMISSION;
 
 		if (continuingFallback)
 			so->traversal.fallbackRequests++;
@@ -278,17 +301,16 @@ GetScanItems(IndexScanDesc scan)
 
 		so->traversal.guidedPhaseDistanceComputations +=
 			so->distanceComputations - distanceStart;
+		so->traversal.guidedExpandedNodes +=
+			so->traversal.expandedNodes - expandedStart;
 		guidedUsable = state->guidedResultCount >= state->target &&
-			state->bridgePendingAtTermination == 0 &&
-			!state->maxScanReached && !state->memoryLimitReached &&
-			!state->invalidNeighbor && !state->workLimitReached &&
-			!state->hopLimitReached;
+			!state->invalidNeighbor;
 		if (guidedUsable)
 			return items;
 
 		state->fallbackReason = HnswTraversalGuidanceFallbackReason(state);
 		state->finalPath = HNSW_TRAVERSAL_PATH_FRESH_STOCK_FALLBACK;
-		state->phaseEnabled = false;
+		state->prioritizationEnabled = false;
 		state->phaseContext = NULL;
 		so->traversal.fallbackRequests++;
 		/* Abandoned pre-distance skips are attempted work, not net savings. */
@@ -413,9 +435,13 @@ HnswResetScanProfile(void)
 	hnsw_last_profile.plannerProof.bypassReason = HNSW_PROOF_BYPASS_SCAN_NOT_STARTED;
 	hnsw_last_profile.traversalFinalPath = HNSW_TRAVERSAL_PATH_STOCK;
 	hnsw_last_profile.traversalStockBypassReason = HNSW_TRAVERSAL_BYPASS_NONE;
+	hnsw_last_profile.traversalAdmissionReason =
+		HNSW_TRAVERSAL_ADMISSION_NOT_REQUESTED;
 	hnsw_last_profile.traversalFallbackReason = HNSW_TRAVERSAL_FALLBACK_NONE;
 	hnsw_last_profile.traversalEstimatedSkipRateValid = false;
 	hnsw_last_profile.traversalEstimatedSkipRate = 0;
+	hnsw_last_profile.traversalPrioritizationBurst =
+		hnsw_traversal_guided_burst;
 	hnsw_last_profile.iterativeScan = (HnswIterativeScanMode) hnsw_iterative_scan;
 	hnsw_last_profile.filterStrategy = (HnswFilterStrategyMode) hnsw_filter_strategy;
 	hnsw_last_profile.plannerProofCount = 0;
@@ -559,7 +585,10 @@ static bool
 HnswScanUsesGuidanceValidation(HnswScanOpaque so)
 {
 	if (so->traversalGuidance.requested)
-		return so->traversalGuidance.finalPath == HNSW_TRAVERSAL_PATH_GUIDED &&
+		return (so->traversalGuidance.finalPath ==
+				HNSW_TRAVERSAL_PATH_CANDIDATE_ADMISSION ||
+			so->traversalGuidance.finalPath ==
+				HNSW_TRAVERSAL_PATH_APPROXIMATE_PRIORITIZATION) &&
 			HnswGuidanceIsActiveForScan(so->guidance);
 
 	return HnswGuidanceIsActiveForScan(so->guidance);
@@ -805,6 +834,11 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	so->idxBlksRead = 0;
 	so->topkTidCount = 0;
 	so->previousDistance = -get_float8_infinity();
+	if (so->traversalGuidance.phaseContext != NULL)
+	{
+		MemoryContextDelete(so->traversalGuidance.phaseContext);
+		so->traversalGuidance.phaseContext = NULL;
+	}
 	MemoryContextReset(so->tmpCtx);
 	MemoryContextReset(so->profileCtx);
 	HnswInitIndexPageProfile(&so->indexPageProfile, so->profileCtx);
@@ -830,7 +864,6 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	so->heapTidDistinctPagesExact = true;
 	MemSet(&so->traversal, 0, sizeof(HnswTraversalProfile));
 	so->abandonedGuidedTuples = 0;
-	so->traversalGuidance.phaseContext = NULL;
 	so->traversalGuidance.bridgeWork = 0;
 	so->traversalGuidance.hopLimitReached = false;
 	so->traversalGuidance.workLimitReached = false;
@@ -839,8 +872,9 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	so->traversalGuidance.invalidNeighbor = false;
 	so->traversalGuidance.guidedResultCount = 0;
 	so->traversalGuidance.bridgePendingAtTermination = 0;
-	/* traversal_guided always reuses the native distance-ordered scan. */
-	so->traversalGuidance.phaseEnabled = false;
+	so->traversalGuidance.prioritizationEnabled =
+		so->traversalGuidance.finalPath ==
+		HNSW_TRAVERSAL_PATH_APPROXIMATE_PRIORITIZATION;
 	HnswResetScanProfile();
 
 	if (keys && scan->numberOfKeys > 0)
@@ -1086,6 +1120,21 @@ hnswendscan(IndexScanDesc scan)
 		hnsw_last_profile.traversal.fallbackStockDistanceComputations += so->traversal.fallbackStockDistanceComputations;
 		hnsw_last_profile.traversal.matchingExpanded += so->traversal.matchingExpanded;
 		hnsw_last_profile.traversal.bridgeExpanded += so->traversal.bridgeExpanded;
+		hnsw_last_profile.traversal.matchFrontierPops += so->traversal.matchFrontierPops;
+		hnsw_last_profile.traversal.noBridgeFrontierPops += so->traversal.noBridgeFrontierPops;
+		hnsw_last_profile.traversal.noBridgeDeferred += so->traversal.noBridgeDeferred;
+		hnsw_last_profile.traversal.maxNoBridgeDebt = Max(
+			hnsw_last_profile.traversal.maxNoBridgeDebt,
+			so->traversal.maxNoBridgeDebt);
+		hnsw_last_profile.traversal.noBridgeExpansions += so->traversal.noBridgeExpansions;
+		hnsw_last_profile.traversal.dualFrontierTerminationChecks +=
+			so->traversal.dualFrontierTerminationChecks;
+		hnsw_last_profile.traversal.dualFrontierTerminationChecksWithBoth +=
+			so->traversal.dualFrontierTerminationChecksWithBoth;
+		hnsw_last_profile.traversal.dualFrontierTerminations +=
+			so->traversal.dualFrontierTerminations;
+		hnsw_last_profile.traversal.dualFrontierTerminationsWithBoth +=
+			so->traversal.dualFrontierTerminationsWithBoth;
 		hnsw_last_profile.traversal.candidateAdmissions += so->traversal.candidateAdmissions;
 		hnsw_last_profile.traversal.resultAdmissions += so->traversal.resultAdmissions;
 		hnsw_last_profile.traversal.guidedAdmissions += so->traversal.guidedAdmissions;
@@ -1145,12 +1194,16 @@ hnswendscan(IndexScanDesc scan)
 	hnsw_last_profile.traversalFinalPath = so->traversalGuidance.finalPath;
 	hnsw_last_profile.traversalStockBypassReason =
 		so->traversalGuidance.stockBypassReason;
+	hnsw_last_profile.traversalAdmissionReason =
+		so->traversalGuidance.admissionReason;
 	hnsw_last_profile.traversalFallbackReason =
 		so->traversalGuidance.fallbackReason;
 	hnsw_last_profile.traversalEstimatedSkipRateValid =
 		so->traversalGuidance.estimatedSkipRateValid;
 	hnsw_last_profile.traversalEstimatedSkipRate =
 		so->traversalGuidance.estimatedSkipRate;
+	hnsw_last_profile.traversalPrioritizationBurst =
+		so->traversalGuidance.burst;
 	hnsw_last_profile.iterativeScan = so->traversalGuidance.iterativeScan;
 	hnsw_last_profile.filterStrategy = so->traversalGuidance.filterStrategy;
 	if (hnsw_last_profile.plannerProofCount < HNSW_PROFILE_MAX_PROOFS)
