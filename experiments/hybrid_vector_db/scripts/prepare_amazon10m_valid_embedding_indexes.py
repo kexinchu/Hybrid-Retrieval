@@ -40,6 +40,10 @@ LEGACY_INDEXES = {
 EXPECTED_ROWS = 10_000_000
 HNSW_M = 16
 HNSW_EF_CONSTRUCTION = 64
+HNSW_MIN_M = 2
+HNSW_MAX_M = 100
+HNSW_MIN_EF_CONSTRUCTION = 4
+HNSW_MAX_EF_CONSTRUCTION = 1000
 INDEX_PROVENANCE_PREFIX = "sqlens-valid-embedding-index-v1:"
 INDEX_PROVENANCE_CONTRACT = "sqlens_valid_embedding_same_heap_hnsw_v1"
 ARTIFACT_CONTRACT = "sqlens_amazon10m_valid_embedding_indexes_v1"
@@ -537,8 +541,10 @@ def source_build_contract(
         "column": "embedding",
         "opclass": "vector_l2_ops",
         "predicate": "embedding_valid",
-        "m": HNSW_M,
-        "ef_construction": HNSW_EF_CONSTRUCTION,
+        "m": int(getattr(args, "hnsw_m", HNSW_M)),
+        "ef_construction": int(
+            getattr(args, "hnsw_ef_construction", HNSW_EF_CONSTRUCTION)
+        ),
         "build_page_order": "insertion",
         "clone_source": "",
         "require_full_memory_build": False,
@@ -559,8 +565,10 @@ def clone_build_contract(
         "column": "embedding",
         "opclass": "vector_l2_ops",
         "predicate": "embedding_valid",
-        "m": HNSW_M,
-        "ef_construction": HNSW_EF_CONSTRUCTION,
+        "m": int(getattr(args, "hnsw_m", HNSW_M)),
+        "ef_construction": int(
+            getattr(args, "hnsw_ef_construction", HNSW_EF_CONSTRUCTION)
+        ),
         "build_page_order": "bfs",
         "clone_source": qualified_name(args.source_index),
         "source_oid": source.oid,
@@ -593,7 +601,10 @@ def index_definition_diff(
         "indexed_column": "embedding",
         "opclass": "vector_l2_ops",
         "predicate": "embedding_valid",
-        "reloptions": {"m": str(HNSW_M), "ef_construction": str(HNSW_EF_CONSTRUCTION)},
+        "reloptions": {
+            "m": str(expected_contract["m"]),
+            "ef_construction": str(expected_contract["ef_construction"]),
+        },
         "comment": provenance_comment(expected_contract),
     }
     observed = {
@@ -641,7 +652,12 @@ def validate_index_state(
     return state
 
 
-def hnsw_create_sql(index_name: str, table: str) -> str:
+def hnsw_create_sql(
+    index_name: str,
+    table: str,
+    hnsw_m: int = HNSW_M,
+    hnsw_ef_construction: int = HNSW_EF_CONSTRUCTION,
+) -> str:
     index_schema, index_relation = parse_qualified_name(index_name)
     table_schema, _ = parse_qualified_name(table)
     if index_schema != table_schema:
@@ -652,8 +668,8 @@ def hnsw_create_sql(index_name: str, table: str) -> str:
     return (
         f"CREATE INDEX {quote_identifier(index_relation)} "
         f"ON {quote_qualified_name(table)} USING hnsw "
-        f"(embedding vector_l2_ops) WITH (m = {HNSW_M}, "
-        f"ef_construction = {HNSW_EF_CONSTRUCTION}) WHERE embedding_valid"
+        f"(embedding vector_l2_ops) WITH (m = {int(hnsw_m)}, "
+        f"ef_construction = {int(hnsw_ef_construction)}) WHERE embedding_valid"
     )
 
 
@@ -696,7 +712,14 @@ def build_source_index(
             "SELECT set_config('hnsw.build_seed', %s, true)",
             (str(args.build_seed),),
         )
-        cur.execute(hnsw_create_sql(index_name, args.table))
+        cur.execute(
+            hnsw_create_sql(
+                index_name,
+                args.table,
+                args.hnsw_m,
+                args.hnsw_ef_construction,
+            )
+        )
         cur.execute(hnsw_comment_sql(index_name, provenance_comment(contract)))
     created = validate_index_state(
         index_state(cur, index_name),
@@ -738,7 +761,14 @@ def build_clone_index(
             "SELECT set_config('hnsw.clone_source', %s, true)",
             (qualified_name(args.source_index),),
         )
-        cur.execute(hnsw_create_sql(index_name, args.table))
+        cur.execute(
+            hnsw_create_sql(
+                index_name,
+                args.table,
+                args.hnsw_m,
+                args.hnsw_ef_construction,
+            )
+        )
         cur.execute(hnsw_comment_sql(index_name, provenance_comment(contract)))
     created = validate_index_state(
         index_state(cur, index_name),
@@ -919,9 +949,22 @@ def dry_run_plan(args: argparse.Namespace) -> dict[str, object]:
         "constraint": args.constraint_name,
         "source_index": qualified_name(args.source_index),
         "clone_index": qualified_name(args.clone_index),
-        "source_create_sql": hnsw_create_sql(args.source_index, args.table),
-        "clone_create_sql": hnsw_create_sql(args.clone_index, args.table),
-        "hnsw": {"m": HNSW_M, "ef_construction": HNSW_EF_CONSTRUCTION},
+        "source_create_sql": hnsw_create_sql(
+            args.source_index,
+            args.table,
+            args.hnsw_m,
+            args.hnsw_ef_construction,
+        ),
+        "clone_create_sql": hnsw_create_sql(
+            args.clone_index,
+            args.table,
+            args.hnsw_m,
+            args.hnsw_ef_construction,
+        ),
+        "hnsw": {
+            "m": args.hnsw_m,
+            "ef_construction": args.hnsw_ef_construction,
+        },
         "source_layout": "insertion",
         "clone_layout": "bfs",
         "clone_source": qualified_name(args.source_index),
@@ -1057,6 +1100,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--expected-vector-so-sha256", type=sha256_value, required=True
     )
     parser.add_argument("--expected-rows", type=positive_int, default=EXPECTED_ROWS)
+    parser.add_argument("--hnsw-m", type=positive_int, default=HNSW_M)
+    parser.add_argument(
+        "--hnsw-ef-construction",
+        type=positive_int,
+        default=HNSW_EF_CONSTRUCTION,
+    )
     parser.add_argument(
         "--maintenance-work-mem", type=memory_setting, default="64GB"
     )
@@ -1085,6 +1134,21 @@ def validate_args(args: argparse.Namespace) -> None:
         raise AssertionError("new default indexes must not reuse legacy index names")
     if not args.expected_sqlens_build_id.strip():
         raise PreparationError("expected SQLens build ID must not be empty")
+    if not HNSW_MIN_M <= args.hnsw_m <= HNSW_MAX_M:
+        raise PreparationError(
+            f"hnsw_m must be in [{HNSW_MIN_M}, {HNSW_MAX_M}]"
+        )
+    if not (
+        HNSW_MIN_EF_CONSTRUCTION
+        <= args.hnsw_ef_construction
+        <= HNSW_MAX_EF_CONSTRUCTION
+    ):
+        raise PreparationError(
+            "hnsw_ef_construction must be in "
+            f"[{HNSW_MIN_EF_CONSTRUCTION}, {HNSW_MAX_EF_CONSTRUCTION}]"
+        )
+    if args.hnsw_ef_construction < 2 * args.hnsw_m:
+        raise PreparationError("hnsw_ef_construction must be at least 2 * hnsw_m")
 
 
 def main(argv: list[str] | None = None) -> int:

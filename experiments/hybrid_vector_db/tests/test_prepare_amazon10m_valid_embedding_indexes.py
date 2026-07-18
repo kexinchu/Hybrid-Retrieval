@@ -27,6 +27,8 @@ def args(**overrides: object) -> argparse.Namespace:
         "expected_sqlens_build_id": BUILD_ID,
         "expected_vector_so_sha256": SHA256,
         "expected_rows": prepare.EXPECTED_ROWS,
+        "hnsw_m": prepare.HNSW_M,
+        "hnsw_ef_construction": prepare.HNSW_EF_CONSTRUCTION,
         "maintenance_work_mem": "64GB",
         "build_seed": 57,
         "proof_output": Path("proof.json"),
@@ -189,6 +191,25 @@ class NamingAndDryRunTests(unittest.TestCase):
         self.assertIn("WITH (m = 16, ef_construction = 64)", sql)
         self.assertTrue(sql.endswith("WHERE embedding_valid"))
         self.assertNotIn("CONCURRENTLY", sql)
+
+    def test_high_quality_build_parameters_enter_sql_and_provenance(self) -> None:
+        parsed = args(hnsw_m=32, hnsw_ef_construction=200)
+        sql = prepare.hnsw_create_sql(
+            parsed.source_index,
+            parsed.table,
+            parsed.hnsw_m,
+            parsed.hnsw_ef_construction,
+        )
+        contract = prepare.source_build_contract(parsed, table_state())
+        self.assertIn("WITH (m = 32, ef_construction = 200)", sql)
+        self.assertEqual(contract["m"], 32)
+        self.assertEqual(contract["ef_construction"], 200)
+
+    def test_validate_args_rejects_invalid_hnsw_parameters(self) -> None:
+        with self.assertRaisesRegex(prepare.PreparationError, "at least 2"):
+            prepare.validate_args(args(hnsw_m=32, hnsw_ef_construction=63))
+        with self.assertRaisesRegex(prepare.PreparationError, "hnsw_m must"):
+            prepare.validate_args(args(hnsw_m=101, hnsw_ef_construction=202))
 
     def test_comment_sql_quotes_identifier_and_literal_without_bind_parameter(self) -> None:
         statement = prepare.hnsw_comment_sql(
