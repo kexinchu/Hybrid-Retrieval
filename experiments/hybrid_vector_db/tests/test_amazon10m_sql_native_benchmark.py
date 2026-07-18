@@ -20,6 +20,44 @@ import amazon10m_sql_native_exact_truth as exact_truth  # noqa: E402
 
 
 class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
+    def _binary_identity_gate(self):
+        build_id = "sqlens-v11-test-build"
+        vector_sha256 = "a" * 64
+        stages_and_connections = [
+            ("experiment_start", "fragment_store"),
+            ("connection_open", "data_guard"),
+            *(("connection_open", mode) for mode in benchmark.MODES),
+            ("pre_exact_truth", "data_guard"),
+            ("pre_calibration", "data_guard"),
+            ("pre_final", "data_guard"),
+            ("manifest_finalization", "data_guard"),
+        ]
+        evidence = [
+            {
+                "sequence": sequence,
+                "stage": stage,
+                "connection": connection,
+                "backend_pid": 1000 + sequence,
+                "database": "benchmark",
+                "expected_sqlens_build_id": build_id,
+                "observed_sqlens_build_id": build_id,
+                "expected_vector_so_sha256": vector_sha256,
+                "observed_vector_so_sha256": vector_sha256,
+                "observed_vector_so_path": "/server/lib/vector.so",
+                "build_id_exact_match": True,
+                "vector_so_sha256_exact_match": True,
+                "path_valid": True,
+                "observed_sha256_valid": True,
+                "exact_match": True,
+            }
+            for sequence, (stage, connection) in enumerate(
+                stages_and_connections, start=1
+            )
+        ]
+        return benchmark.binary_identity_gate_summary(
+            build_id, vector_sha256, evidence
+        )
+
     def _external_truth_fixture(self, directory: Path):
         fbin = directory / "vectors.fbin"
         filters_csv = directory / "filters.csv"
@@ -224,7 +262,12 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         self.assertEqual(args.final_repeats, 5)
         self.assertEqual(args.targets, [0.90, 0.95, 0.99])
         self.assertEqual(args.bootstrap_samples, 10_000)
-        self.assertEqual(args.ef_search_values, [250, 500, 1000, 2000, 5000, 10000])
+        self.assertEqual(
+            args.ef_search_values,
+            [250, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000],
+        )
+        self.assertIsNone(args.expected_sqlens_build_id)
+        self.assertIsNone(args.expected_vector_so_sha256)
         self.assertEqual(args.max_scan_tuples_values, [5_000_000])
         self.assertEqual(args.scan_mem_multiplier_values, [32.0])
         self.assertEqual(tuple(benchmark.MODES), ("stock", "d1", "d1_d2", "d1_d2_d3"))
@@ -438,6 +481,147 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
             benchmark.validate_sqlens_provenance(
                 "sqlens-v11-test", profile | {"profile_semantics_version": 6}
             )
+
+    def test_formal_execute_requires_exact_binary_identity_cli(self):
+        incomplete = (
+            ["--execute"],
+            [
+                "--execute",
+                "--expected-sqlens-build-id",
+                "sqlens-v11-test-build",
+            ],
+            [
+                "--execute",
+                "--expected-vector-so-sha256",
+                "a" * 64,
+            ],
+        )
+        for argv in incomplete:
+            with self.subTest(argv=argv):
+                with mock.patch.object(benchmark, "run_benchmark") as run:
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "requires --expected-sqlens-build-id and --expected-vector-so-sha256",
+                    ):
+                        benchmark.main(argv)
+                    run.assert_not_called()
+
+        with mock.patch.object(benchmark, "run_benchmark", return_value=7) as run:
+            status = benchmark.main(
+                [
+                    "--execute",
+                    "--expected-sqlens-build-id",
+                    "sqlens-v11-test-build",
+                    "--expected-vector-so-sha256",
+                    "a" * 64,
+                ]
+            )
+        self.assertEqual(status, 7)
+        run.assert_called_once()
+
+        for value in ("", "A" * 64, "a" * 63, "g" * 64):
+            with self.subTest(sha256=value):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    benchmark.expected_sha256_arg(value)
+        for value in ("", "sqlens-v10-old", " sqlens-v11-build"):
+            with self.subTest(build_id=value):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    benchmark.expected_sqlens_build_id_arg(value)
+
+    def test_serving_binary_identity_gate_reads_server_and_requires_exact_match(self):
+        build_id = "sqlens-v11-test-build"
+        vector_sha256 = "a" * 64
+        cursor = mock.MagicMock()
+        cursor.fetchone.return_value = (
+            build_id,
+            "/server/lib/vector.so",
+            vector_sha256,
+            1234,
+            "benchmark",
+        )
+        evidence = benchmark.verify_serving_binary_identity(
+            cursor,
+            build_id,
+            vector_sha256,
+            stage="experiment_start",
+            connection="stock",
+        )
+        self.assertTrue(evidence["exact_match"])
+        self.assertEqual(evidence["backend_pid"], 1234)
+        self.assertIn("pg_read_binary_file(path)", cursor.execute.call_args.args[0])
+        self.assertIn("vector_sqlens_build_id()", cursor.execute.call_args.args[0])
+
+        mismatches = (
+            ("sqlens-v11-other", "/server/lib/vector.so", vector_sha256),
+            (build_id, "/server/lib/vector.so", "b" * 64),
+            (build_id, "/server/lib/not-vector", vector_sha256),
+        )
+        for observed_build, path, observed_sha in mismatches:
+            with self.subTest(
+                observed_build=observed_build,
+                path=path,
+                observed_sha=observed_sha,
+            ):
+                cursor.fetchone.return_value = (
+                    observed_build,
+                    path,
+                    observed_sha,
+                    1234,
+                    "benchmark",
+                )
+                with self.assertRaisesRegex(RuntimeError, "binary identity gate failed"):
+                    benchmark.verify_serving_binary_identity(
+                        cursor,
+                        build_id,
+                        vector_sha256,
+                        stage="pre_calibration",
+                        connection="data_guard",
+                    )
+
+        cursor.execute.side_effect = PermissionError("denied")
+        with self.assertRaisesRegex(RuntimeError, "gate unavailable"):
+            benchmark.verify_serving_binary_identity(
+                cursor,
+                build_id,
+                vector_sha256,
+                stage="pre_final",
+                connection="data_guard",
+            )
+
+    def test_binary_identity_summary_fails_closed_without_all_stage_evidence(self):
+        valid = self._binary_identity_gate()
+        self.assertTrue(valid["valid"])
+        self.assertEqual(valid["observed_sqlens_build_id"], valid["expected_sqlens_build_id"])
+        self.assertEqual(
+            valid["observed_vector_so_sha256"],
+            valid["expected_vector_so_sha256"],
+        )
+        missing_finalization = benchmark.binary_identity_gate_summary(
+            valid["expected_sqlens_build_id"],
+            valid["expected_vector_so_sha256"],
+            [
+                item
+                for item in valid["gate_evidence"]
+                if item["stage"] != "manifest_finalization"
+            ],
+        )
+        self.assertFalse(missing_finalization["valid"])
+        self.assertEqual(
+            missing_finalization["missing_required_stages"],
+            ["manifest_finalization"],
+        )
+        forged = dict(valid)
+        forged_evidence = [dict(item) for item in valid["gate_evidence"]]
+        forged_evidence[0]["observed_vector_so_sha256"] = "b" * 64
+        forged["gate_evidence"] = forged_evidence
+        recomputed = benchmark.binary_identity_gate_summary(
+            forged["expected_sqlens_build_id"],
+            forged["expected_vector_so_sha256"],
+            forged_evidence,
+        )
+        self.assertFalse(recomputed["valid"])
+        self.assertFalse(recomputed["all_exact_match"])
+        self.assertNotEqual(recomputed, forged)
 
     def test_explain_gate_requires_named_hnsw_for_approx_and_forbids_hnsw_for_exact(self):
         hnsw_plan = [{"Plan": {"Node Type": "Index Scan", "Index Name": "vector_hnsw_idx"}}]
@@ -1104,6 +1288,7 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
 
     def test_manifest_contract_records_fingerprint_and_timing_fields(self):
         args = benchmark.create_argument_parser().parse_args([])
+        binary_identity_gate = self._binary_identity_gate()
         manifest = benchmark._manifest(
             args,
             [benchmark.FilterSpec("f", "1%", "rating = 5", ("sql:rating = 5",), 10, 1.0)],
@@ -1115,10 +1300,16 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
                 "formal_data_version_proof": {
                     "start_relations": {"t": {"oid": 1, "data_epoch": 9}}
                 },
+                "binary_identity_gate": binary_identity_gate,
             },
             {"join_acl": 1000},
         )
         self.assertEqual(manifest["database"]["sqlens_build_id"], "build-x")
+        self.assertEqual(manifest["binary_identity_gate"], binary_identity_gate)
+        self.assertEqual(
+            manifest["binary_identity_gate"]["observed_vector_so_sha256"],
+            binary_identity_gate["expected_vector_so_sha256"],
+        )
         self.assertIn("schema_sql_sha256", manifest)
         self.assertIn("timing_definition", manifest)
         self.assertIn("candidate-admission/validation", manifest["sqlens_filter_strategy"])
@@ -1413,6 +1604,7 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
             "d1_d2_d3": "clone",
         }
         database = {
+            "binary_identity_gate": self._binary_identity_gate(),
             "d2_graph_proof": graph,
             "d2_graph_proof_end": graph,
             "d2_index_names": ["source", "clone"],
@@ -1454,6 +1646,13 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
                 "d3_startup_reset_evidence": {
                     "after_reset_empty": False,
                     "prebuilt_fragments": 1,
+                }
+            },
+            {
+                "binary_identity_gate": {
+                    **self._binary_identity_gate(),
+                    "all_exact_match": False,
+                    "valid": False,
                 }
             },
         ):

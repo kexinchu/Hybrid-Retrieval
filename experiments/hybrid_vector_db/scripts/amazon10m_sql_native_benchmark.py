@@ -56,6 +56,17 @@ DEFAULT_FINAL_QUERIES = 100
 DEFAULT_CALIBRATION_REPEATS = 2
 DEFAULT_FINAL_REPEATS = 5
 DEFAULT_BOOTSTRAP_SAMPLES = 10_000
+DEFAULT_EF_SEARCH_VALUES = (
+    250,
+    500,
+    1000,
+    2000,
+    5000,
+    10000,
+    20000,
+    50000,
+    100000,
+)
 DEFAULT_D3_PROBE_REQUESTS = 2
 DEFAULT_D3_MIN_BENEFIT_PER_BYTE = 0.0
 DEFAULT_D3_MAX_FRAGMENT_MB = 16
@@ -66,6 +77,13 @@ SQLENS_MODES = MODES[1:]
 NA = "N/A"
 SQLENS_BUILD_PREFIX = "sqlens-v11-"
 SQLENS_PROFILE_SEMANTICS = 7.0
+BINARY_IDENTITY_REQUIRED_STAGES = (
+    "experiment_start",
+    "pre_exact_truth",
+    "pre_calibration",
+    "pre_final",
+    "manifest_finalization",
+)
 CHECKPOINT_VERSION = 5
 EXACT_TRUTH_ARTIFACT_VERSION = 4
 SQLENS_PROFILE_FIELDS = (
@@ -325,6 +343,45 @@ def parse_role_name(value: str) -> str:
     if not re.fullmatch(r"[a-z_][a-z0-9_]*", value):
         raise argparse.ArgumentTypeError("principal must be a lowercase PostgreSQL role identifier")
     return value
+
+
+def expected_sha256_arg(value: str) -> str:
+    normalized = str(value or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+        raise argparse.ArgumentTypeError(
+            "expected a lowercase 64-character SHA256"
+        )
+    return normalized
+
+
+def expected_sqlens_build_id_arg(value: str) -> str:
+    normalized = str(value or "").strip()
+    if (
+        normalized != value
+        or not normalized.startswith(SQLENS_BUILD_PREFIX)
+        or len(normalized) <= len(SQLENS_BUILD_PREFIX)
+    ):
+        raise argparse.ArgumentTypeError(
+            f"expected an exact SQLens build ID beginning with {SQLENS_BUILD_PREFIX!r}"
+        )
+    return normalized
+
+
+def require_execution_binary_identity(args: argparse.Namespace) -> tuple[str, str]:
+    build_id = getattr(args, "expected_sqlens_build_id", None)
+    vector_sha256 = getattr(args, "expected_vector_so_sha256", None)
+    if not build_id or not vector_sha256:
+        raise RuntimeError(
+            "formal --execute requires --expected-sqlens-build-id and "
+            "--expected-vector-so-sha256"
+        )
+    try:
+        return (
+            expected_sqlens_build_id_arg(str(build_id)),
+            expected_sha256_arg(str(vector_sha256)),
+        )
+    except argparse.ArgumentTypeError as exc:
+        raise RuntimeError(f"formal binary identity expectation is invalid: {exc}") from exc
 
 
 validate_candidate_validity_predicate = (
@@ -1105,6 +1162,42 @@ def artifact_validation_errors(
 
 def database_contract_errors(database: dict[str, Any]) -> list[str]:
     errors: list[str] = []
+    identity = database.get("binary_identity_gate")
+    evidence = identity.get("gate_evidence") if isinstance(identity, dict) else None
+    recomputed_identity: dict[str, Any] | None = None
+    if isinstance(identity, dict) and isinstance(evidence, list):
+        try:
+            recomputed_identity = binary_identity_gate_summary(
+                str(identity.get("expected_sqlens_build_id", "")),
+                str(identity.get("expected_vector_so_sha256", "")),
+                evidence,
+            )
+        except (TypeError, ValueError):
+            recomputed_identity = None
+    if (
+        not isinstance(identity, dict)
+        or identity.get("valid") is not True
+        or identity.get("all_exact_match") is not True
+        or not isinstance(evidence, list)
+        or not evidence
+        or len(evidence) != identity.get("evidence_count")
+        or recomputed_identity != identity
+        or identity.get("missing_required_stages") != []
+        or identity.get("missing_required_connections") != []
+        or not str(identity.get("expected_sqlens_build_id", "")).startswith(
+            SQLENS_BUILD_PREFIX
+        )
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", str(identity.get("expected_vector_so_sha256", ""))
+        )
+        or identity.get("observed_vector_so_sha256")
+        != identity.get("expected_vector_so_sha256")
+        or identity.get("observed_sqlens_build_id")
+        != identity.get("expected_sqlens_build_id")
+    ):
+        errors.append(
+            "exact SQLens build ID/server vector.so binary identity gate is missing or invalid"
+        )
     proof = database.get("d2_graph_proof")
     comparison = proof.get("comparison") if isinstance(proof, dict) else None
     if (
@@ -1944,6 +2037,168 @@ def validate_sqlens_provenance(build_id: Any, profile: Any) -> tuple[str, dict[s
     return normalized_build_id, normalized_profile
 
 
+def observe_serving_binary_identity(
+    cur: Any,
+    expected_sqlens_build_id: str,
+    expected_vector_so_sha256: str,
+    *,
+    stage: str,
+    connection: str,
+) -> dict[str, Any]:
+    try:
+        cur.execute(
+            "WITH lib AS ("
+            "SELECT setting || '/vector.so' AS path "
+            "FROM pg_config WHERE name = 'PKGLIBDIR'"
+            ") SELECT vector_sqlens_build_id(), path, "
+            "encode(sha256(pg_read_binary_file(path)), 'hex'), "
+            "pg_backend_pid(), current_database() FROM lib"
+        )
+        row = cur.fetchone()
+    except Exception as exc:  # noqa: BLE001 - this formal gate must fail closed.
+        raise RuntimeError(
+            f"binary identity gate unavailable at stage={stage} connection={connection}: "
+            "could not read the serving PostgreSQL vector.so"
+        ) from exc
+    if row is None:
+        raise RuntimeError(
+            f"binary identity gate returned no row at stage={stage} connection={connection}"
+        )
+    observed_build_id = str(row[0] or "")
+    observed_path = str(row[1] or "")
+    observed_sha256 = str(row[2] or "")
+    evidence = {
+        "sequence": 0,
+        "stage": stage,
+        "connection": connection,
+        "backend_pid": int(row[3]),
+        "database": str(row[4] or ""),
+        "expected_sqlens_build_id": expected_sqlens_build_id,
+        "observed_sqlens_build_id": observed_build_id,
+        "expected_vector_so_sha256": expected_vector_so_sha256,
+        "observed_vector_so_sha256": observed_sha256,
+        "observed_vector_so_path": observed_path,
+        "build_id_exact_match": observed_build_id == expected_sqlens_build_id,
+        "vector_so_sha256_exact_match": (
+            observed_sha256 == expected_vector_so_sha256
+        ),
+        "path_valid": observed_path.endswith("/vector.so"),
+        "observed_sha256_valid": bool(
+            re.fullmatch(r"[0-9a-f]{64}", observed_sha256)
+        ),
+    }
+    evidence["exact_match"] = all(
+        evidence[field]
+        for field in (
+            "build_id_exact_match",
+            "vector_so_sha256_exact_match",
+            "path_valid",
+            "observed_sha256_valid",
+        )
+    )
+    return evidence
+
+
+def require_exact_binary_identity(evidence: dict[str, Any]) -> dict[str, Any]:
+    if evidence.get("exact_match") is not True:
+        raise RuntimeError(
+            "binary identity gate failed: "
+            f"stage={evidence.get('stage')} connection={evidence.get('connection')} "
+            f"expected_build_id={evidence.get('expected_sqlens_build_id')!r} "
+            f"observed_build_id={evidence.get('observed_sqlens_build_id')!r} "
+            f"expected_vector_so_sha256={evidence.get('expected_vector_so_sha256')!r} "
+            f"observed_vector_so_sha256={evidence.get('observed_vector_so_sha256')!r} "
+            f"observed_vector_so_path={evidence.get('observed_vector_so_path')!r}"
+        )
+    return evidence
+
+
+def verify_serving_binary_identity(
+    cur: Any,
+    expected_sqlens_build_id: str,
+    expected_vector_so_sha256: str,
+    *,
+    stage: str,
+    connection: str,
+) -> dict[str, Any]:
+    return require_exact_binary_identity(
+        observe_serving_binary_identity(
+            cur,
+            expected_sqlens_build_id,
+            expected_vector_so_sha256,
+            stage=stage,
+            connection=connection,
+        )
+    )
+
+
+def binary_identity_gate_summary(
+    expected_sqlens_build_id: str,
+    expected_vector_so_sha256: str,
+    evidence: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    gate_evidence = [dict(item) for item in evidence]
+    observed_build_ids = sorted(
+        {str(item.get("observed_sqlens_build_id", "")) for item in gate_evidence}
+    )
+    observed_sha256s = sorted(
+        {str(item.get("observed_vector_so_sha256", "")) for item in gate_evidence}
+    )
+    observed_paths = sorted(
+        {str(item.get("observed_vector_so_path", "")) for item in gate_evidence}
+    )
+    observed_stages = sorted({str(item.get("stage", "")) for item in gate_evidence})
+    observed_connections = sorted(
+        {str(item.get("connection", "")) for item in gate_evidence}
+    )
+    missing_stages = [
+        stage for stage in BINARY_IDENTITY_REQUIRED_STAGES if stage not in observed_stages
+    ]
+    required_connections = ("fragment_store", "data_guard", *MODES)
+    missing_connections = [
+        connection
+        for connection in required_connections
+        if connection not in observed_connections
+    ]
+    all_exact_match = bool(gate_evidence) and all(
+        item.get("exact_match") is True
+        and item.get("expected_sqlens_build_id") == expected_sqlens_build_id
+        and item.get("observed_sqlens_build_id") == expected_sqlens_build_id
+        and item.get("expected_vector_so_sha256") == expected_vector_so_sha256
+        and item.get("observed_vector_so_sha256") == expected_vector_so_sha256
+        and str(item.get("observed_vector_so_path", "")).endswith("/vector.so")
+        and bool(
+            re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(item.get("observed_vector_so_sha256", "")),
+            )
+        )
+        for item in gate_evidence
+    )
+    return {
+        "required_for_formal_execute": True,
+        "expected_sqlens_build_id": expected_sqlens_build_id,
+        "expected_vector_so_sha256": expected_vector_so_sha256,
+        "observed_sqlens_build_id": (
+            observed_build_ids[0] if len(observed_build_ids) == 1 else None
+        ),
+        "observed_vector_so_sha256": (
+            observed_sha256s[0] if len(observed_sha256s) == 1 else None
+        ),
+        "observed_vector_so_paths": observed_paths,
+        "observed_sqlens_build_ids": observed_build_ids,
+        "observed_vector_so_sha256s": observed_sha256s,
+        "observed_stages": observed_stages,
+        "observed_connections": observed_connections,
+        "missing_required_stages": missing_stages,
+        "missing_required_connections": missing_connections,
+        "evidence_count": len(gate_evidence),
+        "all_exact_match": all_exact_match,
+        "valid": all_exact_match and not missing_stages and not missing_connections,
+        "gate_evidence": gate_evidence,
+    }
+
+
 def database_fingerprint(cur: Any, relations: Sequence[str]) -> dict[str, Any]:
     cur.execute(
         "SELECT current_database(), current_setting('server_version'), "
@@ -2590,6 +2845,7 @@ def build_run_spec(
             "postgres_version",
             "vector_extension_version",
             "sqlens_build_id",
+            "binary_identity_contract",
             "profile_semantics_version",
             "required_profile_fields",
             "relations",
@@ -3591,7 +3847,11 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--final-repeats", type=positive_int, default=DEFAULT_FINAL_REPEATS)
     parser.add_argument("--targets", type=parse_targets, default=list(TARGET_RECALLS))
     parser.add_argument("--filter-names", nargs="*", default=[])
-    parser.add_argument("--ef-search-values", type=parse_int_list, default=[250, 500, 1000, 2000, 5000, 10000])
+    parser.add_argument(
+        "--ef-search-values",
+        type=parse_int_list,
+        default=list(DEFAULT_EF_SEARCH_VALUES),
+    )
     parser.add_argument("--max-scan-tuples-values", type=parse_int_list, default=[5_000_000])
     parser.add_argument("--scan-mem-multiplier-values", type=lambda value: parse_float_list(value), default=[32.0])
     parser.add_argument(
@@ -3619,6 +3879,16 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bootstrap-samples", type=positive_int, default=DEFAULT_BOOTSTRAP_SAMPLES)
     parser.add_argument("--bootstrap-seed", type=int, default=20260718)
     parser.add_argument("--schedule-seed", type=int, default=20260718)
+    parser.add_argument(
+        "--expected-sqlens-build-id",
+        type=expected_sqlens_build_id_arg,
+        help="exact vector_sqlens_build_id() required by formal --execute",
+    )
+    parser.add_argument(
+        "--expected-vector-so-sha256",
+        type=expected_sha256_arg,
+        help="exact SHA256 of the serving PostgreSQL PKGLIBDIR/vector.so required by formal --execute",
+    )
     parser.add_argument("--dry-run", action="store_true", help="print the run contract without reading files or opening PostgreSQL")
     parser.add_argument("--execute", action="store_true", help="open PostgreSQL and run the benchmark")
     parser.add_argument(
@@ -3678,6 +3948,8 @@ def print_dry_run(args: argparse.Namespace) -> None:
     print(f"vector_table={args.vector_table}")
     print(f"source_index={args.source_index}")
     print(f"clone_index={args.clone_index}")
+    print(f"expected_sqlens_build_id={args.expected_sqlens_build_id or NA}")
+    print(f"expected_vector_so_sha256={args.expected_vector_so_sha256 or NA}")
     print(f"out={args.out}")
 
 
@@ -3712,6 +3984,7 @@ def _manifest(
         "query_ids_csv_sha256": sha256_file(args.query_ids_csv),
         "query_cohort_manifest_sha256": sha256_file(args.query_cohort_manifest),
         "database": database,
+        "binary_identity_gate": database.get("binary_identity_gate", {}),
         "vector_table": args.vector_table,
         "source_index": args.source_index,
         "clone_index": args.clone_index,
@@ -3823,6 +4096,9 @@ def _manifest(
 def run_benchmark(args: argparse.Namespace) -> int:
     if not args.execute:
         raise RuntimeError("refusing to open PostgreSQL without --execute")
+    expected_sqlens_build_id, expected_vector_so_sha256 = (
+        require_execution_binary_identity(args)
+    )
     require_psycopg()
     import psycopg
 
@@ -3885,6 +4161,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
     formal_guard: dict[str, Any] | None = None
     fragment_conn: Any | None = None
     fragment_cur: Any | None = None
+    identity_evidence: list[dict[str, Any]] = []
     new_checkpoint = False
     d3_settings = {
         "probe_requests": args.d3_probe_requests,
@@ -3892,26 +4169,46 @@ def run_benchmark(args: argparse.Namespace) -> int:
         "max_fragment_mb": args.d3_max_fragment_mb,
         "page_min_skip_rate": args.d3_page_min_skip_rate,
     }
+
+    def record_binary_identity(
+        cur: Any, stage: str, connection: str
+    ) -> dict[str, Any]:
+        evidence = observe_serving_binary_identity(
+            cur,
+            expected_sqlens_build_id,
+            expected_vector_so_sha256,
+            stage=stage,
+            connection=connection,
+        )
+        evidence["sequence"] = len(identity_evidence) + 1
+        identity_evidence.append(evidence)
+        if checkpoint is not None and checkpoint_path.is_dir():
+            persist_checkpoint_meta(checkpoint_path, checkpoint)
+        return require_exact_binary_identity(evidence)
+
     try:
         fragment_conn = psycopg.connect(conninfo, autocommit=True)
         fragment_cur = fragment_conn.cursor()
+        record_binary_identity(fragment_cur, "experiment_start", "fragment_store")
         persistent_fragment_reset = clear_fragment_store(
             fragment_cur, args.vector_table
         )
         guard_conn = psycopg.connect(conninfo, autocommit=True)
         guard_cur = guard_conn.cursor()
+        record_binary_identity(guard_cur, "connection_open", "data_guard")
         formal_guard = exact_truth_contract.acquire_formal_data_guard(
             guard_cur, args.vector_table
         )
         probe_ids = exact_truth_contract.select_rls_probe_ids(
             guard_cur, args.principal
         )
-        for mode in MODES:
-            connections[mode] = psycopg.connect(conninfo, autocommit=True)
         session_contexts: dict[str, dict[str, str]] = {}
         security_proofs: dict[str, dict[str, Any]] = {}
-        for mode, conn in connections.items():
+        for mode in MODES:
+            conn = psycopg.connect(conninfo, autocommit=True)
+            connections[mode] = conn
             cur = conn.cursor()
+            record_binary_identity(cur, "connection_open", mode)
             cur.execute(f'SET ROLE "{args.principal}"')
             cur.execute("SET hnsw.guidance_require_epoch = on")
             set_preferred_index(
@@ -3940,6 +4237,25 @@ def run_benchmark(args: argparse.Namespace) -> int:
             "public.amazon_sql_native_buckets",
         ]
         database = database_fingerprint(fingerprint_cur, relations)
+        initial_identity = binary_identity_gate_summary(
+            expected_sqlens_build_id,
+            expected_vector_so_sha256,
+            identity_evidence,
+        )
+        database["binary_identity_contract"] = {
+            "expected_sqlens_build_id": expected_sqlens_build_id,
+            "expected_vector_so_sha256": expected_vector_so_sha256,
+            "observed_sqlens_build_id": initial_identity[
+                "observed_sqlens_build_id"
+            ],
+            "observed_vector_so_sha256": initial_identity[
+                "observed_vector_so_sha256"
+            ],
+            "observed_vector_so_paths": initial_identity[
+                "observed_vector_so_paths"
+            ],
+            "all_exact_match": initial_identity["all_exact_match"],
+        }
         database["d2_graph_proof"] = graph_clone_proof(
             guard_cur, args.source_index, args.clone_index
         )
@@ -4037,17 +4353,33 @@ def run_benchmark(args: argparse.Namespace) -> int:
         for field in ("loaded_sessions", "exact_truth", "exact_plans", "calibration_blocks", "final_blocks", "invalid_blocks"):
             if not isinstance(checkpoint.get(field), list):
                 raise RuntimeError(f"checkpoint field is incomplete: {field}")
+        for loaded_session in checkpoint["loaded_sessions"]:
+            if (
+                not isinstance(loaded_session, dict)
+                or not isinstance(
+                    loaded_session.get("binary_identity_gate_evidence"), list
+                )
+            ):
+                raise RuntimeError(
+                    "checkpoint loaded session lacks binary identity gate evidence"
+                )
         if checkpoint["invalid_blocks"]:
             raise RuntimeError(
                 "checkpoint contains a failed formal block; inspect invalid_blocks and restart from a clean checkpoint"
             )
         checkpoint["loaded_sessions"].append(
-            {"resume": bool(args.resume), "connections": session_contexts}
+            {
+                "resume": bool(args.resume),
+                "connections": session_contexts,
+                "binary_identity_gate_evidence": identity_evidence,
+            }
         )
         if new_checkpoint:
             initialize_checkpoint(checkpoint_path, checkpoint)
         else:
             persist_checkpoint_meta(checkpoint_path, checkpoint)
+
+        record_binary_identity(guard_cur, "pre_exact_truth", "data_guard")
 
         table_fingerprint_sha256 = canonical_sha256(database["relations"][args.vector_table])
         if args.debug_compute_exact_truth:
@@ -4171,6 +4503,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
                 candidate_validity_predicate=args.candidate_validity_predicate,
             )
 
+        record_binary_identity(guard_cur, "pre_calibration", "data_guard")
         workload_by_name = {item.name: item for item in workloads}
         filter_by_name = {item.name: item for item in filters}
         grids = {mode: build_config_grid(args, mode) for mode in MODES}
@@ -4283,6 +4616,11 @@ def run_benchmark(args: argparse.Namespace) -> int:
                                 workload.name, spec.name, mode, config
                             )
                             if block_id not in calibration_blocks:
+                                record_binary_identity(
+                                    guard_cur,
+                                    f"calibration_block:{block_id}",
+                                    "data_guard",
+                                )
                                 block_fragment_reset = (
                                     clear_fragment_store(fragment_cur, args.vector_table)
                                     if mode == "d1_d2_d3"
@@ -4430,6 +4768,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
                         config_map,
                     )
 
+        record_binary_identity(guard_cur, "pre_final", "data_guard")
         final_blocks: dict[str, dict[str, Any]] = {}
         for block in checkpoint["final_blocks"]:
             block_id = str(block.get("block_id"))
@@ -4462,6 +4801,11 @@ def run_benchmark(args: argparse.Namespace) -> int:
 
         for block_id, (workload, spec, target, config_map) in expected_final.items():
             if block_id not in final_blocks:
+                record_binary_identity(
+                    guard_cur,
+                    f"final_block:{block_id}",
+                    "data_guard",
+                )
                 block_fragment_reset = clear_fragment_store(
                     fragment_cur, args.vector_table
                 )
@@ -4663,6 +5007,20 @@ def run_benchmark(args: argparse.Namespace) -> int:
         database["d3_fragment_store_end"] = audit_fragment_store(
             fragment_cur, args.vector_table
         )
+        record_binary_identity(
+            guard_cur, "manifest_finalization", "data_guard"
+        )
+        retained_identity_evidence = [
+            item
+            for loaded_session in checkpoint["loaded_sessions"]
+            for item in loaded_session["binary_identity_gate_evidence"]
+            if isinstance(item, dict)
+        ]
+        database["binary_identity_gate"] = binary_identity_gate_summary(
+            expected_sqlens_build_id,
+            expected_vector_so_sha256,
+            retained_identity_evidence,
+        )
         database["loaded_sessions"] = checkpoint["loaded_sessions"]
         all_rows = [
             row
@@ -4776,6 +5134,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.dry_run or not args.execute:
         print_dry_run(args)
         return 0
+    require_execution_binary_identity(args)
     return run_benchmark(args)
 
 
