@@ -1179,6 +1179,10 @@ def mode_uses_d2(mode: str) -> bool:
     return mode in {"design1_bloom_bfs_layout", "design1_bloom_bfs_layout_d3"}
 
 
+def mode_uses_guidance(mode: str) -> bool:
+    return mode != "original"
+
+
 def configure(
     cur: psycopg.Cursor,
     args: argparse.Namespace,
@@ -1859,7 +1863,10 @@ def open_mode_runtime(
             {"mode": mode, "backend_pid": cpu_provenance["backend_pid"], **runtime_identity}
         )
         ensure_functions(cur)
-        ensure_tracking(cur, args.insertion_table, args.bfs_table)
+        if mode_uses_guidance(mode) and not bool(
+            getattr(args, "fragment_tracking_prepared", False)
+        ):
+            ensure_tracking(cur, args.insertion_table, args.bfs_table)
         configure(cur, args, cache_mb, mode, config)
         _, expected_index = mode_table_index(args, mode)
         preferred_index_current_setting = set_preferred_index_if_supported(
@@ -2934,6 +2941,14 @@ def main() -> None:
     parser.add_argument("--d2-page-disable-after-no-merge", type=int, default=2)
     parser.add_argument("--d1-cache-mb", type=int, default=1024)
     parser.add_argument("--d3-cache-mb", type=int, default=1024)
+    parser.add_argument(
+        "--fragment-tracking-prepared",
+        action="store_true",
+        help=(
+            "Assert that the parent prepared fragment epoch tracking before acquiring "
+            "its long-lived data guard; child mode sessions must not run tracking DDL."
+        ),
+    )
     parser.add_argument(
         "--guidance-selectivity-max-pct",
         type=float,

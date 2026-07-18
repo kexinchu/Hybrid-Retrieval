@@ -819,6 +819,7 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
             require_preferred_index_guc=False,
             expected_sqlens_build_id="sqlens-v11-exact",
             expected_vector_so_sha256="a" * 64,
+            fragment_tracking_prepared=True,
         )
         config = {
             "ef_search": 100,
@@ -853,7 +854,7 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
                 },
             ),
             mock.patch.object(benchmark, "ensure_functions"),
-            mock.patch.object(benchmark, "ensure_tracking"),
+            mock.patch.object(benchmark, "ensure_tracking") as tracking_mock,
             mock.patch.object(benchmark, "effective_mode_config", return_value=config),
             mock.patch.object(benchmark, "configure") as configure_mock,
             mock.patch.object(benchmark, "set_preferred_index_if_supported", return_value=None),
@@ -866,6 +867,7 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
             )
 
         self.assertEqual(configure_mock.call_count, 2)
+        tracking_mock.assert_not_called()
         gate_mock.assert_called_once()
         self.assertTrue(runtime.planner_proof_verified)
         self.assertEqual(
@@ -878,6 +880,10 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
         self.assertFalse(
             any("vector_hnsw_guidance_activate" in call.args[0] for call in cursor.execute.call_args_list)
         )
+
+    def test_original_mode_never_requires_fragment_tracking(self):
+        self.assertFalse(benchmark.mode_uses_guidance("original"))
+        self.assertTrue(benchmark.mode_uses_guidance("design1_bloom"))
 
     def test_run_query_returns_distances_and_self_excludes_query_id(self):
         cursor = mock.Mock()

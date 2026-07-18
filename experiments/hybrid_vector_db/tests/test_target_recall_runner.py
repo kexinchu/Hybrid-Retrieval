@@ -34,6 +34,7 @@ from experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_run
     parse_targets,
     percentile,
     plan_evidence_path,
+    prepare_fragment_tracking,
     require_plan_evidence,
     run_d123,
     run_d123_interleaved,
@@ -42,6 +43,7 @@ from experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_run
     select_row,
     selected_rows,
     sha256_file,
+    stable_fragment_tracking_evidence,
     sqlens_runtime_provenance,
     truth_query_ids,
     validate_tie_aware_raw_row,
@@ -49,6 +51,82 @@ from experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_run
 
 
 class TargetRecallRunnerTests(unittest.TestCase):
+    def test_fragment_tracking_run_spec_evidence_excludes_timestamp(self):
+        args = argparse.Namespace(
+            fragment_tracking_evidence={
+                "required": True,
+                "prepared": True,
+                "lock_order": "tracking_ddl_committed_before_share_data_guard",
+                "tables": [{"table": "public.items", "oid": 10, "epoch": 3}],
+                "prepared_at": "2026-07-18T20:00:00Z",
+            }
+        )
+        self.assertEqual(
+            stable_fragment_tracking_evidence(args),
+            {
+                "required": True,
+                "prepared": True,
+                "lock_order": "tracking_ddl_committed_before_share_data_guard",
+                "tables": [{"table": "public.items", "oid": 10, "epoch": 3}],
+            },
+        )
+
+    def test_original_only_tracking_preparation_is_a_database_noop(self):
+        args = argparse.Namespace(
+            modes=["original"],
+            insertion_table="public.items",
+            bfs_table="public.items",
+        )
+        with mock.patch(
+            "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.psycopg.connect"
+        ) as connect:
+            evidence = prepare_fragment_tracking(args)
+
+        self.assertEqual(
+            evidence, {"required": False, "prepared": False, "tables": []}
+        )
+        connect.assert_not_called()
+
+    def test_guided_tracking_is_committed_before_the_data_guard(self):
+        cursor = mock.Mock()
+        cursor.fetchone.side_effect = [(10, 20, 7, True)]
+        connection = mock.MagicMock()
+        connection.cursor.return_value = cursor
+        connection.__enter__.return_value = connection
+        connection.__exit__.return_value = False
+        args = argparse.Namespace(
+            modes=["design1_bloom"],
+            insertion_table="public.items",
+            bfs_table="public.items",
+        )
+        with (
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.psycopg.connect",
+                return_value=connection,
+            ) as connect,
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.pg_config_from_env",
+                return_value=argparse.Namespace(conninfo="postgresql://test"),
+            ),
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.ensure_functions"
+            ) as functions,
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.ensure_tracking"
+            ) as tracking,
+        ):
+            evidence = prepare_fragment_tracking(args)
+
+        connect.assert_called_once_with("postgresql://test", autocommit=True)
+        functions.assert_called_once_with(cursor)
+        tracking.assert_called_once_with(cursor, "public.items")
+        self.assertTrue(evidence["prepared"])
+        self.assertEqual(
+            evidence["lock_order"],
+            "tracking_ddl_committed_before_share_data_guard",
+        )
+        self.assertEqual(evidence["tables"][0]["epoch"], 7)
+
     @staticmethod
     def _plan_runtime_metadata():
         identity = {

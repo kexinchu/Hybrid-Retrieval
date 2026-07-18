@@ -173,6 +173,8 @@ class RunPgvectorBinaryAbControlTests(unittest.TestCase):
                     "formal_family": "off",
                     "filters": filters,
                     "target_recalls": targets,
+                    "target_metric": "query_level_mean_recall_at_10",
+                    "uncertainty": "query_bootstrap_95pct_ci_reported_not_used_as_target",
                     "cell_keys": [
                         f"{name}|{format(target, 'g')}"
                         for name in filters

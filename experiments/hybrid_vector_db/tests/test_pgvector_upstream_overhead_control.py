@@ -324,6 +324,7 @@ class PgvectorUpstreamOverheadControlTests(unittest.TestCase):
             {
                 "config_label": label,
                 "complete": True,
+                "recall_mean": 0.94,
                 "recall_lcb95": 0.94,
                 "latency_mean_ms": position + 1.0,
             }
@@ -345,11 +346,11 @@ class PgvectorUpstreamOverheadControlTests(unittest.TestCase):
         self.assertEqual(status, "incomplete_verification")
         self.assertEqual(proof["missing_verified_configs"], ["relaxed-max"])
 
-    def test_verification_selection_uses_lcb_then_fastest_mean_latency(self):
+    def test_verification_selection_uses_mean_recall_then_fastest_mean_latency(self):
         summaries = [
-            {"config_label": "slow", "complete": True, "recall_lcb95": 0.98, "latency_mean_ms": 8.0},
-            {"config_label": "fast", "complete": True, "recall_lcb95": 0.96, "latency_mean_ms": 3.0},
-            {"config_label": "uncertain", "complete": True, "recall_lcb95": 0.94, "latency_mean_ms": 1.0},
+            {"config_label": "slow", "complete": True, "recall_mean": 0.98, "recall_lcb95": 0.94, "latency_mean_ms": 8.0},
+            {"config_label": "fast", "complete": True, "recall_mean": 0.96, "recall_lcb95": 0.90, "latency_mean_ms": 3.0},
+            {"config_label": "uncertain", "complete": True, "recall_mean": 0.94, "recall_lcb95": 0.93, "latency_mean_ms": 1.0},
         ]
         selected, status, _proof = runner.select_verified_config(
             summaries,
@@ -359,8 +360,8 @@ class PgvectorUpstreamOverheadControlTests(unittest.TestCase):
         self.assertEqual(status, "selected")
         self.assertEqual(selected["config_label"], "fast")
 
-    def test_heldout_final_lcb_miss_is_never_reported_as_success(self):
-        metrics = {"complete": True, "recall_lcb95": 0.94}
+    def test_heldout_final_mean_recall_miss_is_never_reported_as_success(self):
+        metrics = {"complete": True, "recall_mean": 0.94, "recall_lcb95": 0.90}
 
         self.assertEqual(
             runner.heldout_final_status("selected", 0.95, metrics),
@@ -368,7 +369,7 @@ class PgvectorUpstreamOverheadControlTests(unittest.TestCase):
         )
         self.assertEqual(
             runner.heldout_final_status(
-                "selected", 0.95, {"complete": True, "recall_lcb95": 0.96}
+                "selected", 0.95, {"complete": True, "recall_mean": 0.96, "recall_lcb95": 0.90}
             ),
             "confirmed",
         )
@@ -570,6 +571,7 @@ class PgvectorUpstreamOverheadControlTests(unittest.TestCase):
 
         self.assertEqual(design["cell_count"], 42)
         self.assertEqual(design["formal_family"], "strict_order")
+        self.assertEqual(design["target_metric"], "query_level_mean_recall_at_10")
         with self.assertRaisesRegex(ValueError, "exactly 14"):
             runner.validate_formal_design(filters[:-1], [0.90, 0.95, 0.99], "off")
         with self.assertRaisesRegex(ValueError, "exactly 0.90,0.95,0.99"):

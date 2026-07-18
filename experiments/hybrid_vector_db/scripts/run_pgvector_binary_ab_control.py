@@ -613,6 +613,8 @@ def _validate_controller_bound_arm(
         "formal_family": controller_spec.get("formal_family"),
         "filters": list(filters),
         "target_recalls": list(targets),
+        "target_metric": "query_level_mean_recall_at_10",
+        "uncertainty": "query_bootstrap_95pct_ci_reported_not_used_as_target",
         "cell_keys": [
             f"{name}|{_target_key(target)}" for name in filters for target in targets
         ],

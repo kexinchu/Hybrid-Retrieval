@@ -25,6 +25,7 @@ try:
         candidate_validity_sha256,
         effective_candidate_validity_predicate,
         ensure_functions,
+        ensure_tracking,
         normalize_cpu_list,
         require_d2_graph_proof,
         stable_d2_graph_proof,
@@ -38,6 +39,7 @@ except ImportError:
         candidate_validity_sha256,
         effective_candidate_validity_predicate,
         ensure_functions,
+        ensure_tracking,
         normalize_cpu_list,
         require_d2_graph_proof,
         stable_d2_graph_proof,
@@ -1217,8 +1219,22 @@ def normalized_args(args: argparse.Namespace) -> dict[str, object]:
     return {
         key: str(value) if isinstance(value, Path) else value
         for key, value in sorted(vars(args).items())
-        if key not in {"resume", "skip_final", "run_spec_hash", "d2_graph_proof"}
+        if key
+        not in {
+            "resume",
+            "skip_final",
+            "run_spec_hash",
+            "d2_graph_proof",
+            "fragment_tracking_evidence",
+        }
     }
+
+
+def stable_fragment_tracking_evidence(args: argparse.Namespace) -> dict[str, object]:
+    evidence = getattr(args, "fragment_tracking_evidence", None)
+    if not isinstance(evidence, dict):
+        return {"required": False, "prepared": False, "tables": []}
+    return {key: value for key, value in evidence.items() if key != "prepared_at"}
 
 
 def explicit_candidate_validity_predicate(
@@ -1240,6 +1256,51 @@ def formal_run_uses_d2(args: argparse.Namespace) -> bool:
         mode in {"design1_bloom_bfs_layout", "design1_bloom_bfs_layout_d3"}
         for mode in args.modes
     )
+
+
+def prepare_fragment_tracking(args: argparse.Namespace) -> dict[str, object]:
+    required = any(mode != "original" for mode in args.modes)
+    tables = list(dict.fromkeys((str(args.insertion_table), str(args.bfs_table))))
+    if not required:
+        return {"required": False, "prepared": False, "tables": []}
+
+    rows: list[dict[str, object]] = []
+    with psycopg.connect(pg_config_from_env().conninfo, autocommit=True) as conn:
+        cur = conn.cursor()
+        ensure_functions(cur)
+        ensure_tracking(cur, *tables)
+        for table in tables:
+            cur.execute(
+                "SELECT c.oid::bigint, c.relfilenode::bigint, e.epoch::bigint, "
+                "EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgrelid = c.oid "
+                "AND t.tgname = 'pgvector_hnsw_fragment_epoch' "
+                "AND NOT t.tgisinternal AND t.tgenabled <> 'D') "
+                "FROM pg_class c "
+                "JOIN public.pgvector_hnsw_fragment_epoch e ON e.heap_oid = c.oid "
+                "WHERE c.oid = %s::regclass",
+                (table,),
+            )
+            row = cur.fetchone()
+            if row is None or row[1] is None or row[2] is None or row[3] is not True:
+                raise RuntimeError(
+                    f"fragment tracking preparation is incomplete for {table}"
+                )
+            rows.append(
+                {
+                    "table": table,
+                    "oid": int(row[0]),
+                    "relfilenode": int(row[1]),
+                    "epoch": int(row[2]),
+                    "enabled_trigger": True,
+                }
+            )
+    return {
+        "required": True,
+        "prepared": True,
+        "lock_order": "tracking_ddl_committed_before_share_data_guard",
+        "tables": rows,
+        "prepared_at": utc_now(),
+    }
 
 
 def d2_graph_proof_from_env(args: argparse.Namespace) -> dict[str, object]:
@@ -1327,6 +1388,7 @@ def build_run_spec(args: argparse.Namespace) -> dict[str, object]:
         "sqlens_source_sha256": sha256_tree(source_files),
         "sqlens_runtime_provenance": sqlens_runtime,
         "d2_graph_proof": d2_proof,
+        "fragment_tracking_preparation": stable_fragment_tracking_evidence(args),
         "query_contract": {
             "query_table": args.query_table or args.insertion_table,
             "query_id_column": args.query_id_column,
@@ -1517,6 +1579,8 @@ def run_d123(
         cmd.append("--no-expected-truth-self-excluded")
     append_option(cmd, "--backend-cpu-list", getattr(args, "backend_cpu_list", None))
     append_expected_runtime_identity(cmd, args)
+    if getattr(args, "fragment_tracking_prepared", False):
+        cmd.append("--fragment-tracking-prepared")
     if not args.require_preferred_index_guc:
         cmd.append("--no-require-preferred-index-guc")
     if args.warmup_all_queries:
@@ -1617,6 +1681,8 @@ def run_d123_interleaved(
         cmd.append("--no-expected-truth-self-excluded")
     append_option(cmd, "--backend-cpu-list", getattr(args, "backend_cpu_list", None))
     append_expected_runtime_identity(cmd, args)
+    if getattr(args, "fragment_tracking_prepared", False):
+        cmd.append("--fragment-tracking-prepared")
     if not args.require_preferred_index_guc:
         cmd.append("--no-require-preferred-index-guc")
     if args.warmup_all_queries:
@@ -2704,6 +2770,10 @@ def main() -> None:
     final_results: dict[FinalResultKey, dict[str, object]] = {}
     guard_connection: psycopg.Connection | None = None
     try:
+        tracking_evidence = prepare_fragment_tracking(args)
+        args.fragment_tracking_prepared = bool(tracking_evidence["prepared"])
+        args.fragment_tracking_evidence = tracking_evidence
+        manifest["fragment_tracking_preparation"] = tracking_evidence
         guard_connection, guard_evidence = acquire_formal_data_guard(args)
         manifest["formal_data_guard"] = guard_evidence
         run_spec = build_run_spec(args)

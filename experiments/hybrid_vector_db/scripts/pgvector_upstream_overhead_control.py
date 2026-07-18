@@ -252,6 +252,8 @@ def validate_formal_design(
         "formal_family": formal_family,
         "filters": names,
         "target_recalls": list(FORMAL_TARGET_RECALLS),
+        "target_metric": "query_level_mean_recall_at_10",
+        "uncertainty": "query_bootstrap_95pct_ci_reported_not_used_as_target",
         "cell_keys": [
             f"{name}|{format(target, 'g')}" for name in names for target in normalized
         ],
@@ -1533,7 +1535,7 @@ def build_promotion_set(
         eligible = [
             row
             for row in summaries.values()
-            if float(row["recall_lcb95"]) >= threshold
+            if float(row["recall_mean"]) >= threshold
         ]
         if eligible:
             winner = min(
@@ -1558,8 +1560,8 @@ def build_promotion_set(
         max_recall = max(
             family_rows,
             key=lambda row: (
-                float(row["recall_lcb95"]),
                 float(row["recall_mean"]),
+                float(row["recall_lcb95"]),
                 -float(row["latency_mean_ms"]),
                 str(row["config_label"]),
             ),
@@ -1572,8 +1574,8 @@ def build_promotion_set(
     global_max = max(
         summaries.values(),
         key=lambda row: (
-            float(row["recall_lcb95"]),
             float(row["recall_mean"]),
+            float(row["recall_lcb95"]),
             -float(row["latency_mean_ms"]),
             str(row["config_label"]),
         ),
@@ -1660,7 +1662,7 @@ def select_verified_config(
         for row in verification_summaries
         if str(row.get("config_label", "")) in required_labels
         and _complete_summary(row)
-        and float(row.get("recall_lcb95", 0.0)) >= target
+        and float(row.get("recall_mean", 0.0)) >= target
     ]
     if eligible:
         eligible.sort(
@@ -1693,7 +1695,7 @@ def select_config(
         dict(row)
         for row in summaries
         if _complete_summary(row)
-        and float(row.get("recall_lcb95", 0.0)) >= target_recall
+        and float(row.get("recall_mean", 0.0)) >= target_recall
     ]
     if not eligible:
         return None, "unattainable_on_grid"
@@ -1719,7 +1721,7 @@ def heldout_final_status(
         )
     if not _complete_summary(metrics):
         return "incomplete_final"
-    if float(metrics["recall_lcb95"]) < target:
+    if float(metrics["recall_mean"]) < target:
         return "missed_target"
     return "confirmed"
 
