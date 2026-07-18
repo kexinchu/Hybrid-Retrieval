@@ -29,14 +29,18 @@ from typing import Any, Iterable, Mapping, Protocol, Sequence
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_FILTERS = ROOT / "experiments/hybrid_vector_db/configs/amazon10m_selectivity14_filters.csv"
 DEFAULT_TRUTH = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_formal.csv"
+DEFAULT_TRUTH_MANIFEST = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_formal_manifest.json"
 DEFAULT_TABLE = "amazon_grocery_reviews_10m_pgvector"
 DEFAULT_INDEX = f"{DEFAULT_TABLE}_embedding_hnsw_idx"
 MODES = ("stock", "adaptive", "eager_prebuilt")
 FORMAL_REQUESTS = 10_000
 FORMAL_WINDOW = 100
 FORMAL_Q200 = 200
-CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 3
 PAIRING_SCHEDULE = "deterministic_request_interleaved_round_robin"
+FRAGMENT_STORE_RELATION = "public.pgvector_hnsw_fragment_store"
+FRAGMENT_EPOCH_RELATION = "public.pgvector_hnsw_fragment_epoch"
+FORMAL_WORKLOAD_MANIFEST_NAME = "amazon10m_d3_online_adaptation_10000_request_trace_q200_reused_vectors"
 
 
 @dataclass(frozen=True)
@@ -124,7 +128,7 @@ def checkpoint_resume_contract() -> dict[str, Any]:
         "checkpoint_unit": "complete_cross_mode_paired_window",
         "cross_process_resume": "forbidden",
         "policy": "fail_closed",
-        "reason": "D3 lifecycle and metadata cache state are backend-local and have no portable restore API",
+        "reason": "D3 lifecycle, metadata cache, and persistent fragment-store state are backend-local and have no portable restore API",
         "cache_lifecycle_fingerprints": "audit_only_not_replayable",
         "timed_replay": "not_implemented",
     }
@@ -231,7 +235,7 @@ def build_trace(filters: Sequence[FilterSpec], truth: Mapping[tuple[str, int], T
         raise BenchmarkContractError("trace needs exactly fourteen real filters")
     filter_names = [item.name for item in filters]
     if any((name, q) not in truth for name in filter_names for q in range(FORMAL_Q200)):
-        raise BenchmarkContractError("trace cannot use independent q10000 queries; q200 truth is incomplete")
+        raise BenchmarkContractError("trace cannot use query IDs outside the fixed q200 truth grid")
     rng = random.Random(seed)
     ranked = filter_names[:]
     rng.shuffle(ranked)
@@ -279,7 +283,110 @@ def bootstrap_ci(values: Sequence[float], *, samples: int, seed: int) -> tuple[f
 
 
 def cache_is_empty(profile: Mapping[str, Any]) -> bool:
-    return all(int(profile.get(key, 0) or 0) == 0 for key in ("entries", "resident_entries", "resident_bytes", "composed_guide_entries"))
+    return all(int(profile.get(key, 0) or 0) == 0 for key in (
+        "entries", "resident_entries", "resident_bytes", "composed_guide_entries",
+        "composed_exact_entries", "adaptive_cache_entries", "adaptive_bytes",
+    ))
+
+
+def _counter(profile: Mapping[str, Any], key: str) -> int:
+    return int(profile.get(key, 0) or 0)
+
+
+def _counter_delta(before: Mapping[str, Any], after: Mapping[str, Any], key: str) -> int:
+    return max(0, _counter(after, key) - _counter(before, key))
+
+
+def audit_fragment_store(session: Session, table: str) -> dict[str, Any]:
+    """Audit only fragments bound to ``table`` and prove their heap version."""
+    session.execute(
+        f"SELECT to_regclass(%s), %s::regclass::oid::bigint, "
+        f"pg_relation_filenode(%s::regclass)::bigint, "
+        f"coalesce((SELECT epoch FROM {FRAGMENT_EPOCH_RELATION} "
+        "WHERE heap_oid = %s::regclass::oid), 0)::bigint, "
+        f"EXISTS (SELECT 1 FROM {FRAGMENT_EPOCH_RELATION} "
+        "WHERE heap_oid = %s::regclass::oid)",
+        (FRAGMENT_STORE_RELATION, table, table, table, table),
+    )
+    store_name, heap_oid, relfilenode, epoch, epoch_present = session.row()
+    store_exists = store_name is not None
+    records: list[dict[str, Any]] = []
+    if store_exists:
+        session.execute(
+            f"SELECT row_to_json(store_row)::text FROM {FRAGMENT_STORE_RELATION} AS store_row "
+            "WHERE store_row.heap_oid = %s::regclass::oid ORDER BY row_to_json(store_row)::text",
+            (table,),
+        )
+        records = [json.loads(str(row[0])) for row in session.all()]
+    epoch_value = int(epoch or 0)
+    relfilenode_value = int(relfilenode)
+    epoch_matches = sum(int(record.get("build_epoch", -1)) == epoch_value for record in records)
+    relfilenode_matches = sum(int(record.get("relfilenode", -1)) == relfilenode_value for record in records)
+    proof = {
+        "valid": all(
+            int(record.get("heap_oid", -1)) == int(heap_oid)
+            and int(record.get("build_epoch", -1)) == epoch_value
+            and int(record.get("relfilenode", -1)) == relfilenode_value
+            for record in records
+        ) and bool(epoch_present),
+        "heap_oid": int(heap_oid),
+        "epoch": epoch_value,
+        "epoch_present": bool(epoch_present),
+        "relfilenode": relfilenode_value,
+        "rows_checked": len(records),
+        "rows_epoch_match": epoch_matches,
+        "rows_relfilenode_match": relfilenode_matches,
+    }
+    return {
+        "exists": store_exists,
+        "count": len(records),
+        "content_sha256": canonical_sha256(records),
+        "heap_oid": int(heap_oid),
+        "epoch": epoch_value,
+        "relfilenode": relfilenode_value,
+        "epoch_proof": proof,
+    }
+
+
+def validate_fragment_store_reset(before: Mapping[str, Any], deleted_count: int,
+                                  after: Mapping[str, Any]) -> dict[str, Any]:
+    before_count = int(before.get("count", -1))
+    after_count = int(after.get("count", -1))
+    if before_count < 0 or after_count < 0 or int(deleted_count) != before_count or after_count != 0:
+        raise BenchmarkContractError(
+            "persistent fragment store reset failed: "
+            f"before={before_count} deleted={deleted_count} after={after_count}"
+        )
+    if int(before.get("heap_oid", -1)) != int(after.get("heap_oid", -2)):
+        raise BenchmarkContractError("persistent fragment store reset changed target heap identity")
+    epoch_proof = dict(after.get("epoch_proof") or {})
+    if epoch_proof.get("valid") is not True or int(epoch_proof.get("rows_checked", -1)) != 0:
+        raise BenchmarkContractError("persistent fragment store reset has incomplete epoch proof")
+    return {
+        "valid": True,
+        "before": dict(before),
+        "deleted": int(deleted_count),
+        "after": dict(after),
+        "heap_oid": int(after["heap_oid"]),
+        "epoch_proof": epoch_proof,
+        "prebuilt_fragments": after_count,
+    }
+
+
+def clear_fragment_store(session: Session, table: str) -> dict[str, Any]:
+    """Clear persistent fragments for one heap, retaining an epoch proof."""
+    before = audit_fragment_store(session, table)
+    if before["exists"]:
+        session.execute(
+            f"DELETE FROM {FRAGMENT_STORE_RELATION} "
+            "WHERE heap_oid = %s::regclass::oid RETURNING heap_oid",
+            (table,),
+        )
+        deleted = len(session.all())
+    else:
+        deleted = 0
+    after = audit_fragment_store(session, table)
+    return validate_fragment_store_reset(before, deleted, after)
 
 
 def lifecycle_classification(before: Mapping[str, Any], after: Mapping[str, Any], guidance: Mapping[str, Any], *,
@@ -309,6 +416,13 @@ def summary_for_window(rows: Sequence[Mapping[str, Any]], *, bootstrap_samples: 
     checks = sum(float(row.get("guidance_checks", 0) or 0) for row in ok)
     skips = sum(float(row.get("guidance_skips", 0) or 0) for row in ok)
     hits = sum(1 for row in ok if row.get("fragment_reused"))
+    lifecycle_fields = {
+        "probe": "probe_observed",
+        "materialize": "materialization_observed",
+        "reuse": "reuse_observed",
+        "refine": "refine_observed",
+        "evict": "evict_observed",
+    }
     return {
         "requests": len(rows), "ok": len(ok), "errors": len(rows) - len(ok),
         "e2e_mean_ms": statistics.fmean(e2e) if e2e else 0.0, "e2e_p50_ms": percentile(e2e, .50),
@@ -320,6 +434,17 @@ def summary_for_window(rows: Sequence[Mapping[str, Any]], *, bootstrap_samples: 
         "cache_hit_rate": hits / len(ok) if ok else 0.0,
         "memory_bytes_end": int(ok[-1].get("cache_resident_bytes_after", 0) or 0) if ok else 0,
         "guidance_skip_rate": skips / checks if checks else 0.0,
+        "lifecycle_event_counts": {
+            event: sum(1 for row in ok if row.get(field)) for event, field in lifecycle_fields.items()
+        },
+        "probe_count": sum(1 for row in ok if row.get("probe_observed")),
+        "materialization_count": sum(1 for row in ok if row.get("materialization_observed")),
+        "reuse_count": sum(1 for row in ok if row.get("reuse_observed")),
+        "refine_count": sum(1 for row in ok if row.get("refine_observed")),
+        "evict_count": sum(1 for row in ok if row.get("evict_observed")),
+        "fragment_store_hit_delta": sum(_counter(row, "fragment_store_hit_delta") for row in ok),
+        "hidden_prebuilt_reuse_count": sum(1 for row in ok if row.get("hidden_prebuilt_fragment_reused")),
+        "lifecycle_paths": dict(statistics.Counter(str(row.get("lifecycle_path", "unknown")) for row in ok)),
     }
 
 
@@ -369,11 +494,27 @@ def validate_artifact(rows_by_mode: Mapping[str, Sequence[Mapping[str, Any]]], t
                 if stock_row and float(row.get("recall_at_10", 0.0)) + recall_delta < float(stock_row.get("recall_at_10", 0.0)):
                     errors.append(f"recall_regression:{mode}")
                     break
+                if int(row.get("fragment_store_hit_delta", 0) or 0) < 0:
+                    errors.append(f"negative_fragment_store_hit_delta:{mode}")
+                    break
             if planner_failed:
                 errors.append(f"planner_proof_failure:{mode}")
     adaptive_rows = rows_by_mode.get("adaptive", [])
     if adaptive_rows and not bool(adaptive_rows[0].get("adaptive_cache_started_empty")):
         errors.append("preexisting_adaptive_cache")
+    if adaptive_rows:
+        reset_proof = adaptive_rows[0].get("persistent_fragment_reset_proof")
+        if not isinstance(reset_proof, Mapping) or reset_proof.get("valid") is not True:
+            errors.append("missing_adaptive_fragment_store_reset_proof")
+        elif int(reset_proof.get("prebuilt_fragments", -1)) != 0:
+            errors.append("prebuilt_adaptive_fragments")
+        if any(row.get("hidden_prebuilt_fragment_reused") for row in adaptive_rows):
+            errors.append("hidden_prebuilt_fragment_reuse:adaptive")
+        if any(not row.get("online_arm") for row in adaptive_rows):
+            errors.append("adaptive_arm_contract_missing")
+    eager_rows = rows_by_mode.get("eager_prebuilt", [])
+    if eager_rows and any(not row.get("explicit_eager_control") for row in eager_rows):
+        errors.append("eager_control_contract_missing")
     return errors
 
 
@@ -480,6 +621,8 @@ def backend_lifecycle_fingerprints(rows_by_mode: Mapping[str, Sequence[Mapping[s
             "adaptive_state": last.get("adaptive_state"),
             "fragment_created": last.get("fragment_created"),
             "fragment_reused": last.get("fragment_reused"),
+            "fragment_store_hit_delta": last.get("fragment_store_hit_delta"),
+            "lifecycle_path": last.get("lifecycle_path"),
         })
     return fingerprints
 
@@ -557,6 +700,7 @@ def reset_guidance(session: Session) -> None:
 
 
 def adaptive_cache_empty_gate(session: Session) -> tuple[bool, dict[str, Any]]:
+    reset_guidance(session)
     before = json_profile(session, "SELECT vector_hnsw_metadata_cache_profile()")
     session.execute("SELECT vector_hnsw_metadata_cache_reset()")
     after = json_profile(session, "SELECT vector_hnsw_metadata_cache_profile()")
@@ -606,8 +750,13 @@ def reported_profile_build_id(profiles: Sequence[Mapping[str, Any]]) -> str:
 
 
 def run_request(session: Session, args: argparse.Namespace, mode: str, request: Request, filter_spec: FilterSpec,
-                truth: TruthEntry, provenance: Mapping[str, Any], *, adaptive_started_empty: bool) -> dict[str, Any]:
+                truth: TruthEntry, provenance: Mapping[str, Any], *, adaptive_started_empty: bool,
+                online_materializations_before: int = 0) -> dict[str, Any]:
     cache_before = json_profile(session, "SELECT vector_hnsw_metadata_cache_profile()")
+    guidance_before = (
+        json_profile(session, "SELECT vector_hnsw_guidance_profile()")
+        if mode != "stock" else {}
+    )
     reset_guidance(session)
     activation_ms = 0.0
     guidance: dict[str, Any] = {}
@@ -633,8 +782,48 @@ def run_request(session: Session, args: argparse.Namespace, mode: str, request: 
         session, args.table, filter_spec.predicate, request.query_id, args.k
     )
     cache_after = json_profile(session, "SELECT vector_hnsw_metadata_cache_profile()")
+    guidance_after = (
+        json_profile(session, "SELECT vector_hnsw_guidance_profile()")
+        if mode != "stock" else guidance
+    )
     e2e_ms = activation_ms + query_ms
-    lifecycle = lifecycle_classification(cache_before, cache_after, guidance, admitted=guidance_active, reason=reason)
+    lifecycle_guidance = dict(guidance)
+    lifecycle_guidance.update(guidance_after)
+    lifecycle = lifecycle_classification(
+        cache_before, cache_after, lifecycle_guidance, admitted=guidance_active, reason=reason
+    )
+    counter_fields = (
+        "adaptive_probes", "adaptive_admissions", "adaptive_page_builds", "adaptive_bloom_builds",
+        "adaptive_refinements", "adaptive_rejections", "adaptive_evictions", "fragment_cache_hits",
+        "fragment_store_hits", "fragment_builds",
+    )
+    deltas = {f"{field}_delta": _counter_delta(guidance_before, guidance_after, field) for field in counter_fields}
+    materialization_observed = bool(
+        deltas["fragment_builds_delta"]
+        or deltas["adaptive_page_builds_delta"]
+        or deltas["adaptive_bloom_builds_delta"]
+    )
+    probe_observed = bool(deltas["adaptive_probes_delta"])
+    refine_observed = bool(deltas["adaptive_refinements_delta"])
+    evict_observed = bool(deltas["adaptive_evictions_delta"] or _counter_delta(cache_before, cache_after, "evictions"))
+    reuse_observed = bool(
+        deltas["fragment_cache_hits_delta"]
+        or deltas["fragment_store_hits_delta"]
+        or guidance_after.get("composed_guide_hit", False)
+        or (guidance_active and not materialization_observed)
+    )
+    hidden_prebuilt_reused = bool(
+        mode == "adaptive"
+        and deltas["fragment_store_hits_delta"] > 0
+        and online_materializations_before == 0
+    )
+    lifecycle_events = [
+        name for name, observed in (
+            ("probe", probe_observed), ("materialize", materialization_observed),
+            ("reuse", reuse_observed), ("refine", refine_observed), ("evict", evict_observed),
+        ) if observed
+    ]
+    lifecycle_path = "->".join(lifecycle_events) if lifecycle_events else "none"
     proof = bool(scan.get("planner_proof_succeeded", False)) if guidance_active else True
     return {
         "mode": mode, "request_no": request.request_no, "phase": request.phase, "window": request.window,
@@ -666,6 +855,16 @@ def run_request(session: Session, args: argparse.Namespace, mode: str, request: 
         "profile_build_id": provenance["database_build_id"],
         "profile_reported_build_id": reported_profile_build_id((scan, guidance, cache_after)),
         "database_build_id": provenance["database_build_id"], "adaptive_cache_started_empty": adaptive_started_empty,
+        "online_arm": mode == "adaptive", "explicit_eager_control": mode == "eager_prebuilt",
+        "guidance_profile_before": guidance_before, "guidance_profile_after": guidance_after,
+        **deltas,
+        "probe_observed": probe_observed, "materialization_observed": materialization_observed,
+        "reuse_observed": reuse_observed, "refine_observed": refine_observed,
+        "evict_observed": evict_observed, "lifecycle_events": lifecycle_events,
+        "lifecycle_path": lifecycle_path,
+        "fragment_store_hit_delta": deltas["fragment_store_hits_delta"],
+        "online_materializations_before": online_materializations_before,
+        "hidden_prebuilt_fragment_reused": hidden_prebuilt_reused,
         **lifecycle,
     }
 
@@ -673,12 +872,15 @@ def run_request(session: Session, args: argparse.Namespace, mode: str, request: 
 def run_paired_window(backends: Mapping[str, ModeBackend], args: argparse.Namespace, trace: Sequence[Request],
                       filters_by_name: Mapping[str, FilterSpec], truth: Mapping[tuple[str, int], TruthEntry],
                       provenance: Mapping[str, Any], *, window: int,
-                      adaptive_started_empty: bool) -> dict[str, list[dict[str, Any]]]:
+                      adaptive_started_empty: bool,
+                      adaptive_lifecycle_state: dict[str, int] | None = None) -> dict[str, list[dict[str, Any]]]:
     """Run one complete trace window once per mode on isolated persistent backends."""
     validate_independent_mode_sessions(backends)
     window_trace = [request for request in trace if request.window == window]
     if len(window_trace) != args.window_size:
         raise BenchmarkContractError(f"trace does not contain one full paired window: {window}")
+    if adaptive_lifecycle_state is None:
+        adaptive_lifecycle_state = {"online_materializations": 0}
     blocks: dict[str, list[dict[str, Any]]] = {mode: [] for mode in MODES}
     for request in window_trace:
         mode_order = paired_request_mode_order(request.request_no)
@@ -688,7 +890,19 @@ def run_paired_window(backends: Mapping[str, ModeBackend], args: argparse.Namesp
                 backend.session, args, mode, request, filters_by_name[request.filter_name],
                 truth[(request.filter_name, request.query_no)], provenance,
                 adaptive_started_empty=adaptive_started_empty,
+                online_materializations_before=(
+                    int(adaptive_lifecycle_state.get("online_materializations", 0))
+                    if mode == "adaptive" else 0
+                ),
             )
+            if mode == "adaptive":
+                builds = int(row.get("fragment_builds_delta", 0) or 0)
+                if builds <= 0 and row.get("materialization_observed"):
+                    builds = 1
+                adaptive_lifecycle_state["online_materializations"] = (
+                    int(adaptive_lifecycle_state.get("online_materializations", 0)) + builds
+                )
+                row["online_materializations_after"] = adaptive_lifecycle_state["online_materializations"]
             row["backend_mode"] = mode
             row["backend_pid"] = backend.backend_pid
             row["paired_request_mode_order"] = list(mode_order)
@@ -702,6 +916,7 @@ def run_paired_window(backends: Mapping[str, ModeBackend], args: argparse.Namesp
 
 def eager_prebuild(session: Session, args: argparse.Namespace, filters: Sequence[FilterSpec]) -> dict[str, Any]:
     """This is intentionally outside timed requests and only used for the eager control."""
+    reset_guidance(session)
     session.execute("SELECT vector_hnsw_metadata_cache_reset()")
     total_ms = 0.0
     for item in filters:
@@ -767,24 +982,40 @@ def close_mode_backends(backends: Mapping[str, ModeBackend]) -> None:
 
 def initialize_mode_backends(backends: Mapping[str, ModeBackend], args: argparse.Namespace,
                              filters: Sequence[FilterSpec]) -> tuple[bool, dict[str, Any], dict[str, Any]]:
-    """Configure each backend once; only adaptive receives a real cold-cache gate."""
+    """Configure modes, retain eager's local prebuild, then cold-start online persistently."""
     validate_independent_mode_sessions(backends)
     for mode in MODES:
         configure(backends[mode].session, args, mode)
+    reset_guidance(backends["stock"].session)
     backends["stock"].session.execute("SELECT vector_hnsw_metadata_cache_reset()")
     adaptive_started_empty, adaptive_reset_evidence = adaptive_cache_empty_gate(backends["adaptive"].session)
     if not adaptive_started_empty:
         raise BenchmarkContractError("adaptive cold-start reset did not leave an empty metadata cache")
     eager_prebuild_evidence = eager_prebuild(backends["eager_prebuilt"].session, args, filters)
+    # Eager intentionally materializes its control cache.  Its writes are shared
+    # through the persistent store, so the final online gate must happen after
+    # that control setup and before the first timed request.
+    persistent_reset = clear_fragment_store(backends["adaptive"].session, args.table)
+    if int(persistent_reset["prebuilt_fragments"]) != 0:
+        raise BenchmarkContractError("online arm persistent fragment store is not empty before run")
+    adaptive_reset_evidence["persistent_fragment_store_reset"] = persistent_reset
+    adaptive_reset_evidence["prebuilt_fragments"] = persistent_reset["prebuilt_fragments"]
+    eager_prebuild_evidence["persistent_store_cleared_after_prebuild"] = True
     return adaptive_started_empty, adaptive_reset_evidence, eager_prebuild_evidence
 
 
 def source_provenance(args: argparse.Namespace) -> dict[str, Any]:
-    truth_manifest = args.truth.with_name(args.truth.stem + "_manifest.json")
+    truth_manifest = args.truth_manifest
     if not truth_manifest.exists():
         raise BenchmarkContractError("fixed exact GT manifest is required for strict source provenance")
+    expected_manifest_name = args.truth.with_name(args.truth.stem + "_manifest.json").name
+    if truth_manifest.name != expected_manifest_name:
+        raise BenchmarkContractError(
+            f"truth manifest name must match its truth CSV: expected {expected_manifest_name}"
+        )
     return {"script_sha256": sha256_file(Path(__file__)), "filters_sha256": sha256_file(args.filters_csv),
-            "truth_sha256": sha256_file(args.truth), "truth_manifest_sha256": sha256_file(truth_manifest)}
+            "truth_sha256": sha256_file(args.truth), "truth_manifest_sha256": sha256_file(truth_manifest),
+            "truth_manifest_name": truth_manifest.name}
 
 
 def write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
@@ -802,9 +1033,14 @@ def write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
 
 
 def make_run_spec(args: argparse.Namespace, source: Mapping[str, Any], database: Mapping[str, Any], trace: Sequence[Request]) -> dict[str, Any]:
+    workload_name = FORMAL_WORKLOAD_MANIFEST_NAME if args.requests == FORMAL_REQUESTS and args.window_size == FORMAL_WINDOW else "amazon10m_d3_request_trace_q200_reused_vectors"
     return {"formal": args.requests == FORMAL_REQUESTS and args.window_size == FORMAL_WINDOW, "requests": args.requests,
             "window_size": args.window_size, "seed": args.seed, "phase_boundary": args.requests // 2,
-            "q200_fixed_exact_truth": True, "effective_unique_queries": FORMAL_Q200, "modes": list(MODES),
+            "workload_manifest_name": workload_name,
+            "trace_contract": "10,000-request trace over q200 fixed truth query vectors; vectors are reused",
+            "q200_fixed_exact_truth": True, "effective_unique_queries": FORMAL_Q200,
+            "unique_query_vectors": FORMAL_Q200, "database_cracking": False,
+            "modes": list(MODES),
             "single_client_sequential": True, "measurement_schedule": PAIRING_SCHEDULE,
             "mode_backend_topology": "three_independent_persistent_postgresql_backends",
             "paired_request_mode_order": "round_robin rotation by request number",
@@ -833,6 +1069,7 @@ def execute_experiment(args: argparse.Namespace) -> int:
     filters_by_name = {item.name: item for item in filters}
     rows_by_mode: dict[str, list[dict[str, Any]]] = {mode: [] for mode in MODES}
     completed_paired_windows: list[int] = []
+    adaptive_lifecycle_state = {"online_materializations": 0}
     adaptive_reset_evidence: dict[str, Any] | None = None
     eager_prebuild_evidence: dict[str, Any] | None = None
     backends: dict[str, ModeBackend] = {}
@@ -857,13 +1094,18 @@ def execute_experiment(args: argparse.Namespace) -> int:
         adaptive_started_empty, adaptive_reset_evidence, eager_prebuild_evidence = initialize_mode_backends(
             backends, args, filters
         )
+        persistent_reset = adaptive_reset_evidence.get("persistent_fragment_store_reset", {})
+        if int(persistent_reset.get("heap_oid", -1)) != int(database.get("table_oid", -2)):
+            raise BenchmarkContractError("online fragment reset heap_oid does not match target table")
         for window in range(args.requests // args.window_size):
             blocks = run_paired_window(
                 backends, args, trace, filters_by_name, truth, database, window=window,
                 adaptive_started_empty=adaptive_started_empty,
+                adaptive_lifecycle_state=adaptive_lifecycle_state,
             )
             if not rows_by_mode["adaptive"] and blocks["adaptive"]:
                 blocks["adaptive"][0]["adaptive_reset_evidence"] = adaptive_reset_evidence
+                blocks["adaptive"][0]["persistent_fragment_reset_proof"] = persistent_reset
             for mode in MODES:
                 rows_by_mode[mode].extend(blocks[mode])
             completed_paired_windows.append(window)
@@ -873,19 +1115,36 @@ def execute_experiment(args: argparse.Namespace) -> int:
         close_mode_backends(backends)
     errors = validate_artifact(rows_by_mode, trace, recall_delta=args.recall_delta, provenance=database)
     all_rows = [row for mode in MODES for row in rows_by_mode[mode]]
+    stock_by_request = {int(row["request_no"]): row for row in rows_by_mode["stock"]}
     windows = [{"mode": mode, "window": window, "phase": next(request.phase for request in trace if request.window == window),
                 **summary_for_window([row for row in rows_by_mode[mode] if row["window"] == window], bootstrap_samples=args.bootstrap_samples,
                                      bootstrap_seed=args.bootstrap_seed + window)}
                for mode in MODES for window in range(args.requests // args.window_size)]
-    stock_by_request = {int(row["request_no"]): row for row in rows_by_mode["stock"]}
+    for item in windows:
+        if item["mode"] != "stock":
+            mode_rows = [row for row in rows_by_mode[item["mode"]] if row["window"] == item["window"]]
+            item["cumulative_savings_vs_stock_ms"] = sum(
+                float(stock_by_request[int(row["request_no"])] ["e2e_ms"]) - float(row["e2e_ms"])
+                for row in mode_rows if int(row["request_no"]) in stock_by_request and not row.get("error")
+            )
+            item["cumulative_break_even_request"] = break_even_request(mode_rows, stock_by_request)
+        else:
+            item["cumulative_savings_vs_stock_ms"] = 0.0
+            item["cumulative_break_even_request"] = None
     timeline = []
     for mode in MODES:
         cumulative_build = 0.0
+        cumulative_savings = 0.0
         for row in sorted(rows_by_mode[mode], key=lambda item: item["request_no"]):
             cumulative_build += float(row["materialization_ms"])
+            if mode != "stock" and int(row["request_no"]) in stock_by_request:
+                cumulative_savings += float(stock_by_request[int(row["request_no"])] ["e2e_ms"]) - float(row["e2e_ms"])
             timeline.append({"mode": mode, "request_no": row["request_no"], "phase": row["phase"],
                              "cumulative_build_ms": cumulative_build, "cache_resident_bytes": row["cache_resident_bytes_after"],
-                             "fragment_created": row["fragment_created"], "fragment_reused": row["fragment_reused"]})
+                             "fragment_created": row["fragment_created"], "fragment_reused": row["fragment_reused"],
+                             "fragment_store_hit_delta": row.get("fragment_store_hit_delta", 0),
+                             "lifecycle_path": row.get("lifecycle_path", "none"),
+                             "cumulative_savings_vs_stock_ms": cumulative_savings})
     for item in windows:
         stock_window = next((candidate for candidate in windows if candidate["mode"] == "stock" and candidate["window"] == item["window"]), None)
         item["benefit_vs_stock_mean_ms"] = (float(stock_window["e2e_mean_ms"]) - float(item["e2e_mean_ms"])) if stock_window else 0.0
@@ -899,11 +1158,32 @@ def execute_experiment(args: argparse.Namespace) -> int:
         }
         for mode in MODES
     }
+    phase_summaries = []
+    for mode in MODES:
+        for phase in ("steady_hot", "phase_shift_hot"):
+            phase_rows = [row for row in rows_by_mode[mode] if row["phase"] == phase]
+            phase_summary = summary_for_window(
+                phase_rows, bootstrap_samples=args.bootstrap_samples,
+                bootstrap_seed=args.bootstrap_seed + (0 if phase == "steady_hot" else 1),
+            )
+            if mode != "stock":
+                phase_summary["cumulative_savings_vs_stock_ms"] = sum(
+                    float(stock_by_request[int(row["request_no"])] ["e2e_ms"]) - float(row["e2e_ms"])
+                    for row in phase_rows if int(row["request_no"]) in stock_by_request and not row.get("error")
+                )
+                phase_summary["cumulative_break_even_request"] = break_even_request(phase_rows, stock_by_request)
+            else:
+                phase_summary["cumulative_savings_vs_stock_ms"] = 0.0
+                phase_summary["cumulative_break_even_request"] = None
+            phase_summaries.append({"mode": mode, "phase": phase, **phase_summary})
     summary = {"artifact_valid": not errors, "validation_errors": errors, "run_spec": run_spec, "run_spec_hash": spec_hash,
-               "effective_unique_queries": FORMAL_Q200, "independent_q10000_queries_called": False,
+               "effective_unique_queries": FORMAL_Q200, "unique_query_vectors": FORMAL_Q200,
+               "database_cracking": False,
                "non_formal_debug_override": args.requests != FORMAL_REQUESTS or args.window_size != FORMAL_WINDOW,
-               "window_summaries": windows, "cumulative_build_cost_ms": cumulative_build_cost,
+               "window_summaries": windows, "phase_summaries": phase_summaries,
+               "cumulative_build_cost_ms": cumulative_build_cost,
                "break_even_request": {mode: break_even_request(rows_by_mode[mode], stock_by_request) for mode in MODES if mode != "stock"},
+               "cumulative_break_even_request": {mode: break_even_request(rows_by_mode[mode], stock_by_request) for mode in MODES if mode != "stock"},
                "phase_shift_recovery": phase_shift_recovery,
                "adaptive_reset_evidence": adaptive_reset_evidence,
                "eager_prebuild_evidence": eager_prebuild_evidence,
@@ -924,6 +1204,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Formal Amazon-10M workload-driven D3 adaptation lifecycle benchmark")
     parser.add_argument("--filters-csv", type=Path, default=DEFAULT_FILTERS)
     parser.add_argument("--truth", type=Path, default=DEFAULT_TRUTH)
+    parser.add_argument("--truth-manifest", type=Path, default=DEFAULT_TRUTH_MANIFEST)
     parser.add_argument("--table", default=DEFAULT_TABLE)
     parser.add_argument("--index", default=DEFAULT_INDEX)
     parser.add_argument("--out", type=Path, default=ROOT / "results/hybrid_vector_db/amazon10m_d3_adaptation_lifecycle.csv")
@@ -964,11 +1245,14 @@ def dry_run_payload(args: argparse.Namespace) -> dict[str, Any]:
             "modes": list(MODES), "requests": args.requests, "window_size": args.window_size,
             "formal": args.requests == FORMAL_REQUESTS and args.window_size == FORMAL_WINDOW,
             "debug_override_labeled_non_formal": args.requests != FORMAL_REQUESTS or args.window_size != FORMAL_WINDOW,
-            "fixed_exact_gt_q200": True, "single_client_sequential": True,
+            "fixed_exact_gt_q200": True, "unique_query_vectors": FORMAL_Q200,
+            "trace_contract": "10,000-request trace over q200 fixed truth query vectors; vectors are reused",
+            "database_cracking": False, "single_client_sequential": True,
+            "workload_manifest_name": FORMAL_WORKLOAD_MANIFEST_NAME,
             "measurement_schedule": PAIRING_SCHEDULE,
             "mode_backend_topology": "three_independent_persistent_postgresql_backends",
             "checkpoint_resume_contract": checkpoint_resume_contract(),
-            "adaptive_contract": "reset empty metadata cache; no activate/prewarm outside timed requests"}
+            "adaptive_contract": "reset empty metadata cache and target-heap persistent fragment store; no activate/prewarm outside timed requests"}
 
 
 def main(argv: Sequence[str] | None = None) -> int:

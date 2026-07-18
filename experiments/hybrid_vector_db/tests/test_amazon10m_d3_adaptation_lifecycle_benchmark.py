@@ -45,6 +45,30 @@ class FakeSession:
         return []
 
 
+class FragmentStoreSession:
+    def __init__(self, audits: list[tuple[object, ...]], records: list[list[tuple[str]]], deleted: int) -> None:
+        self.audits = iter(audits)
+        self.records = iter(records)
+        self.deleted = deleted
+        self.calls: list[tuple[str, object]] = []
+        self.last_sql = ""
+
+    def execute(self, sql: str, params=None) -> None:  # type: ignore[no-untyped-def]
+        self.last_sql = sql
+        self.calls.append((sql, params))
+
+    def one(self):  # type: ignore[no-untyped-def]
+        raise AssertionError("fragment-store audit uses row(), not one()")
+
+    def row(self):  # type: ignore[no-untyped-def]
+        return next(self.audits)
+
+    def all(self):  # type: ignore[no-untyped-def]
+        if "DELETE FROM" in self.last_sql:
+            return [(1,)] * self.deleted
+        return next(self.records)
+
+
 class Amazon10MD3AdaptationLifecycleTests(unittest.TestCase):
     def test_real_fourteen_amazon_predicates_and_atoms_are_loaded_without_synthesis(self) -> None:
         specs = runner.load_filters(Path(__file__).resolve().parents[1] / "configs" / "amazon10m_selectivity14_filters.csv")
@@ -78,6 +102,42 @@ class Amazon10MD3AdaptationLifecycleTests(unittest.TestCase):
         self.assertTrue(evidence["after_reset_empty"])
         self.assertEqual(evidence["after_reset"]["entries"], 0)
         self.assertIn("SELECT vector_hnsw_metadata_cache_reset()", session.calls)
+
+    def test_fragment_store_reset_is_targeted_and_epoch_proven(self) -> None:
+        before = {"heap_oid": 41, "count": 2, "epoch": 7, "relfilenode": 91,
+                  "epoch_proof": {"valid": True, "rows_checked": 2}}
+        after = {"heap_oid": 41, "count": 0, "epoch": 7, "relfilenode": 91,
+                 "epoch_proof": {"valid": True, "rows_checked": 0, "epoch": 7}}
+        proof = runner.validate_fragment_store_reset(before, 2, after)
+        self.assertTrue(proof["valid"])
+        self.assertEqual(proof["deleted"], 2)
+        self.assertEqual(proof["heap_oid"], 41)
+        self.assertEqual(proof["epoch_proof"]["epoch"], 7)
+        with self.assertRaisesRegex(runner.BenchmarkContractError, "persistent fragment store"):
+            runner.validate_fragment_store_reset(before, 1, after)
+        with self.assertRaisesRegex(runner.BenchmarkContractError, "epoch proof"):
+            runner.validate_fragment_store_reset(before, 2, {**after, "epoch_proof": {"valid": False, "rows_checked": 0}})
+
+    def test_fragment_store_audit_and_clear_use_target_heap_not_global_delete(self) -> None:
+        row = json.dumps({"heap_oid": 41, "build_epoch": 7, "relfilenode": 91})
+        session = FragmentStoreSession(
+            [("pgvector_hnsw_fragment_store", 41, 91, 7, True), ("pgvector_hnsw_fragment_store", 41, 91, 7, True)],
+            [[(row,), (row,)], []],
+            2,
+        )
+        proof = runner.clear_fragment_store(session, "public.reviews")
+        self.assertEqual(proof["prebuilt_fragments"], 0)
+        delete_sql = next(sql for sql, _ in session.calls if "DELETE FROM" in sql)
+        self.assertIn("WHERE heap_oid = %s::regclass::oid", delete_sql)
+        self.assertIn("RETURNING heap_oid", delete_sql)
+        self.assertEqual(proof["heap_oid"], 41)
+
+    def test_old_checkpoint_schema_fails_closed(self) -> None:
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "old_checkpoint.json"
+            path.write_text(json.dumps({"checkpoint_schema_version": 2}), encoding="utf-8")
+            with self.assertRaisesRegex(runner.BenchmarkContractError, "checkpoint schema"):
+                runner.load_checkpoint(path, "unused")
 
     def test_lifecycle_classifies_creation_reuse_eviction_and_reason(self) -> None:
         created = runner.lifecycle_classification({"entries": 0, "evictions": 0}, {"entries": 1, "evictions": 0},
@@ -141,21 +201,26 @@ class Amazon10MD3AdaptationLifecycleTests(unittest.TestCase):
         calls: list[tuple[str, int, object]] = []
         cache_entries = {mode: 0 for mode in runner.MODES}
 
-        def fake_run_request(session, unused_args, mode, request, unused_filter, unused_truth, unused_provenance, *, adaptive_started_empty):  # type: ignore[no-untyped-def]
+        def fake_run_request(session, unused_args, mode, request, unused_filter, unused_truth, unused_provenance, *, adaptive_started_empty, online_materializations_before):  # type: ignore[no-untyped-def]
             self.assertIs(session, sessions[mode])
             self.assertTrue(adaptive_started_empty)
+            if mode == "adaptive":
+                self.assertEqual(online_materializations_before, int(request.request_no > 0))
             cache_entries[mode] += 1
             calls.append((mode, request.request_no, session))
-            return {"mode": mode, "request_no": request.request_no, "window": request.window}
+            return {"mode": mode, "request_no": request.request_no, "window": request.window,
+                    "fragment_builds_delta": int(mode == "adaptive" and request.request_no == 0),
+                    "materialization_observed": bool(mode == "adaptive" and request.request_no == 0)}
 
+        lifecycle_state = {"online_materializations": 0}
         with mock.patch.object(runner, "run_request", side_effect=fake_run_request):
             first = runner.run_paired_window(
                 backends, args, trace, {"f": spec}, {("f", 0): exact}, {"database_build_id": "build"},
-                window=0, adaptive_started_empty=True,
+                window=0, adaptive_started_empty=True, adaptive_lifecycle_state=lifecycle_state,
             )
             second = runner.run_paired_window(
                 backends, args, trace, {"f": spec}, {("f", 0): exact}, {"database_build_id": "build"},
-                window=1, adaptive_started_empty=True,
+                window=1, adaptive_started_empty=True, adaptive_lifecycle_state=lifecycle_state,
             )
 
         self.assertEqual(runner.paired_request_mode_order(0), runner.MODES)
@@ -173,6 +238,7 @@ class Amazon10MD3AdaptationLifecycleTests(unittest.TestCase):
         self.assertEqual(first["stock"][0]["backend_pid"], 1)
         self.assertEqual(second["stock"][0]["paired_request_mode_rank"], 0)
         self.assertEqual(second["adaptive"][0]["paired_request_mode_rank"], 1)
+        self.assertEqual(lifecycle_state["online_materializations"], 1)
 
     def test_paired_execution_rejects_shared_mode_session(self) -> None:
         shared_session = mock.Mock()
@@ -211,6 +277,37 @@ class Amazon10MD3AdaptationLifecycleTests(unittest.TestCase):
         self.assertEqual(summary["e2e_p95_ms"], 5.0)
         self.assertEqual(summary["e2e_p99_ms"], 5.0)
 
+    def test_summary_proves_lifecycle_deltas_and_percentile_contract(self) -> None:
+        rows = [
+            {"e2e_ms": 4.0, "query_ms": 3.0, "recall_at_10": 1.0, "fragment_reused": False,
+             "fragment_store_hit_delta": 0, "probe_observed": True, "materialization_observed": True,
+             "reuse_observed": False, "refine_observed": False, "evict_observed": False,
+             "hidden_prebuilt_fragment_reused": False, "lifecycle_path": "probe->materialize",
+             "guidance_checks": 1, "guidance_skips": 0, "cache_resident_bytes_after": 2, "error": ""},
+            {"e2e_ms": 2.0, "query_ms": 1.0, "recall_at_10": 1.0, "fragment_reused": True,
+             "fragment_store_hit_delta": 1, "probe_observed": False, "materialization_observed": False,
+             "reuse_observed": True, "refine_observed": True, "evict_observed": True,
+             "hidden_prebuilt_fragment_reused": False, "lifecycle_path": "reuse->refine->evict",
+             "guidance_checks": 1, "guidance_skips": 1, "cache_resident_bytes_after": 1, "error": ""},
+        ]
+        summary = runner.summary_for_window(rows, bootstrap_samples=20, bootstrap_seed=7)
+        self.assertEqual(summary["e2e_p50_ms"], 2.0)
+        self.assertEqual(summary["e2e_p95_ms"], 4.0)
+        self.assertEqual(summary["e2e_p99_ms"], 4.0)
+        self.assertEqual(summary["fragment_store_hit_delta"], 1)
+        self.assertEqual(summary["lifecycle_event_counts"]["materialize"], 1)
+        self.assertEqual(summary["hidden_prebuilt_reuse_count"], 0)
+
+    def test_run_spec_names_reused_q200_trace_and_rejects_cracking_claim(self) -> None:
+        args = runner.create_argument_parser().parse_args([])
+        spec = runner.make_run_spec(args, {}, {}, [])
+        self.assertEqual(spec["workload_manifest_name"], runner.FORMAL_WORKLOAD_MANIFEST_NAME)
+        self.assertEqual(spec["unique_query_vectors"], runner.FORMAL_Q200)
+        self.assertFalse(spec["database_cracking"])
+        self.assertIn("10,000-request trace", spec["trace_contract"])
+        self.assertIn("vectors are reused", spec["trace_contract"])
+        self.assertNotIn("q10000", json.dumps(spec))
+
     def test_invalidation_catches_missing_rows_recall_planner_and_build_mismatch(self) -> None:
         trace = [runner.Request(0, "steady_hot", 0, "f", 0, 0, None)]
         base = {"request_no": 0, "e2e_ms": 1.0, "recall_at_10": 1.0, "database_build_id": "build", "profile_build_id": "build", "error": ""}
@@ -232,7 +329,7 @@ class Amazon10MD3AdaptationLifecycleTests(unittest.TestCase):
         exact = runner.TruthEntry("f", 0, 99, tuple(range(10)), 1.0, 0.0)
         session = mock.Mock()
         cache = {"entries": 0, "resident_entries": 0, "resident_bytes": 0}
-        with mock.patch.object(runner, "json_profile", side_effect=[cache, cache]), \
+        with mock.patch.object(runner, "json_profile", side_effect=[cache, cache, cache, cache]), \
              mock.patch.object(runner, "activate", return_value=({"active": False, "adaptive_state": "probing"}, 2.5)) as activate, \
              mock.patch.object(runner, "run_search", return_value=(list(range(10)), {}, "", 7.5)):
             row = runner.run_request(
@@ -255,7 +352,7 @@ class Amazon10MD3AdaptationLifecycleTests(unittest.TestCase):
         exact = runner.TruthEntry("f", 0, 99, tuple(range(10)), 1.0, 0.0)
         session = mock.Mock()
         cache = {"entries": 1, "resident_entries": 1, "resident_bytes": 8}
-        with mock.patch.object(runner, "json_profile", side_effect=[cache, cache]), \
+        with mock.patch.object(runner, "json_profile", side_effect=[cache, cache, cache, cache]), \
              mock.patch.object(runner, "activate", return_value=({"active": True}, 1.0)) as activate, \
              mock.patch.object(runner, "run_search", return_value=(list(range(10)), {"planner_proof_succeeded": True}, "", 2.0)):
             row = runner.run_request(
