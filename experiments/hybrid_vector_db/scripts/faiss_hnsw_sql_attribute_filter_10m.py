@@ -25,6 +25,18 @@ ATTR_FILTERS: list[tuple[str, str, str]] = [
 ]
 
 
+def load_filter_specs(path: Path | None) -> list[tuple[str, str, str]]:
+    if path is None:
+        return ATTR_FILTERS
+    specs: list[tuple[str, str, str]] = []
+    with path.open(newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            specs.append((row["filter_name"], row["target_rate"], row["predicate"]))
+    if not specs:
+        raise SystemExit(f"no filters loaded from {path}")
+    return specs
+
+
 @dataclass
 class QueryResult:
     ids: list[int]
@@ -132,7 +144,7 @@ def summarize(rows: list[dict[str, object]], out: Path) -> None:
         groups.setdefault((str(row["filter_name"]), str(row["method"])), []).append(row)
     order = {name: i for i, (name, _, _) in enumerate(ATTR_FILTERS)}
     summary_rows = []
-    for (name, method), items in sorted(groups.items(), key=lambda x: (order[x[0][0]], x[0][1])):
+    for (name, method), items in sorted(groups.items(), key=lambda x: (order.get(x[0][0], 999), x[0][0], x[0][1])):
         latencies = [float(row["latency_ms"]) for row in items]
         recalls = [float(row["recall_at_10_exact_filtered"]) for row in items]
         returned = [float(row["returned"]) for row in items]
@@ -175,7 +187,9 @@ def main() -> None:
     parser.add_argument("--exact-chunk-size", type=int, default=200_000)
     parser.add_argument("--truth-csv", type=Path)
     parser.add_argument("--post-in-only", action="store_true")
+    parser.add_argument("--truth-only", action="store_true")
     parser.add_argument("--filter-names", nargs="+")
+    parser.add_argument("--filters-csv", type=Path)
     args = parser.parse_args()
 
     require_psycopg()
@@ -208,7 +222,7 @@ def main() -> None:
             rows = min(rows, sql_rows)
 
             selected = set(args.filter_names or [])
-            for filter_name, target_rate, predicate in ATTR_FILTERS:
+            for filter_name, target_rate, predicate in load_filter_specs(args.filters_csv):
                 if selected and filter_name not in selected:
                     continue
                 filter_ids, sql_ms = sql_filter_ids(cur, args.table, predicate)
@@ -230,16 +244,21 @@ def main() -> None:
                         )
                     else:
                         exact = exact_topk(xb, query, filter_ids, args.k, args.exact_chunk_size)
-                    post_vec = hnsw_search(index, query, args.post_overfetch, args.post_ef_search)
-                    post = validate_sql(cur, args.table, post_vec.ids, predicate, args.k)
-                    post.latency_ms += post_vec.latency_ms
-                    in_filter = hnsw_search(index, query, args.k, args.in_ef_search, selector)
                     method_results = [
                         ("pre_filter_exact", exact),
-                        ("post_filtering", post),
-                        ("in_filtering", in_filter),
                     ]
-                    if args.post_in_only:
+                    if not args.truth_only:
+                        post_vec = hnsw_search(index, query, args.post_overfetch, args.post_ef_search)
+                        post = validate_sql(cur, args.table, post_vec.ids, predicate, args.k)
+                        post.latency_ms += post_vec.latency_ms
+                        in_filter = hnsw_search(index, query, args.k, args.in_ef_search, selector)
+                        method_results.extend(
+                            [
+                                ("post_filtering", post),
+                                ("in_filtering", in_filter),
+                            ]
+                        )
+                    if args.post_in_only and not args.truth_only:
                         method_results = method_results[1:]
                     for method, result in method_results:
                         rows_out.append(

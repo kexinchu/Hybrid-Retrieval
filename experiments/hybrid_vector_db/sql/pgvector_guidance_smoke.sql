@@ -1,0 +1,95 @@
+CREATE EXTENSION IF NOT EXISTS vector;
+
+DROP TABLE IF EXISTS guidance_smoke;
+CREATE TABLE guidance_smoke (
+  id bigserial PRIMARY KEY,
+  embedding vector(3),
+  color text,
+  price int,
+  tenant_id int
+);
+
+INSERT INTO guidance_smoke (embedding, color, price, tenant_id)
+SELECT ARRAY[(i % 7)::float, (i % 11)::float, (i % 13)::float]::vector,
+       CASE WHEN i % 2 = 0 THEN 'red' ELSE 'blue' END,
+       i % 50,
+       i % 3
+FROM generate_series(1, 200) i;
+
+CREATE INDEX guidance_smoke_embedding_idx ON guidance_smoke USING hnsw (embedding vector_l2_ops);
+
+SELECT vector_hnsw_guidance_reset();
+SELECT vector_hnsw_guidance_activate(
+  'guidance_smoke_embedding_idx'::regclass,
+  ARRAY['page:sql:color = ''red''', 'bloom:sql:price <= 20', '|', 'exact:sql:tenant_id = 2'],
+  'exact'
+) AS activated_atoms;
+
+SELECT vector_hnsw_guidance_profile();
+
+DO $$
+BEGIN
+  BEGIN
+    PERFORM vector_hnsw_guidance_activate(
+      'guidance_smoke_embedding_idx'::regclass,
+      ARRAY['!page:sql:color = ''red'''],
+      'exact'
+    );
+    RAISE EXCEPTION 'expected !page guidance to fail';
+  EXCEPTION WHEN invalid_parameter_value THEN
+    RAISE NOTICE 'negated lossy guidance rejected as expected';
+  END;
+END $$;
+
+SELECT vector_hnsw_guidance_reset();
+DROP TABLE guidance_smoke;
+
+DROP TABLE IF EXISTS guidance_scan_smoke;
+CREATE TABLE guidance_scan_smoke (
+  id bigserial PRIMARY KEY,
+  embedding vector(3),
+  tenant_id int
+);
+
+INSERT INTO guidance_scan_smoke (embedding, tenant_id)
+SELECT ARRAY[(i % 7)::float, (i % 11)::float, (i % 13)::float]::vector, i % 3
+FROM generate_series(1, 3000) i;
+
+CREATE INDEX guidance_scan_smoke_embedding_idx ON guidance_scan_smoke USING hnsw (embedding vector_l2_ops);
+ANALYZE guidance_scan_smoke;
+
+SET enable_seqscan = off;
+SET hnsw.iterative_scan = strict_order;
+SET hnsw.ef_search = 20;
+SET hnsw.filter_strategy = acorn1;
+
+SELECT vector_hnsw_guidance_activate(
+  'guidance_scan_smoke_embedding_idx'::regclass,
+  ARRAY['exact:sql:tenant_id = 1'],
+  'exact'
+);
+
+EXPLAIN (COSTS OFF)
+SELECT id, tenant_id
+FROM guidance_scan_smoke
+ORDER BY embedding <-> '[0,0,0]'
+LIMIT 10;
+
+WITH guided AS (
+  SELECT id, tenant_id
+  FROM guidance_scan_smoke
+  ORDER BY embedding <-> '[0,0,0]'
+  LIMIT 10
+)
+SELECT count(*) AS rows, bool_and(tenant_id = 1) AS all_tenant_1
+FROM guided;
+
+SELECT vector_hnsw_last_scan_profile();
+SELECT vector_hnsw_guidance_reset();
+
+RESET enable_seqscan;
+RESET hnsw.iterative_scan;
+RESET hnsw.ef_search;
+RESET hnsw.filter_strategy;
+
+DROP TABLE guidance_scan_smoke;

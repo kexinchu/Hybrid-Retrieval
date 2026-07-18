@@ -1,0 +1,4 @@
+comment = 'per-query executor qual timing profile for hybrid retrieval experiments'
+default_version = '0.1'
+module_pathname = '$libdir/hybrid_qual_profile'
+relocatable = true

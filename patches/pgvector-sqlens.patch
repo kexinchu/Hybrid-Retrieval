@@ -1,0 +1,4279 @@
+diff --git a/sql/vector.sql b/sql/vector.sql
+index 7fc36712b31dc3b58d6c0c5caa8fa6097f30471d..9f8e18bea4f11ae87df95a607667a31f00b130ec 100644
+--- a/sql/vector.sql
++++ b/sql/vector.sql
+@@ -102,6 +102,57 @@ CREATE FUNCTION vector_negative_inner_product(vector, vector) RETURNS float8
+ CREATE FUNCTION vector_spherical_distance(vector, vector) RETURNS float8
+ 	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+ 
++CREATE FUNCTION vector_hnsw_last_scan_profile() RETURNS text
++	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL SAFE;
++
++CREATE FUNCTION vector_hnsw_reset_scan_profile() RETURNS void
++	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL SAFE;
++
++CREATE FUNCTION vector_hnsw_guidance_activate(regclass, text[], text) RETURNS int4
++	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
++
++CREATE FUNCTION vector_hnsw_guidance_reset() RETURNS void
++	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL SAFE;
++
++CREATE FUNCTION vector_hnsw_guidance_profile() RETURNS text
++	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL SAFE;
++
++CREATE FUNCTION vector_hnsw_page_materialize(regclass, vector, int4, int4) RETURNS TABLE(rank int4, id int8, ctid text)
++	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
++
++CREATE FUNCTION vector_hnsw_page_materialize_profile() RETURNS text
++	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL SAFE;
++
++CREATE FUNCTION vector_hnsw_metadata_cache_build(regclass, text) RETURNS int8
++	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
++
++CREATE FUNCTION vector_hnsw_metadata_page_cache_build(regclass, text) RETURNS int8
++	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
++
++CREATE FUNCTION vector_hnsw_metadata_bloom_cache_build(regclass, text) RETURNS int8
++	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
++
++CREATE FUNCTION vector_hnsw_metadata_filter_search(regclass, vector, int4, int4, text) RETURNS TABLE(rank int4, id int8, ctid text)
++	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
++
++CREATE FUNCTION vector_hnsw_metadata_page_filter_candidates(regclass, vector, int4, text) RETURNS TABLE(rank int4, ctid text)
++	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
++
++CREATE FUNCTION vector_hnsw_metadata_bloom_filter_candidates(regclass, vector, int4, text) RETURNS TABLE(rank int4, ctid text)
++	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
++
++CREATE FUNCTION vector_hnsw_metadata_bloom_filter_candidates_limited(regclass, vector, int4, int4, text) RETURNS TABLE(rank int4, ctid text)
++	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
++
++CREATE FUNCTION vector_hnsw_metadata_filter_profile() RETURNS text
++	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL SAFE;
++
++CREATE FUNCTION vector_hnsw_metadata_cache_profile() RETURNS text
++	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL SAFE;
++
++CREATE FUNCTION vector_hnsw_metadata_cache_reset() RETURNS void
++	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL SAFE;
++
+ CREATE FUNCTION vector_accum(double precision[], vector) RETURNS double precision[]
+ 	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+ 
+diff --git a/src/hnsw.c b/src/hnsw.c
+index bfc92a1c754cec6cff8c4114273146cae7716768..18012072390c43d34cb19058e233150bbf492624 100644
+--- a/src/hnsw.c
++++ b/src/hnsw.c
+@@ -31,9 +31,43 @@ static const struct config_enum_entry hnsw_iterative_scan_options[] = {
+ 	{NULL, 0, false}
+ };
+ 
++static const struct config_enum_entry hnsw_page_access_options[] = {
++	{"off", HNSW_PAGE_ACCESS_OFF, false},
++	{"prefetch", HNSW_PAGE_ACCESS_PREFETCH, false},
++	{"reorder", HNSW_PAGE_ACCESS_REORDER, false},
++	{NULL, 0, false}
++};
++
++static const struct config_enum_entry hnsw_index_page_access_options[] = {
++	{"off", HNSW_INDEX_PAGE_ACCESS_OFF, false},
++	{"prefetch", HNSW_INDEX_PAGE_ACCESS_PREFETCH, false},
++	{NULL, 0, false}
++};
++
++static const struct config_enum_entry hnsw_build_page_order_options[] = {
++	{"insertion", HNSW_BUILD_PAGE_ORDER_INSERTION, false},
++	{"bfs", HNSW_BUILD_PAGE_ORDER_BFS, false},
++	{NULL, 0, false}
++};
++
++static const struct config_enum_entry hnsw_filter_strategy_options[] = {
++	{"off", HNSW_FILTER_STRATEGY_OFF, false},
++	{"acorn1", HNSW_FILTER_STRATEGY_ACORN1, false},
++	{"guided_collect", HNSW_FILTER_STRATEGY_GUIDED_COLLECT, false},
++	{NULL, 0, false}
++};
++
+ int			hnsw_ef_search;
+ int			hnsw_iterative_scan;
+ int			hnsw_max_scan_tuples;
++int			hnsw_page_access;
++int			hnsw_page_window;
++int			hnsw_page_prefetch_min_items;
++int			hnsw_page_disable_after_no_merge;
++int			hnsw_index_page_access;
++int			hnsw_build_page_order;
++int			hnsw_filter_strategy;
++int			hnsw_guided_collect_target;
+ double		hnsw_scan_mem_multiplier;
+ int			hnsw_lock_tranche_id;
+ static relopt_kind hnsw_relopt_kind;
+@@ -90,7 +124,7 @@ HnswInit(void)
+ 					  HNSW_DEFAULT_EF_CONSTRUCTION, HNSW_MIN_EF_CONSTRUCTION, HNSW_MAX_EF_CONSTRUCTION, AccessExclusiveLock);
+ 
+ 	DefineCustomIntVariable("hnsw.ef_search", "Sets the size of the dynamic candidate list for search",
+-							"Valid range is 1..1000.", &hnsw_ef_search,
++							"Valid range is 1..10000.", &hnsw_ef_search,
+ 							HNSW_DEFAULT_EF_SEARCH, HNSW_MIN_EF_SEARCH, HNSW_MAX_EF_SEARCH, PGC_USERSET, 0, NULL, NULL, NULL);
+ 
+ 	DefineCustomEnumVariable("hnsw.iterative_scan", "Sets the mode for iterative scans",
+@@ -102,6 +136,45 @@ HnswInit(void)
+ 							NULL, &hnsw_max_scan_tuples,
+ 							20000, 1, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+ 
++	DefineCustomEnumVariable("hnsw.page_access", "Sets heap-page-aware access mode for HNSW scans",
++							 "prefetch preserves distance order; reorder is experimental and returns TIDs in heap page order within each window.",
++							 &hnsw_page_access,
++							 HNSW_PAGE_ACCESS_OFF, hnsw_page_access_options, PGC_USERSET, 0, NULL, NULL, NULL);
++
++	DefineCustomIntVariable("hnsw.page_window", "Sets the candidate window for heap-page-aware HNSW scans",
++							"Valid range is 1..10000.", &hnsw_page_window,
++							128, 1, 10000, PGC_USERSET, 0, NULL, NULL, NULL);
++
++	DefineCustomIntVariable("hnsw.page_prefetch_min_items", "Sets the minimum candidates per heap page before HNSW heap-page prefetch",
++							"Prefetch is only issued for heap pages that have at least this many candidates in the current page window.",
++							&hnsw_page_prefetch_min_items,
++							2, 1, 10000, PGC_USERSET, 0, NULL, NULL, NULL);
++
++	DefineCustomIntVariable("hnsw.page_disable_after_no_merge", "Disables HNSW heap-page windows after consecutive windows without same-page candidates",
++							"A value of 0 keeps heap-page windows enabled for the full scan.",
++							&hnsw_page_disable_after_no_merge,
++							2, 0, 10000, PGC_USERSET, 0, NULL, NULL, NULL);
++
++	DefineCustomEnumVariable("hnsw.index_page_access", "Sets index-page-aware access mode for HNSW graph traversal",
++							 "prefetch preserves HNSW traversal order and prefetches neighbor element index pages.",
++							 &hnsw_index_page_access,
++							 HNSW_INDEX_PAGE_ACCESS_OFF, hnsw_index_page_access_options, PGC_USERSET, 0, NULL, NULL, NULL);
++
++	DefineCustomEnumVariable("hnsw.build_page_order", "Sets physical page order when flushing an in-memory HNSW graph",
++							 "insertion preserves pgvector's default write order; bfs writes graph-neighbor BFS order from the entry point.",
++							 &hnsw_build_page_order,
++							 HNSW_BUILD_PAGE_ORDER_INSERTION, hnsw_build_page_order_options, PGC_USERSET, 0, NULL, NULL, NULL);
++
++	DefineCustomEnumVariable("hnsw.filter_strategy", "Sets predicate-aware HNSW traversal strategy",
++							 "off preserves pgvector behavior; acorn1 filters the L0 W heap with active guidance; guided_collect keeps the stock frontier and returns guided candidates collected during traversal.",
++							 &hnsw_filter_strategy,
++							 HNSW_FILTER_STRATEGY_OFF, hnsw_filter_strategy_options, PGC_USERSET, 0, NULL, NULL, NULL);
++
++	DefineCustomIntVariable("hnsw.guided_collect_target", "Sets minimum guided candidates to collect before guided_collect can stop",
++							"Only used when hnsw.filter_strategy = guided_collect. A smaller value is faster; a larger value improves filtered recall.",
++							&hnsw_guided_collect_target,
++							100, 1, 1000000, PGC_USERSET, 0, NULL, NULL, NULL);
++
+ 	/* Same range as hash_mem_multiplier */
+ 	DefineCustomRealVariable("hnsw.scan_mem_multiplier", "Sets the multiple of work_mem to use for iterative scans",
+ 							 NULL, &hnsw_scan_mem_multiplier,
+diff --git a/src/hnsw.h b/src/hnsw.h
+index 841af0fa71b292f304e63cbf4007f6dcd6ebe346..68370161c47f8be7799e724769e350cf5051de0d 100644
+--- a/src/hnsw.h
++++ b/src/hnsw.h
+@@ -9,6 +9,7 @@
+ #include "access/parallel.h"
+ #include "lib/pairingheap.h"
+ #include "nodes/execnodes.h"
++#include "portability/instr_time.h"
+ #include "port.h"				/* for random() */
+ #include "utils/relptr.h"
+ #include "utils/sampling.h"
+@@ -47,7 +48,7 @@ typedef Pointer Item;
+ #define HNSW_MAX_EF_CONSTRUCTION		1000
+ #define HNSW_DEFAULT_EF_SEARCH	40
+ #define HNSW_MIN_EF_SEARCH		1
+-#define HNSW_MAX_EF_SEARCH		1000
++#define HNSW_MAX_EF_SEARCH		10000
+ 
+ /* Tuple types */
+ #define HNSW_ELEMENT_TUPLE_TYPE  1
+@@ -65,6 +66,7 @@ typedef Pointer Item;
+ 
+ #define HNSW_MAX_SIZE (BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(HnswPageOpaqueData)) - sizeof(ItemIdData))
+ #define HNSW_TUPLE_ALLOC_SIZE BLCKSZ
++#define HNSW_PROFILE_MAX_TIDS 1000
+ 
+ #define HNSW_ELEMENT_TUPLE_SIZE(size)	MAXALIGN(offsetof(HnswElementTupleData, data) + (size))
+ #define HNSW_NEIGHBOR_TUPLE_SIZE(level, m)	MAXALIGN(offsetof(HnswNeighborTupleData, indextids) + ((level) + 2) * (m) * sizeof(ItemPointerData))
+@@ -117,6 +119,14 @@ typedef Pointer Item;
+ extern int	hnsw_ef_search;
+ extern int	hnsw_iterative_scan;
+ extern int	hnsw_max_scan_tuples;
++extern int	hnsw_page_access;
++extern int	hnsw_page_window;
++extern int	hnsw_page_prefetch_min_items;
++extern int	hnsw_page_disable_after_no_merge;
++extern int	hnsw_index_page_access;
++extern int	hnsw_build_page_order;
++extern int	hnsw_filter_strategy;
++extern int	hnsw_guided_collect_target;
+ extern double hnsw_scan_mem_multiplier;
+ extern int	hnsw_lock_tranche_id;
+ 
+@@ -127,6 +137,32 @@ typedef enum HnswIterativeScanMode
+ 	HNSW_ITERATIVE_SCAN_STRICT
+ }			HnswIterativeScanMode;
+ 
++typedef enum HnswPageAccessMode
++{
++	HNSW_PAGE_ACCESS_OFF,
++	HNSW_PAGE_ACCESS_PREFETCH,
++	HNSW_PAGE_ACCESS_REORDER
++}			HnswPageAccessMode;
++
++typedef enum HnswIndexPageAccessMode
++{
++	HNSW_INDEX_PAGE_ACCESS_OFF,
++	HNSW_INDEX_PAGE_ACCESS_PREFETCH
++}			HnswIndexPageAccessMode;
++
++typedef enum HnswBuildPageOrderMode
++{
++	HNSW_BUILD_PAGE_ORDER_INSERTION,
++	HNSW_BUILD_PAGE_ORDER_BFS
++}			HnswBuildPageOrderMode;
++
++typedef enum HnswFilterStrategyMode
++{
++	HNSW_FILTER_STRATEGY_OFF,
++	HNSW_FILTER_STRATEGY_ACORN1,
++	HNSW_FILTER_STRATEGY_GUIDED_COLLECT
++}			HnswFilterStrategyMode;
++
+ typedef struct HnswElementData HnswElementData;
+ typedef struct HnswNeighborArray HnswNeighborArray;
+ 
+@@ -179,10 +215,68 @@ typedef struct HnswSearchCandidate
+ {
+ 	pairingheap_node c_node;
+ 	pairingheap_node w_node;
++	pairingheap_node g_node;
+ 	HnswElementPtr element;
+ 	double		distance;
++	bool		matchesGuidance;
+ }			HnswSearchCandidate;
+ 
++typedef struct HnswScanProfile
++{
++	bool		valid;
++	double		totalScanMs;
++	double		hnswSearchMs;
++	double		heapFetchMs;
++	double		vectorSearchMs;
++	int64		visitedTuples;
++	int64		returnedTuples;
++	int64		distanceComputations;
++	int64		pageAccessBatches;
++	int64		pageAccessCandidates;
++	int64		pageAccessPrefetches;
++	int64		pageAccessDistanceRuns;
++	int64		pageAccessDistinctPages;
++	int64		guidanceChecks;
++	int64		guidanceMatches;
++	int64		guidanceSkips;
++	int64		indexPageNeighborLoads;
++	int64		indexPageNeighborRuns;
++	int64		indexPageNeighborDistinctPages;
++	int64		indexPageElementLoads;
++	int64		indexPageElementRuns;
++	int64		indexPageElementDistinctPages;
++	int64		indexPagePrefetches;
++	int64		blksHitBefore;
++	int64		blksHitAfter;
++	int64		blksReadBefore;
++	int64		blksReadAfter;
++	int64		idxBlksHit;
++	int64		idxBlksRead;
++	int64		heapBlksHit;
++	int64		heapBlksRead;
++	int			topkTidCount;
++	ItemPointerData topkTids[HNSW_PROFILE_MAX_TIDS];
++}			HnswScanProfile;
++
++typedef struct HnswIndexPageProfile
++{
++	int64		neighborLoads;
++	int64		neighborRuns;
++	int64		neighborDistinctPages;
++	int64		elementLoads;
++	int64		elementRuns;
++	int64		elementDistinctPages;
++	int64		prefetches;
++}			HnswIndexPageProfile;
++
++typedef struct HnswPageAccessItem
++{
++	ItemPointerData heaptid;
++	double		distance;
++	int			rank;
++	bool		guidanceChecked;
++}			HnswPageAccessItem;
++
+ /* HNSW index options */
+ typedef struct HnswOptions
+ {
+@@ -378,9 +472,34 @@ typedef struct HnswScanOpaqueData
+ 	HnswQuery	q;
+ 	int			m;
+ 	int64		tuples;
++	instr_time	scanStart;
++	instr_time	inIndexTime;
++	double		vectorSearchMs;
++	int64		returnedTuples;
++	int64		distanceComputations;
++	int64		blksHitBefore;
++	int64		blksReadBefore;
++	int64		idxBlksHit;
++	int64		idxBlksRead;
++	int			topkTidCount;
++	ItemPointerData topkTids[HNSW_PROFILE_MAX_TIDS];
+ 	double		previousDistance;
+ 	Size		maxMemory;
+ 	MemoryContext tmpCtx;
++	HnswPageAccessItem *pageItems;
++	int			pageItemCount;
++	int			pageItemIndex;
++	int			pageItemCapacity;
++	int64		pageAccessBatches;
++	int64		pageAccessCandidates;
++	int64		pageAccessPrefetches;
++	int64		pageAccessDistanceRuns;
++	int64		pageAccessDistinctPages;
++	int			pageAccessNoMergeBatches;
++	bool		pageAccessDisabled;
++	int64		guidanceChecks;
++	int64		guidanceMatches;
++	int64		guidanceSkips;
+ 
+ 	/* Support functions */
+ 	HnswSupport support;
+@@ -423,7 +542,7 @@ bool		HnswCheckNorm(HnswSupport * support, Datum value);
+ Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
+ void		HnswInitPage(Buffer buf, Page page);
+ void		HnswInit(void);
+-List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples);
++List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, int64 *distanceComputations);
+ HnswElement HnswGetEntryPoint(Relation index);
+ void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
+ void	   *HnswAlloc(HnswAllocator * allocator, Size size);
+@@ -463,6 +582,12 @@ IndexScanDesc hnswbeginscan(Relation index, int nkeys, int norderbys);
+ void		hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys);
+ bool		hnswgettuple(IndexScanDesc scan, ScanDirection dir);
+ void		hnswendscan(IndexScanDesc scan);
++void		HnswResetScanProfile(void);
++void		HnswGetLastScanProfile(HnswScanProfile *profile);
++void		HnswResetIndexPageProfile(void);
++void		HnswGetIndexPageProfile(HnswIndexPageProfile *profile);
++bool		HnswGuidanceIsActive(void);
++bool		HnswGuidanceAllowsTid(ItemPointer tid);
+ 
+ static inline HnswNeighborArray *
+ HnswGetNeighbors(char *base, HnswElement element, int lc)
+diff --git a/src/hnswbuild.c b/src/hnswbuild.c
+index b15c144e04899d644dc79e9c19c8e97ad81d66c3..c4ffec737d11de68b9e9669233c365136845a0e5 100644
+--- a/src/hnswbuild.c
++++ b/src/hnswbuild.c
+@@ -54,6 +54,7 @@
+ #include "storage/bufmgr.h"
+ #include "tcop/tcopprot.h"
+ #include "utils/datum.h"
++#include "utils/hsearch.h"
+ #include "utils/memutils.h"
+ #include "utils/rel.h"
+ #include "utils/snapmgr.h"
+@@ -79,6 +80,8 @@
+ 
+ #define HNSW_MAX_GRAPH_MEMORY (SIZE_MAX / 2)
+ 
++static void OrderGraphPagesByBfs(HnswBuildState *buildstate);
++
+ /*
+  * Create the metapage
+  */
+@@ -305,6 +308,8 @@ FlushPages(HnswBuildState * buildstate)
+ #endif
+ 
+ 	CreateMetaPage(buildstate);
++	if (hnsw_build_page_order == HNSW_BUILD_PAGE_ORDER_BFS)
++		OrderGraphPagesByBfs(buildstate);
+ 	CreateGraphPages(buildstate);
+ 	WriteNeighborTuples(buildstate);
+ 
+@@ -372,6 +377,127 @@ AddElementInMemory(char *base, HnswGraph * graph, HnswElement element)
+ 	SpinLockRelease(&graph->lock);
+ }
+ 
++typedef struct HnswBuildOrderKey
++{
++	uintptr_t	ptr;
++} HnswBuildOrderKey;
++
++typedef struct HnswBuildOrderEntry
++{
++	HnswBuildOrderKey key;
++} HnswBuildOrderEntry;
++
++static bool
++BuildOrderMarkVisited(HTAB *visited, HnswElement element)
++{
++	HnswBuildOrderKey key;
++	bool		found;
++
++	key.ptr = (uintptr_t) element;
++	hash_search(visited, &key, HASH_ENTER, &found);
++	return !found;
++}
++
++static void
++BuildOrderAppend(HnswElement **items, int *count, int *capacity, HnswElement element)
++{
++	if (*count >= *capacity)
++	{
++		*capacity *= 2;
++		*items = repalloc(*items, sizeof(HnswElement) * *capacity);
++	}
++
++	(*items)[(*count)++] = element;
++}
++
++/*
++ * Re-link the in-memory element list in graph-neighbor BFS order before
++ * assigning on-disk index TIDs. Query semantics stay unchanged; only physical
++ * placement changes for indexes built while the graph is still in memory.
++ */
++static void
++OrderGraphPagesByBfs(HnswBuildState *buildstate)
++{
++	HnswGraph  *graph = buildstate->graph;
++	char	   *base = buildstate->hnswarea;
++	HnswElement entryPoint = HnswPtrAccess(base, graph->entryPoint);
++	HASHCTL		ctl;
++	HTAB	   *visited;
++	HnswElement *order;
++	HnswElement *queue;
++	int			orderCount = 0;
++	int			orderCapacity = 1024;
++	int			queueHead = 0;
++	int			queueCount = 0;
++	int			queueCapacity = 1024;
++	HnswElementPtr iter;
++
++	if (entryPoint == NULL)
++		return;
++
++	MemSet(&ctl, 0, sizeof(ctl));
++	ctl.keysize = sizeof(HnswBuildOrderKey);
++	ctl.entrysize = sizeof(HnswBuildOrderEntry);
++	visited = hash_create("hnsw build page order visited", 1024, &ctl, HASH_ELEM | HASH_BLOBS);
++
++	order = palloc(sizeof(HnswElement) * orderCapacity);
++	queue = palloc(sizeof(HnswElement) * queueCapacity);
++
++	if (BuildOrderMarkVisited(visited, entryPoint))
++	{
++		BuildOrderAppend(&order, &orderCount, &orderCapacity, entryPoint);
++		BuildOrderAppend(&queue, &queueCount, &queueCapacity, entryPoint);
++	}
++
++	while (queueHead < queueCount)
++	{
++		HnswElement element = queue[queueHead++];
++
++		for (int lc = element->level; lc >= 0; lc--)
++		{
++			HnswNeighborArray *neighbors = HnswGetNeighbors(base, element, lc);
++
++			for (int i = 0; i < neighbors->length; i++)
++			{
++				HnswCandidate *hc = &neighbors->items[i];
++				HnswElement neighbor = HnswPtrAccess(base, hc->element);
++
++				if (neighbor == NULL)
++					continue;
++
++				if (BuildOrderMarkVisited(visited, neighbor))
++				{
++					BuildOrderAppend(&order, &orderCount, &orderCapacity, neighbor);
++					BuildOrderAppend(&queue, &queueCount, &queueCapacity, neighbor);
++				}
++			}
++		}
++	}
++
++	iter = graph->head;
++	while (!HnswPtrIsNull(base, iter))
++	{
++		HnswElement element = HnswPtrAccess(base, iter);
++
++		iter = element->next;
++		if (BuildOrderMarkVisited(visited, element))
++			BuildOrderAppend(&order, &orderCount, &orderCapacity, element);
++	}
++
++	for (int i = 0; i < orderCount; i++)
++	{
++		HnswElement next = i + 1 < orderCount ? order[i + 1] : NULL;
++
++		HnswPtrStore(base, order[i]->next, next);
++	}
++
++	HnswPtrStore(base, graph->head, orderCount > 0 ? order[0] : NULL);
++
++	hash_destroy(visited);
++	pfree(order);
++	pfree(queue);
++}
++
+ /*
+  * Update neighbors
+  */
+@@ -1119,9 +1245,8 @@ static void
+ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
+ 		   HnswBuildState * buildstate, ForkNumber forkNum)
+ {
+-#ifdef HNSW_MEMORY
++	/* Keep experimental physical-layout builds comparable. */
+ 	SeedRandom(42);
+-#endif
+ 
+ 	InitBuildState(buildstate, heap, index, indexInfo, forkNum);
+ 
+diff --git a/src/hnswscan.c b/src/hnswscan.c
+index 61a8d63e893cff093c2f9ac9c070946186ea0971..a8f7c7e1abaa80126a0753e45f7940ab148311ac 100644
+--- a/src/hnswscan.c
++++ b/src/hnswscan.c
+@@ -2,16 +2,19 @@
+ 
+ #include "access/genam.h"
+ #include "access/relscan.h"
++#include "executor/instrument.h"
+ #include "hnsw.h"
+ #include "lib/pairingheap.h"
+ #include "miscadmin.h"
+ #include "nodes/pg_list.h"
+ #include "pgstat.h"
++#include "storage/bufmgr.h"
+ #include "storage/lmgr.h"
+ #include "utils/float.h"
+ #include "utils/memutils.h"
+ #include "utils/relcache.h"
+ #include "utils/snapmgr.h"
++#include "portability/instr_time.h"
+ 
+ #if PG_VERSION_NUM >= 160000
+ #include "varatt.h"
+@@ -20,6 +23,42 @@
+ /*
+  * Algorithm 5 from paper
+  */
++static HnswScanProfile hnsw_last_profile;
++
++static int
++ComparePageAccessItems(const void *a, const void *b)
++{
++	const HnswPageAccessItem *ia = (const HnswPageAccessItem *) a;
++	const HnswPageAccessItem *ib = (const HnswPageAccessItem *) b;
++	BlockNumber ba = ItemPointerGetBlockNumber(&ia->heaptid);
++	BlockNumber bb = ItemPointerGetBlockNumber(&ib->heaptid);
++	OffsetNumber oa = ItemPointerGetOffsetNumber(&ia->heaptid);
++	OffsetNumber ob = ItemPointerGetOffsetNumber(&ib->heaptid);
++
++	if (ba < bb)
++		return -1;
++	if (ba > bb)
++		return 1;
++	if (oa < ob)
++		return -1;
++	if (oa > ob)
++		return 1;
++	return 0;
++}
++
++static int
++ComparePageAccessItemsByRank(const void *a, const void *b)
++{
++	const HnswPageAccessItem *ia = (const HnswPageAccessItem *) a;
++	const HnswPageAccessItem *ib = (const HnswPageAccessItem *) b;
++
++	if (ia->rank < ib->rank)
++		return -1;
++	if (ia->rank > ib->rank)
++		return 1;
++	return 0;
++}
++
+ static List *
+ GetScanItems(IndexScanDesc scan, Datum value)
+ {
+@@ -43,14 +82,34 @@ GetScanItems(IndexScanDesc scan, Datum value)
+ 		return NIL;
+ 
+ 	ep = list_make1(HnswEntryCandidate(base, entryPoint, q, index, support, false));
++	so->distanceComputations++;
+ 
+ 	for (int lc = entryPoint->level; lc >= 1; lc--)
+ 	{
+-		w = HnswSearchLayer(base, q, ep, 1, lc, index, support, m, false, NULL, NULL, NULL, true, NULL);
++		instr_time start;
++		instr_time elapsed;
++
++		INSTR_TIME_SET_CURRENT(start);
++		w = HnswSearchLayer(base, q, ep, 1, lc, index, support, m, false, NULL, NULL, NULL, true, NULL, &so->distanceComputations);
++		INSTR_TIME_SET_CURRENT(elapsed);
++		INSTR_TIME_SUBTRACT(elapsed, start);
++		so->vectorSearchMs += INSTR_TIME_GET_MILLISEC(elapsed);
+ 		ep = w;
+ 	}
+ 
+-	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples);
++	{
++		instr_time start;
++		instr_time elapsed;
++		List	   *next;
++
++		INSTR_TIME_SET_CURRENT(start);
++		next = HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v,
++							   hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples, &so->distanceComputations);
++		INSTR_TIME_SET_CURRENT(elapsed);
++		INSTR_TIME_SUBTRACT(elapsed, start);
++		so->vectorSearchMs += INSTR_TIME_GET_MILLISEC(elapsed);
++		return next;
++	}
+ }
+ 
+ /*
+@@ -81,7 +140,64 @@ ResumeScanItems(IndexScanDesc scan)
+ 		ep = lappend(ep, sc);
+ 	}
+ 
+-	return HnswSearchLayer(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, false, NULL, &so->v, &so->discarded, false, &so->tuples);
++	{
++		instr_time start;
++		instr_time elapsed;
++		List	   *next;
++
++		INSTR_TIME_SET_CURRENT(start);
++		next = HnswSearchLayer(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, false, NULL, &so->v, &so->discarded, false,
++							  &so->tuples, &so->distanceComputations);
++		INSTR_TIME_SET_CURRENT(elapsed);
++		INSTR_TIME_SUBTRACT(elapsed, start);
++		so->vectorSearchMs += INSTR_TIME_GET_MILLISEC(elapsed);
++		return next;
++	}
++}
++
++void
++HnswResetScanProfile(void)
++{
++	hnsw_last_profile.valid = false;
++	hnsw_last_profile.totalScanMs = 0;
++	hnsw_last_profile.hnswSearchMs = 0;
++	hnsw_last_profile.heapFetchMs = 0;
++	hnsw_last_profile.vectorSearchMs = 0;
++	hnsw_last_profile.visitedTuples = 0;
++	hnsw_last_profile.returnedTuples = 0;
++	hnsw_last_profile.distanceComputations = 0;
++	hnsw_last_profile.pageAccessBatches = 0;
++	hnsw_last_profile.pageAccessCandidates = 0;
++	hnsw_last_profile.pageAccessPrefetches = 0;
++	hnsw_last_profile.pageAccessDistanceRuns = 0;
++	hnsw_last_profile.pageAccessDistinctPages = 0;
++	hnsw_last_profile.guidanceChecks = 0;
++	hnsw_last_profile.guidanceMatches = 0;
++	hnsw_last_profile.guidanceSkips = 0;
++	hnsw_last_profile.indexPageNeighborLoads = 0;
++	hnsw_last_profile.indexPageNeighborRuns = 0;
++	hnsw_last_profile.indexPageNeighborDistinctPages = 0;
++	hnsw_last_profile.indexPageElementLoads = 0;
++	hnsw_last_profile.indexPageElementRuns = 0;
++	hnsw_last_profile.indexPageElementDistinctPages = 0;
++	hnsw_last_profile.indexPagePrefetches = 0;
++	hnsw_last_profile.blksHitBefore = 0;
++	hnsw_last_profile.blksHitAfter = 0;
++	hnsw_last_profile.blksReadBefore = 0;
++	hnsw_last_profile.blksReadAfter = 0;
++	hnsw_last_profile.idxBlksHit = 0;
++	hnsw_last_profile.idxBlksRead = 0;
++	hnsw_last_profile.heapBlksHit = 0;
++	hnsw_last_profile.heapBlksRead = 0;
++	hnsw_last_profile.topkTidCount = 0;
++	HnswResetIndexPageProfile();
++}
++
++void
++HnswGetLastScanProfile(HnswScanProfile *profile)
++{
++	if (profile != NULL)
++		*profile = hnsw_last_profile;
+ }
+ 
+ /*
+@@ -111,6 +227,226 @@ GetScanValue(IndexScanDesc scan)
+ 	return value;
+ }
+ 
++static bool
++HnswGetNextHeapTid(IndexScanDesc scan, ItemPointerData *heaptid, double *distance)
++{
++	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
++
++	for (;;)
++	{
++		char	   *base = NULL;
++		HnswSearchCandidate *sc;
++		HnswElement element;
++		ItemPointer tid;
++
++		CHECK_FOR_INTERRUPTS();
++
++		if (list_length(so->w) == 0)
++		{
++			if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_OFF)
++				return false;
++
++			/* Empty index */
++			if (so->discarded == NULL)
++				return false;
++
++			/* Reached max number of tuples or memory limit */
++			if (so->tuples >= hnsw_max_scan_tuples || MemoryContextMemAllocated(so->tmpCtx, false) > so->maxMemory)
++			{
++				if (pairingheap_is_empty(so->discarded))
++					return false;
++
++				/* Return remaining tuples */
++				so->w = lappend(so->w, HnswGetSearchCandidate(w_node, pairingheap_remove_first(so->discarded)));
++			}
++			else
++			{
++				/*
++				 * Locking ensures when neighbors are read, the elements they
++				 * reference will not be deleted (and replaced) during the
++				 * iteration.
++				 *
++				 * Elements loaded into memory on previous iterations may have
++				 * been deleted (and replaced), so when reading neighbors, the
++				 * element version must be checked.
++				 */
++				LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
++
++				so->w = ResumeScanItems(scan);
++
++				UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
++
++#if defined(HNSW_MEMORY)
++				ShowMemoryUsage(so);
++#endif
++			}
++
++			if (list_length(so->w) == 0)
++				return false;
++		}
++
++		sc = llast(so->w);
++		element = HnswPtrAccess(base, sc->element);
++
++		/* Move to next element if no valid heap TIDs */
++		if (element->heaptidsLength == 0)
++		{
++			so->w = list_delete_last(so->w);
++
++			/* Mark memory as free for next iteration */
++			if (hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF)
++			{
++				pfree(element);
++				pfree(sc);
++			}
++
++			continue;
++		}
++
++		tid = &element->heaptids[--element->heaptidsLength];
++
++		if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_STRICT)
++		{
++			if (sc->distance < so->previousDistance)
++				continue;
++
++			so->previousDistance = sc->distance;
++		}
++
++		*heaptid = *tid;
++		if (distance != NULL)
++			*distance = sc->distance;
++		return true;
++	}
++}
++
++static bool
++HnswFillPageAccessBuffer(IndexScanDesc scan, int pageAccessMode)
++{
++	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
++	int			target = hnsw_page_window;
++	BlockNumber previousBlock = InvalidBlockNumber;
++	BlockNumber previousPrefetchBlock = InvalidBlockNumber;
++	int64		distanceRuns = 0;
++	int64		distinctPages = 0;
++	int			rawPulls = 0;
++	int			mergeablePages = 0;
++	bool		exhausted = false;
++
++	so->pageItemCount = 0;
++	so->pageItemIndex = 0;
++
++	if (target < 1)
++		target = 1;
++
++	if (so->pageItemCapacity < target)
++	{
++		if (so->pageItems == NULL)
++			so->pageItems = palloc(sizeof(HnswPageAccessItem) * target);
++		else
++			so->pageItems = repalloc(so->pageItems, sizeof(HnswPageAccessItem) * target);
++		so->pageItemCapacity = target;
++	}
++
++	while (so->pageItemCount < target && rawPulls < target)
++	{
++		HnswPageAccessItem *item = &so->pageItems[so->pageItemCount];
++		BlockNumber block;
++
++		CHECK_FOR_INTERRUPTS();
++
++		if (!HnswGetNextHeapTid(scan, &item->heaptid, &item->distance))
++		{
++			exhausted = true;
++			break;
++		}
++		rawPulls++;
++
++		item->guidanceChecked = false;
++		if (HnswGuidanceIsActive())
++		{
++			item->guidanceChecked = true;
++			so->guidanceChecks++;
++			if (!HnswGuidanceAllowsTid(&item->heaptid))
++			{
++				so->guidanceSkips++;
++				continue;
++			}
++			so->guidanceMatches++;
++		}
++
++		item->rank = so->pageItemCount;
++		block = ItemPointerGetBlockNumber(&item->heaptid);
++		if (so->pageItemCount == 0 || block != previousBlock)
++			distanceRuns++;
++		previousBlock = block;
++
++		so->pageItemCount++;
++	}
++
++	if (so->pageItemCount == 0)
++	{
++		if (!exhausted)
++			so->pageAccessDisabled = true;
++		return false;
++	}
++
++	so->pageAccessBatches++;
++	so->pageAccessCandidates += so->pageItemCount;
++	so->pageAccessDistanceRuns += distanceRuns;
++
++	qsort(so->pageItems, so->pageItemCount, sizeof(HnswPageAccessItem), ComparePageAccessItems);
++
++	for (int i = 0; i < so->pageItemCount; i++)
++	{
++		BlockNumber block = ItemPointerGetBlockNumber(&so->pageItems[i].heaptid);
++
++		if (i == 0 || block != previousPrefetchBlock)
++		{
++			int			runLength = 1;
++
++			distinctPages++;
++
++			while (i + runLength < so->pageItemCount &&
++				   ItemPointerGetBlockNumber(&so->pageItems[i + runLength].heaptid) == block)
++				runLength++;
++
++			if (pageAccessMode == HNSW_PAGE_ACCESS_PREFETCH || pageAccessMode == HNSW_PAGE_ACCESS_REORDER)
++			{
++				if (runLength >= hnsw_page_prefetch_min_items)
++				{
++					mergeablePages++;
++					PrefetchBuffer(scan->heapRelation, MAIN_FORKNUM, block);
++					so->pageAccessPrefetches++;
++				}
++			}
++		}
++
++		previousPrefetchBlock = block;
++	}
++
++	so->pageAccessDistinctPages += distinctPages;
++	if (hnsw_page_disable_after_no_merge > 0)
++	{
++		if (mergeablePages == 0)
++			so->pageAccessNoMergeBatches++;
++		else
++			so->pageAccessNoMergeBatches = 0;
++
++		if (so->pageAccessNoMergeBatches >= hnsw_page_disable_after_no_merge)
++			so->pageAccessDisabled = true;
++	}
++
++	/*
++	 * prefetch mode preserves the candidate distance order. reorder mode is
++	 * experimental and returns TIDs in heap page order within the window.
++	 */
++	if (pageAccessMode == HNSW_PAGE_ACCESS_PREFETCH)
++		qsort(so->pageItems, so->pageItemCount, sizeof(HnswPageAccessItem), ComparePageAccessItemsByRank);
++
++	return true;
++}
++
+ #if defined(HNSW_MEMORY)
+ /*
+  * Show memory usage
+@@ -147,8 +483,22 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
+ 	so->tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
+ 									   "Hnsw scan temporary context",
+ 									   0, 8 * 1024, 256 * 1024);
+-
+-	/* Calculate max memory */
++	so->pageItems = NULL;
++	so->pageItemCount = 0;
++	so->pageItemIndex = 0;
++	so->pageItemCapacity = 0;
++	so->pageAccessBatches = 0;
++	so->pageAccessCandidates = 0;
++		so->pageAccessPrefetches = 0;
++		so->pageAccessDistanceRuns = 0;
++		so->pageAccessDistinctPages = 0;
++		so->pageAccessNoMergeBatches = 0;
++		so->pageAccessDisabled = false;
++		so->guidanceChecks = 0;
++		so->guidanceMatches = 0;
++		so->guidanceSkips = 0;
++
++		/* Calculate max memory */
+ 	/* Add 256 extra bytes to fill last block when close */
+ 	maxMemory = (double) work_mem * hnsw_scan_mem_multiplier * 1024.0 + 256;
+ 	so->maxMemory = Min(maxMemory, (double) SIZE_MAX);
+@@ -171,8 +521,33 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
+ 	so->v.tids = NULL;
+ 	so->discarded = NULL;
+ 	so->tuples = 0;
++	INSTR_TIME_SET_CURRENT(so->scanStart);
++	INSTR_TIME_SET_ZERO(so->inIndexTime);
++	so->vectorSearchMs = 0;
++	so->returnedTuples = 0;
++	so->distanceComputations = 0;
++	so->blksHitBefore = pgBufferUsage.shared_blks_hit;
++	so->blksReadBefore = pgBufferUsage.shared_blks_read;
++	so->idxBlksHit = 0;
++	so->idxBlksRead = 0;
++	so->topkTidCount = 0;
+ 	so->previousDistance = -get_float8_infinity();
+ 	MemoryContextReset(so->tmpCtx);
++	so->pageItems = NULL;
++	so->pageItemCount = 0;
++	so->pageItemIndex = 0;
++	so->pageItemCapacity = 0;
++	so->pageAccessBatches = 0;
++	so->pageAccessCandidates = 0;
++	so->pageAccessPrefetches = 0;
++	so->pageAccessDistanceRuns = 0;
++	so->pageAccessDistinctPages = 0;
++	so->pageAccessNoMergeBatches = 0;
++	so->pageAccessDisabled = false;
++	so->guidanceChecks = 0;
++	so->guidanceMatches = 0;
++	so->guidanceSkips = 0;
++	HnswResetScanProfile();
+ 
+ 	if (keys && scan->numberOfKeys > 0)
+ 		memmove(scan->keyData, keys, scan->numberOfKeys * sizeof(ScanKeyData));
+@@ -184,11 +559,27 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
+ /*
+  * Fetch the next tuple in the given scan
+  */
++static void
++HnswAccumulateIndexCall(HnswScanOpaque so, int64 entryBlksHit, int64 entryBlksRead, instr_time entryTime)
++{
++	instr_time	exitTime;
++
++	so->idxBlksHit += pgBufferUsage.shared_blks_hit - entryBlksHit;
++	so->idxBlksRead += pgBufferUsage.shared_blks_read - entryBlksRead;
++	INSTR_TIME_SET_CURRENT(exitTime);
++	INSTR_TIME_ACCUM_DIFF(so->inIndexTime, exitTime, entryTime);
++}
++
+ bool
+ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
+ {
+ 	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+ 	MemoryContext oldCtx = MemoryContextSwitchTo(so->tmpCtx);
++	int64		entryBlksHit = pgBufferUsage.shared_blks_hit;
++	int64		entryBlksRead = pgBufferUsage.shared_blks_read;
++	instr_time	entryTime;
++
++	INSTR_TIME_SET_CURRENT(entryTime);
+ 
+ 	/*
+ 	 * Index can be used to scan backward, but Postgres doesn't support
+@@ -239,92 +630,66 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
+ 
+ 	for (;;)
+ 	{
+-		char	   *base = NULL;
+-		HnswSearchCandidate *sc;
+-		HnswElement element;
+-		ItemPointer heaptid;
++		ItemPointerData heaptid;
++		int			pageAccessMode = hnsw_page_access;
++		bool		guidanceChecked = false;
+ 
+-		if (list_length(so->w) == 0)
+-		{
+-			if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_OFF)
+-				break;
++		CHECK_FOR_INTERRUPTS();
+ 
+-			/* Empty index */
+-			if (so->discarded == NULL)
+-				break;
++		if (pageAccessMode == HNSW_PAGE_ACCESS_REORDER && hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_STRICT)
++			pageAccessMode = HNSW_PAGE_ACCESS_PREFETCH;
+ 
+-			/* Reached max number of tuples or memory limit */
+-			if (so->tuples >= hnsw_max_scan_tuples || MemoryContextMemAllocated(so->tmpCtx, false) > so->maxMemory)
++		if (so->pageAccessDisabled)
++			pageAccessMode = HNSW_PAGE_ACCESS_OFF;
++
++		if (pageAccessMode != HNSW_PAGE_ACCESS_OFF && hnsw_page_window > 1)
++		{
++			if (so->pageItemIndex >= so->pageItemCount)
+ 			{
+-				if (pairingheap_is_empty(so->discarded))
++				if (!HnswFillPageAccessBuffer(scan, pageAccessMode))
++				{
++					if (so->pageAccessDisabled)
++						continue;
+ 					break;
+-
+-				/* Return remaining tuples */
+-				so->w = lappend(so->w, HnswGetSearchCandidate(w_node, pairingheap_remove_first(so->discarded)));
++				}
+ 			}
+-			else
+-			{
+-				/*
+-				 * Locking ensures when neighbors are read, the elements they
+-				 * reference will not be deleted (and replaced) during the
+-				 * iteration.
+-				 *
+-				 * Elements loaded into memory on previous iterations may have
+-				 * been deleted (and replaced), so when reading neighbors, the
+-				 * element version must be checked.
+-				 */
+-				LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+ 
+-				so->w = ResumeScanItems(scan);
+-
+-				UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
++			{
++				HnswPageAccessItem *item = &so->pageItems[so->pageItemIndex++];
+ 
+-#if defined(HNSW_MEMORY)
+-				ShowMemoryUsage(so);
+-#endif
++				heaptid = item->heaptid;
++				guidanceChecked = item->guidanceChecked;
+ 			}
+-
+-			if (list_length(so->w) == 0)
+-				break;
+ 		}
++		else if (!HnswGetNextHeapTid(scan, &heaptid, NULL))
++			break;
+ 
+-		sc = llast(so->w);
+-		element = HnswPtrAccess(base, sc->element);
+-
+-		/* Move to next element if no valid heap TIDs */
+-		if (element->heaptidsLength == 0)
++		if (HnswGuidanceIsActive() && !guidanceChecked)
+ 		{
+-			so->w = list_delete_last(so->w);
+-
+-			/* Mark memory as free for next iteration */
+-			if (hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF)
++			so->guidanceChecks++;
++			if (!HnswGuidanceAllowsTid(&heaptid))
+ 			{
+-				pfree(element);
+-				pfree(sc);
+-			}
+-
+-			continue;
+-		}
+-
+-		heaptid = &element->heaptids[--element->heaptidsLength];
+-
+-		if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_STRICT)
+-		{
+-			if (sc->distance < so->previousDistance)
++				so->guidanceSkips++;
+ 				continue;
+-
+-			so->previousDistance = sc->distance;
++			}
++			so->guidanceMatches++;
+ 		}
+ 
+ 		MemoryContextSwitchTo(oldCtx);
+ 
+-		scan->xs_heaptid = *heaptid;
++		if (so->topkTidCount < HNSW_PROFILE_MAX_TIDS)
++			so->topkTids[so->topkTidCount++] = heaptid;
++		so->returnedTuples++;
++
++		scan->xs_heaptid = heaptid;
+ 		scan->xs_recheck = false;
+ 		scan->xs_recheckorderby = false;
++		HnswAccumulateIndexCall(so, entryBlksHit, entryBlksRead, entryTime);
+ 		return true;
+ 	}
+ 
+ 	MemoryContextSwitchTo(oldCtx);
++	HnswAccumulateIndexCall(so, entryBlksHit, entryBlksRead, entryTime);
+ 	return false;
+ }
+ 
+@@ -336,6 +701,64 @@ hnswendscan(IndexScanDesc scan)
+ {
+ 	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+ 
++	if (so->tuples > 0 || so->returnedTuples > 0)
++	{
++		HnswIndexPageProfile indexPageProfile;
++		instr_time	now;
++		instr_time	elapsed;
++		double		totalScanMs;
++		double		hnswSearchMs;
++		double		heapFetchMs;
++		int64		totalBlksHit;
++		int64		totalBlksRead;
++
++		HnswGetIndexPageProfile(&indexPageProfile);
++		INSTR_TIME_SET_CURRENT(now);
++		elapsed = now;
++		INSTR_TIME_SUBTRACT(elapsed, so->scanStart);
++		totalScanMs = INSTR_TIME_GET_MILLISEC(elapsed);
++		hnswSearchMs = INSTR_TIME_GET_MILLISEC(so->inIndexTime);
++		heapFetchMs = totalScanMs - hnswSearchMs;
++		if (heapFetchMs < 0)
++			heapFetchMs = 0;
++		totalBlksHit = pgBufferUsage.shared_blks_hit - so->blksHitBefore;
++		totalBlksRead = pgBufferUsage.shared_blks_read - so->blksReadBefore;
++
++		hnsw_last_profile.valid = true;
++		hnsw_last_profile.totalScanMs += totalScanMs;
++		hnsw_last_profile.hnswSearchMs += hnswSearchMs;
++		hnsw_last_profile.heapFetchMs += heapFetchMs;
++		hnsw_last_profile.vectorSearchMs += so->vectorSearchMs;
++		hnsw_last_profile.visitedTuples += so->tuples;
++		hnsw_last_profile.returnedTuples += so->returnedTuples;
++		hnsw_last_profile.distanceComputations += so->distanceComputations;
++		hnsw_last_profile.pageAccessBatches += so->pageAccessBatches;
++		hnsw_last_profile.pageAccessCandidates += so->pageAccessCandidates;
++		hnsw_last_profile.pageAccessPrefetches += so->pageAccessPrefetches;
++		hnsw_last_profile.pageAccessDistanceRuns += so->pageAccessDistanceRuns;
++		hnsw_last_profile.pageAccessDistinctPages += so->pageAccessDistinctPages;
++		hnsw_last_profile.guidanceChecks += so->guidanceChecks;
++		hnsw_last_profile.guidanceMatches += so->guidanceMatches;
++		hnsw_last_profile.guidanceSkips += so->guidanceSkips;
++		hnsw_last_profile.indexPageNeighborLoads += indexPageProfile.neighborLoads;
++		hnsw_last_profile.indexPageNeighborRuns += indexPageProfile.neighborRuns;
++		hnsw_last_profile.indexPageNeighborDistinctPages += indexPageProfile.neighborDistinctPages;
++		hnsw_last_profile.indexPageElementLoads += indexPageProfile.elementLoads;
++		hnsw_last_profile.indexPageElementRuns += indexPageProfile.elementRuns;
++		hnsw_last_profile.indexPageElementDistinctPages += indexPageProfile.elementDistinctPages;
++		hnsw_last_profile.indexPagePrefetches += indexPageProfile.prefetches;
++		hnsw_last_profile.blksHitBefore = so->blksHitBefore;
++		hnsw_last_profile.blksHitAfter = pgBufferUsage.shared_blks_hit;
++		hnsw_last_profile.blksReadBefore = so->blksReadBefore;
++		hnsw_last_profile.blksReadAfter = pgBufferUsage.shared_blks_read;
++		hnsw_last_profile.idxBlksHit += so->idxBlksHit;
++		hnsw_last_profile.idxBlksRead += so->idxBlksRead;
++		hnsw_last_profile.heapBlksHit += totalBlksHit - so->idxBlksHit;
++		hnsw_last_profile.heapBlksRead += totalBlksRead - so->idxBlksRead;
++		hnsw_last_profile.topkTidCount = Min(so->topkTidCount, HNSW_PROFILE_MAX_TIDS);
++		memcpy(hnsw_last_profile.topkTids, so->topkTids, sizeof(ItemPointerData) * hnsw_last_profile.topkTidCount);
++	}
++
+ 	MemoryContextDelete(so->tmpCtx);
+ 
+ 	pfree(so);
+diff --git a/src/hnswutils.c b/src/hnswutils.c
+index f4e4d824bfec373716febc373c5919319f83f87c..063b9561dff66e7fe389a97014dd3280687ccce0 100644
+--- a/src/hnswutils.c
++++ b/src/hnswutils.c
+@@ -8,6 +8,7 @@
+ #include "fmgr.h"
+ #include "hnsw.h"
+ #include "lib/pairingheap.h"
++#include "miscadmin.h"
+ #include "nodes/pg_list.h"
+ #include "port/atomics.h"
+ #include "sparsevec.h"
+@@ -21,6 +22,118 @@
+ #include "varatt.h"
+ #endif
+ 
++static HnswIndexPageProfile hnsw_index_page_profile;
++static BlockNumber hnsw_index_page_last_neighbor_block = InvalidBlockNumber;
++static BlockNumber hnsw_index_page_last_element_block = InvalidBlockNumber;
++
++static bool
++HnswElementMatchesGuidance(HnswElement element)
++{
++	if (!HnswGuidanceIsActive())
++		return true;
++
++	for (int i = 0; i < element->heaptidsLength; i++)
++	{
++		if (HnswGuidanceAllowsTid(&element->heaptids[i]))
++			return true;
++	}
++
++	return false;
++}
++
++static int
++CompareBlockNumbers(const void *a, const void *b)
++{
++	BlockNumber ba = *((const BlockNumber *) a);
++	BlockNumber bb = *((const BlockNumber *) b);
++
++	if (ba < bb)
++		return -1;
++	if (ba > bb)
++		return 1;
++	return 0;
++}
++
++void
++HnswResetIndexPageProfile(void)
++{
++	hnsw_index_page_profile.neighborLoads = 0;
++	hnsw_index_page_profile.neighborRuns = 0;
++	hnsw_index_page_profile.neighborDistinctPages = 0;
++	hnsw_index_page_profile.elementLoads = 0;
++	hnsw_index_page_profile.elementRuns = 0;
++	hnsw_index_page_profile.elementDistinctPages = 0;
++	hnsw_index_page_profile.prefetches = 0;
++	hnsw_index_page_last_neighbor_block = InvalidBlockNumber;
++	hnsw_index_page_last_element_block = InvalidBlockNumber;
++}
++
++void
++HnswGetIndexPageProfile(HnswIndexPageProfile *profile)
++{
++	if (profile != NULL)
++		*profile = hnsw_index_page_profile;
++}
++
++static void
++HnswRecordIndexNeighborPage(BlockNumber block)
++{
++	hnsw_index_page_profile.neighborLoads++;
++	if (block != hnsw_index_page_last_neighbor_block)
++	{
++		hnsw_index_page_profile.neighborRuns++;
++		hnsw_index_page_profile.neighborDistinctPages++;
++	}
++	hnsw_index_page_last_neighbor_block = block;
++}
++
++static void
++HnswPrefetchUnvisitedIndexPages(Relation index, HnswUnvisited *unvisited, int unvisitedLength)
++{
++	BlockNumber blocks[HNSW_MAX_M * 2];
++	int			blockCount = 0;
++	BlockNumber previousBlock = InvalidBlockNumber;
++
++	if (unvisitedLength <= 0)
++		return;
++
++	for (int i = 0; i < unvisitedLength; i++)
++	{
++		ItemPointer indextid = &unvisited[i].indextid;
++		BlockNumber block;
++
++		if (!ItemPointerIsValid(indextid))
++			continue;
++
++		block = ItemPointerGetBlockNumber(indextid);
++		hnsw_index_page_profile.elementLoads++;
++		if (block != hnsw_index_page_last_element_block)
++			hnsw_index_page_profile.elementRuns++;
++		hnsw_index_page_last_element_block = block;
++		blocks[blockCount++] = block;
++	}
++
++	if (blockCount == 0)
++		return;
++
++	qsort(blocks, blockCount, sizeof(BlockNumber), CompareBlockNumbers);
++	for (int i = 0; i < blockCount; i++)
++	{
++		BlockNumber block = blocks[i];
++
++		if (i > 0 && block == previousBlock)
++			continue;
++
++		hnsw_index_page_profile.elementDistinctPages++;
++		if (hnsw_index_page_access == HNSW_INDEX_PAGE_ACCESS_PREFETCH)
++		{
++			PrefetchBuffer(index, MAIN_FORKNUM, block);
++			hnsw_index_page_profile.prefetches++;
++		}
++		previousBlock = block;
++	}
++}
++
+ #if PG_VERSION_NUM < 170000
+ static inline uint64
+ murmurhash64(uint64 data)
+@@ -597,6 +710,7 @@ HnswInitSearchCandidate(char *base, HnswElement element, double distance)
+ 
+ 	HnswPtrStore(base, sc->element, element);
+ 	sc->distance = distance;
++	sc->matchesGuidance = true;
+ 	return sc;
+ }
+ 
+@@ -662,6 +776,39 @@ CompareFurthestCandidates(const pairingheap_node *a, const pairingheap_node *b,
+ 	return 0;
+ }
+ 
++/*
++ * Compare guided candidate distances
++ */
++static int
++CompareFurthestGuidedCandidates(const pairingheap_node *a, const pairingheap_node *b, void *arg)
++{
++	if (HnswGetSearchCandidateConst(g_node, a)->distance < HnswGetSearchCandidateConst(g_node, b)->distance)
++		return -1;
++
++	if (HnswGetSearchCandidateConst(g_node, a)->distance > HnswGetSearchCandidateConst(g_node, b)->distance)
++		return 1;
++
++	return 0;
++}
++
++static inline bool CountElement(HnswElement skipElement, HnswElement e);
++
++static inline void
++HnswAddGuidedCandidate(pairingheap *G, int *glen, int ef, HnswSearchCandidate *sc, HnswElement element, HnswElement skipElement)
++{
++	if (G == NULL || !sc->matchesGuidance || !CountElement(skipElement, element))
++		return;
++
++	pairingheap_add(G, &sc->g_node);
++	(*glen)++;
++
++	if (*glen > ef)
++	{
++		(void) pairingheap_remove_first(G);
++		(*glen)--;
++	}
++}
++
+ /*
+  * Init visited
+  */
+@@ -817,12 +964,14 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
+  * Algorithm 2 from paper
+  */
+ List *
+-HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples)
++HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, int64 *distanceComputations)
+ {
+ 	List	   *w = NIL;
+ 	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
+ 	pairingheap *W = pairingheap_allocate(CompareFurthestCandidates, NULL);
++	pairingheap *G = NULL;
+ 	int			wlen = 0;
++	int			glen = 0;
+ 	visited_hash vh;
+ 	ListCell   *lc2;
+ 	HnswNeighborArray *localNeighborhood = NULL;
+@@ -831,6 +980,16 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 	HnswUnvisited *unvisited = palloc(lm * sizeof(HnswUnvisited));
+ 	int			unvisitedLength;
+ 	bool		inMemory = index == NULL;
++	bool		useAcorn1 = !inserting && lc == 0 && hnsw_filter_strategy == HNSW_FILTER_STRATEGY_ACORN1 && HnswGuidanceIsActive();
++	bool		useGuidedCollect = !inserting && lc == 0 && hnsw_filter_strategy == HNSW_FILTER_STRATEGY_GUIDED_COLLECT && HnswGuidanceIsActive();
++	int			guidedTarget = hnsw_guided_collect_target;
++
++	if (useGuidedCollect)
++	{
++		if (guidedTarget > ef)
++			guidedTarget = ef;
++		G = pairingheap_allocate(CompareFurthestGuidedCandidates, NULL);
++	}
+ 
+ 	if (v == NULL)
+ 	{
+@@ -858,6 +1017,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 	{
+ 		HnswSearchCandidate *sc = (HnswSearchCandidate *) lfirst(lc2);
+ 		bool		found;
++		bool		matchesGuidance = true;
+ 
+ 		if (initVisited)
+ 		{
+@@ -869,32 +1029,52 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 		}
+ 
+ 		pairingheap_add(C, &sc->c_node);
+-		pairingheap_add(W, &sc->w_node);
++		if (useAcorn1 || useGuidedCollect)
++			matchesGuidance = HnswElementMatchesGuidance(HnswPtrAccess(base, sc->element));
++		sc->matchesGuidance = matchesGuidance;
++		if (!useAcorn1 || matchesGuidance)
++			pairingheap_add(W, &sc->w_node);
++		if (useGuidedCollect)
++			HnswAddGuidedCandidate(G, &glen, ef, sc, HnswPtrAccess(base, sc->element), skipElement);
+ 
+ 		/*
+ 		 * Do not count elements being deleted towards ef when vacuuming. It
+ 		 * would be ideal to do this for inserts as well, but this could
+ 		 * affect insert performance.
+ 		 */
+-		if (CountElement(skipElement, HnswPtrAccess(base, sc->element)))
++		if ((!useAcorn1 || matchesGuidance) && CountElement(skipElement, HnswPtrAccess(base, sc->element)))
+ 			wlen++;
+ 	}
+ 
+ 	while (!pairingheap_is_empty(C))
+ 	{
+ 		HnswSearchCandidate *c = HnswGetSearchCandidate(c_node, pairingheap_remove_first(C));
+-		HnswSearchCandidate *f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
++		HnswSearchCandidate *f = pairingheap_is_empty(W) ? NULL : HnswGetSearchCandidate(w_node, pairingheap_first(W));
+ 		HnswElement cElement;
+ 
+-		if (c->distance > f->distance)
+-			break;
++		CHECK_FOR_INTERRUPTS();
++
++		if (f != NULL && wlen >= ef && c->distance > f->distance)
++		{
++			if (!useGuidedCollect || glen >= guidedTarget)
++				break;
++
++			if (tuples != NULL && hnsw_max_scan_tuples > 0 && *tuples >= hnsw_max_scan_tuples)
++				break;
++		}
+ 
+ 		cElement = HnswPtrAccess(base, c->element);
+ 
+ 		if (inMemory)
+ 			HnswLoadUnvisitedFromMemory(base, cElement, unvisited, &unvisitedLength, v, lc, localNeighborhood, neighborhoodSize);
+ 		else
++		{
++			if (!inserting)
++				HnswRecordIndexNeighborPage(cElement->neighborPage);
+ 			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc);
++			if (!inserting)
++				HnswPrefetchUnvisitedIndexPages(index, unvisited, unvisitedLength);
++		}
+ 
+ 		/* OK to count elements instead of tuples */
+ 		if (tuples != NULL)
+@@ -906,13 +1086,18 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 			HnswSearchCandidate *e;
+ 			double		eDistance;
+ 			bool		alwaysAdd = wlen < ef;
++			bool		matchesGuidance = true;
++
++			CHECK_FOR_INTERRUPTS();
+ 
+-			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
++			f = pairingheap_is_empty(W) ? NULL : HnswGetSearchCandidate(w_node, pairingheap_first(W));
+ 
+ 			if (inMemory)
+ 			{
+ 				eElement = unvisited[i].element;
+ 				eDistance = GetElementDistance(base, eElement, q, support);
++				if (distanceComputations != NULL)
++					(*distanceComputations)++;
+ 			}
+ 			else
+ 			{
+@@ -922,19 +1107,40 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 
+ 				/* Avoid any allocations if not adding */
+ 				eElement = NULL;
+-				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement);
++				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, (alwaysAdd || discarded != NULL || f == NULL) ? NULL : &f->distance, &eElement);
++				if (distanceComputations != NULL)
++					(*distanceComputations)++;
+ 
+ 				if (eElement == NULL)
+ 					continue;
+ 			}
+ 
+-			if (!(eDistance < f->distance || alwaysAdd))
++			if (useAcorn1 || useGuidedCollect)
++				matchesGuidance = HnswElementMatchesGuidance(eElement);
++
++			if (useAcorn1 && !matchesGuidance)
++			{
++				if (alwaysAdd || f == NULL || eDistance < f->distance)
++				{
++					e = HnswInitSearchCandidate(base, eElement, eDistance);
++					e->matchesGuidance = false;
++					pairingheap_add(C, &e->c_node);
++				}
++
++				continue;
++			}
++
++			if (!((f == NULL || eDistance < f->distance) || alwaysAdd))
+ 			{
+-				if (discarded != NULL)
++				if (discarded != NULL || (useGuidedCollect && matchesGuidance))
+ 				{
+ 					/* Create a new candidate */
+ 					e = HnswInitSearchCandidate(base, eElement, eDistance);
+-					pairingheap_add(*discarded, &e->w_node);
++					e->matchesGuidance = matchesGuidance;
++					if (useGuidedCollect)
++						HnswAddGuidedCandidate(G, &glen, ef, e, eElement, skipElement);
++					if (discarded != NULL && !(useGuidedCollect && matchesGuidance))
++						pairingheap_add(*discarded, &e->w_node);
+ 				}
+ 
+ 				continue;
+@@ -946,8 +1152,11 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 
+ 			/* Create a new candidate */
+ 			e = HnswInitSearchCandidate(base, eElement, eDistance);
++			e->matchesGuidance = matchesGuidance;
+ 			pairingheap_add(C, &e->c_node);
+ 			pairingheap_add(W, &e->w_node);
++			if (useGuidedCollect)
++				HnswAddGuidedCandidate(G, &glen, ef, e, eElement, skipElement);
+ 
+ 			/*
+ 			 * Do not count elements being deleted towards ef when vacuuming.
+@@ -963,13 +1172,25 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 				{
+ 					HnswSearchCandidate *d = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+ 
+-					if (discarded != NULL)
++					if (discarded != NULL && !(useGuidedCollect && d->matchesGuidance))
+ 						pairingheap_add(*discarded, &d->w_node);
+ 				}
+ 			}
+ 		}
+ 	}
+ 
++	if (useGuidedCollect && G != NULL && !pairingheap_is_empty(G))
++	{
++		while (!pairingheap_is_empty(G))
++		{
++			HnswSearchCandidate *sc = HnswGetSearchCandidate(g_node, pairingheap_remove_first(G));
++
++			w = lappend(w, sc);
++		}
++
++		return w;
++	}
++
+ 	/* Add each element of W to w */
+ 	while (!pairingheap_is_empty(W))
+ 	{
+@@ -1300,7 +1521,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
+ 	/* 1st phase: greedy search to insert level */
+ 	for (int lc = entryLevel; lc >= level + 1; lc--)
+ 	{
+-		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
++		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL);
+ 		ep = w;
+ 	}
+ 
+@@ -1319,7 +1540,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
+ 		List	   *lw = NIL;
+ 		ListCell   *lc2;
+ 
+-		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
++		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL);
+ 
+ 		/* Convert search candidates to candidates */
+ 		foreach(lc2, w)
+diff --git a/src/vector.c b/src/vector.c
+index b8c295395e9dfcac4532a892c2abcb009d9d46ea..770d9f7576fad657a3ef63731976de5fd2e1f0c1 100644
+--- a/src/vector.c
++++ b/src/vector.c
+@@ -2,11 +2,19 @@
+ 
+ #include <math.h>
+ 
++#include "access/genam.h"
++#include "access/skey.h"
++#include "access/table.h"
++#include "access/tableam.h"
+ #include "bitutils.h"
+ #include "bitvec.h"
++#include "catalog/index.h"
++#include "catalog/namespace.h"
+ #include "catalog/pg_type.h"
+ #include "common/shortest_dec.h"
++#include "executor/tuptable.h"
+ #include "fmgr.h"
++#include "funcapi.h"
+ #include "halfutils.h"
+ #include "halfvec.h"
+ #include "hnsw.h"
+@@ -14,14 +22,174 @@
+ #include "lib/stringinfo.h"
+ #include "libpq/pqformat.h"
+ #include "port.h"				/* for strtof() */
++#include "executor/spi.h"
+ #include "sparsevec.h"
++#include "utils/inval.h"
+ #include "utils/array.h"
+ #include "utils/float.h"
+ #include "utils/fmgrprotos.h"
++#include "utils/builtins.h"
++#include "utils/guc.h"
++#include "utils/hsearch.h"
+ #include "utils/lsyscache.h"
++#include "utils/rel.h"
++#include "utils/snapmgr.h"
+ #include "utils/varbit.h"
+ #include "vector.h"
+ 
++extern text *cstring_to_text(const char *s);
++
++typedef struct HnswMaterializeCandidate
++{
++	ItemPointerData tid;
++	int			rank;
++	int64		id;
++	bool		visible;
++} HnswMaterializeCandidate;
++
++typedef struct HnswMaterializeProfile
++{
++	bool		valid;
++	int64		candidates;
++	int64		visible;
++	int64		returned;
++	int64		distanceRuns;
++	int64		distinctPages;
++	double		indexMs;
++	double		fetchMs;
++} HnswMaterializeProfile;
++
++typedef struct HnswMetadataCacheKey
++{
++	Oid			heapOid;
++	char		filterName[256];
++} HnswMetadataCacheKey;
++
++typedef struct HnswMetadataTidKey
++{
++	ItemPointerData tid;
++} HnswMetadataTidKey;
++
++typedef struct HnswMetadataTidEntry
++{
++	HnswMetadataTidKey key;
++	int64		id;
++} HnswMetadataTidEntry;
++
++typedef struct HnswMetadataCacheEntry
++{
++	HnswMetadataCacheKey key;
++	HTAB	   *tidHash;
++	uint8	   *pageBits;
++	uint8	   *bloomBits;
++	int64		rows;
++	int64		pageRows;
++	int64		pages;
++	int64		bloomRows;
++	Size		pageBitBytes;
++	Size		bloomBytes;
++	uint64		bloomBitCount;
++	double		buildMs;
++	double		pageBuildMs;
++	double		bloomBuildMs;
++	int64		memoryBytes;
++	uint64		lastUsed;
++} HnswMetadataCacheEntry;
++
++typedef struct HnswGuidanceDescriptorKey
++{
++	Oid			heapOid;
++	char		signature[1024];
++} HnswGuidanceDescriptorKey;
++
++typedef struct HnswGuidanceDescriptorEntry
++{
++	HnswGuidanceDescriptorKey key;
++	uint64		hits;
++	uint64		lastUsed;
++	HTAB	   *exactTidHash;
++	int64		exactRows;
++	int64		exactMemoryBytes;
++	double		exactBuildMs;
++	uint64		exactHits;
++} HnswGuidanceDescriptorEntry;
++
++typedef struct HnswMetadataFilterProfile
++{
++	bool		valid;
++	bool		cacheHit;
++	const char *cacheKind;
++	int64		cacheRows;
++	int64		cachePages;
++	int64		candidates;
++	int64		cacheChecks;
++	int64		cacheMatches;
++	int64		returned;
++	int64		cacheMemoryBytes;
++	double		cacheBuildMs;
++	double		searchMs;
++} HnswMetadataFilterProfile;
++
++#define HNSW_GUIDANCE_MAX_ATOMS 128
++
++typedef enum HnswGuidanceKind
++{
++	HNSW_GUIDANCE_KIND_OFF,
++	HNSW_GUIDANCE_KIND_EXACT,
++	HNSW_GUIDANCE_KIND_PAGE,
++	HNSW_GUIDANCE_KIND_BLOOM
++} HnswGuidanceKind;
++
++typedef struct HnswGuidanceAtom
++{
++	HnswMetadataCacheEntry *cache;
++	HnswGuidanceKind kind;
++	bool		negated;
++	int			group;
++} HnswGuidanceAtom;
++
++typedef struct HnswActiveGuidance
++{
++	bool		active;
++	HnswGuidanceKind kind;
++	Oid			heapOid;
++	int			atoms;
++	int			groups;
++	int			negatedAtoms;
++	double		lastBuildMs;
++	int64		lastCacheRows;
++	int64		lastCachePages;
++	int64		lastCacheMemoryBytes;
++	int64		fragmentCacheHits;
++	int64		fragmentCacheMisses;
++	int64		fragmentStoreHits;
++	int64		fragmentBuilds;
++	bool		composedGuideHit;
++	int64		composedGuideHits;
++	int64		composedGuideMisses;
++	HnswGuidanceAtom atom[HNSW_GUIDANCE_MAX_ATOMS];
++	bool		composedExactActive;
++	bool		composedExactHit;
++	HTAB	   *composedExactTidHash;
++	int64		composedExactRows;
++	int64		composedExactMemoryBytes;
++	double		composedExactBuildMs;
++} HnswActiveGuidance;
++
++static HnswMaterializeProfile hnsw_materialize_last_profile;
++static HTAB *hnsw_metadata_caches = NULL;
++static HTAB *hnsw_guidance_descriptors = NULL;
++static HnswMetadataFilterProfile hnsw_metadata_filter_last_profile;
++static HnswActiveGuidance hnsw_active_guidance;
++static int	hnsw_metadata_cache_max_mb = 64;
++static bool hnsw_guidance_compose_exact_or = false;
++static uint64 hnsw_metadata_cache_clock = 0;
++static int64 hnsw_metadata_cache_evictions = 0;
++
++static void HnswMetadataFreeCacheEntry(HnswMetadataCacheEntry *entry);
++static void HnswGuidanceFreeDescriptorEntry(HnswGuidanceDescriptorEntry *entry);
++static void HnswGuidanceDeactivate(void);
++
+ #if PG_VERSION_NUM >= 160000
+ #include "varatt.h"
+ #endif
+@@ -56,6 +224,2464 @@ _PG_init(void)
+ 	HalfvecInit();
+ 	HnswInit();
+ 	IvfflatInit();
++
++	DefineCustomIntVariable("hnsw.metadata_cache_max_mb",
++							"Sets the backend-local memory budget for HNSW fragment summaries",
++							"Page, Bloom, and exact guidance fragments are evicted with an LRU policy when this budget is exceeded.",
++							&hnsw_metadata_cache_max_mb,
++							64, 1, 1024 * 1024, PGC_USERSET, 0, NULL, NULL, NULL);
++
++	DefineCustomBoolVariable("hnsw.guidance_compose_exact_or",
++							 "Builds a composed exact TID set for OR guidance predicates",
++							 "When off, OR predicates are evaluated from cached atom fragments only.",
++							 &hnsw_guidance_compose_exact_or,
++							 false, PGC_USERSET, 0, NULL, NULL, NULL);
++}
++
++static void
++VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
++{
++	appendStringInfo(output,
++					"{\"valid\":%s,"
++					"\"total_scan_ms\":%.6f,"
++					"\"hnsw_search_ms\":%.6f,"
++					"\"heap_fetch_ms\":%.6f,"
++					"\"vector_search_ms\":%.6f,"
++					"\"visited_tuples\":" INT64_FORMAT ","
++					"\"returned_tuples\":" INT64_FORMAT ","
++					"\"distance_compute_count\":" INT64_FORMAT ","
++					"\"page_access_batches\":" INT64_FORMAT ","
++					"\"page_access_candidates\":" INT64_FORMAT ","
++					"\"page_access_prefetches\":" INT64_FORMAT ","
++					"\"page_access_distance_runs\":" INT64_FORMAT ","
++					"\"page_access_distinct_pages\":" INT64_FORMAT ","
++					"\"guidance_checks\":" INT64_FORMAT ","
++					"\"guidance_matches\":" INT64_FORMAT ","
++					"\"guidance_skips\":" INT64_FORMAT ","
++					"\"index_page_neighbor_loads\":" INT64_FORMAT ","
++					"\"index_page_neighbor_runs\":" INT64_FORMAT ","
++					"\"index_page_neighbor_distinct_pages\":" INT64_FORMAT ","
++					"\"index_page_element_loads\":" INT64_FORMAT ","
++					"\"index_page_element_runs\":" INT64_FORMAT ","
++					"\"index_page_element_distinct_pages\":" INT64_FORMAT ","
++					"\"index_page_prefetches\":" INT64_FORMAT ","
++					"\"blks_hit_before\":" INT64_FORMAT ","
++					"\"blks_hit_after\":" INT64_FORMAT ","
++					"\"blks_read_before\":" INT64_FORMAT ","
++					"\"blks_read_after\":" INT64_FORMAT ","
++					"\"idx_blks_hit\":" INT64_FORMAT ","
++					"\"idx_blks_read\":" INT64_FORMAT ","
++					"\"heap_blks_hit\":" INT64_FORMAT ","
++					"\"heap_blks_read\":" INT64_FORMAT ","
++					"\"topk_count\":%d,"
++					"\"topk_ids\":[",
++					profile->valid ? "true" : "false",
++					profile->totalScanMs,
++					profile->hnswSearchMs,
++					profile->heapFetchMs,
++					profile->vectorSearchMs,
++					profile->visitedTuples,
++					profile->returnedTuples,
++					profile->distanceComputations,
++					profile->pageAccessBatches,
++					profile->pageAccessCandidates,
++					profile->pageAccessPrefetches,
++					profile->pageAccessDistanceRuns,
++					profile->pageAccessDistinctPages,
++					profile->guidanceChecks,
++					profile->guidanceMatches,
++					profile->guidanceSkips,
++					profile->indexPageNeighborLoads,
++					profile->indexPageNeighborRuns,
++					profile->indexPageNeighborDistinctPages,
++					profile->indexPageElementLoads,
++					profile->indexPageElementRuns,
++					profile->indexPageElementDistinctPages,
++					profile->indexPagePrefetches,
++					profile->blksHitBefore,
++					profile->blksHitAfter,
++					profile->blksReadBefore,
++					profile->blksReadAfter,
++					profile->idxBlksHit,
++					profile->idxBlksRead,
++					profile->heapBlksHit,
++					profile->heapBlksRead,
++					profile->topkTidCount);
++
++	for (int i = 0; i < profile->topkTidCount; i++)
++	{
++		if (i > 0)
++			appendStringInfoChar(output, ',');
++		appendStringInfo(output, "\"(%u,%u)\"",
++						 ItemPointerGetBlockNumber(&profile->topkTids[i]),
++						 ItemPointerGetOffsetNumber(&profile->topkTids[i]));
++	}
++
++	appendStringInfoString(output, "]}");
++}
++
++static void
++ResetHnswMetadataFilterProfile(void)
++{
++	hnsw_metadata_filter_last_profile.valid = false;
++	hnsw_metadata_filter_last_profile.cacheHit = false;
++	hnsw_metadata_filter_last_profile.cacheKind = "none";
++	hnsw_metadata_filter_last_profile.cacheRows = 0;
++	hnsw_metadata_filter_last_profile.cachePages = 0;
++	hnsw_metadata_filter_last_profile.candidates = 0;
++	hnsw_metadata_filter_last_profile.cacheChecks = 0;
++	hnsw_metadata_filter_last_profile.cacheMatches = 0;
++	hnsw_metadata_filter_last_profile.returned = 0;
++	hnsw_metadata_filter_last_profile.cacheMemoryBytes = 0;
++	hnsw_metadata_filter_last_profile.cacheBuildMs = 0;
++	hnsw_metadata_filter_last_profile.searchMs = 0;
++}
++
++static void
++InitHnswMetadataCaches(void)
++{
++	HASHCTL		ctl;
++
++	if (hnsw_metadata_caches != NULL)
++		return;
++
++	MemSet(&ctl, 0, sizeof(ctl));
++	ctl.keysize = sizeof(HnswMetadataCacheKey);
++	ctl.entrysize = sizeof(HnswMetadataCacheEntry);
++	ctl.hcxt = TopMemoryContext;
++	hnsw_metadata_caches = hash_create("hnsw metadata filter caches",
++									   16,
++									   &ctl,
++									   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
++}
++
++static void
++InitHnswGuidanceDescriptors(void)
++{
++	HASHCTL		ctl;
++
++	if (hnsw_guidance_descriptors != NULL)
++		return;
++
++	MemSet(&ctl, 0, sizeof(ctl));
++	ctl.keysize = sizeof(HnswGuidanceDescriptorKey);
++	ctl.entrysize = sizeof(HnswGuidanceDescriptorEntry);
++	ctl.hcxt = TopMemoryContext;
++	hnsw_guidance_descriptors = hash_create("hnsw composed guidance descriptors",
++											64,
++											&ctl,
++												HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
++}
++
++static void
++HnswGuidanceFreeDescriptorEntry(HnswGuidanceDescriptorEntry *entry)
++{
++	if (entry->exactTidHash != NULL)
++	{
++		hash_destroy(entry->exactTidHash);
++		entry->exactTidHash = NULL;
++	}
++	entry->exactRows = 0;
++	entry->exactMemoryBytes = 0;
++	entry->exactBuildMs = 0;
++	entry->exactHits = 0;
++}
++
++static void
++HnswMetadataResetCaches(void)
++{
++	HASH_SEQ_STATUS status;
++	HnswMetadataCacheEntry *entry;
++	HnswGuidanceDescriptorEntry *descriptor;
++
++	if (hnsw_metadata_caches != NULL)
++	{
++		hash_seq_init(&status, hnsw_metadata_caches);
++		while ((entry = (HnswMetadataCacheEntry *) hash_seq_search(&status)) != NULL)
++			HnswMetadataFreeCacheEntry(entry);
++		hash_destroy(hnsw_metadata_caches);
++		hnsw_metadata_caches = NULL;
++	}
++
++	if (hnsw_guidance_descriptors != NULL)
++	{
++		hash_seq_init(&status, hnsw_guidance_descriptors);
++		while ((descriptor = (HnswGuidanceDescriptorEntry *) hash_seq_search(&status)) != NULL)
++			HnswGuidanceFreeDescriptorEntry(descriptor);
++		hash_destroy(hnsw_guidance_descriptors);
++		hnsw_guidance_descriptors = NULL;
++	}
++
++	hnsw_metadata_cache_clock = 0;
++	hnsw_metadata_cache_evictions = 0;
++	HnswGuidanceDeactivate();
++}
++
++static int64
++HnswMetadataEntryMemoryBytes(HnswMetadataCacheEntry *cache)
++{
++	int64		bytes = 0;
++
++	if (cache->tidHash != NULL)
++		bytes += (int64) cache->rows * (int64) sizeof(HnswMetadataTidEntry);
++	bytes += (int64) cache->pageBitBytes;
++	bytes += (int64) cache->bloomBytes;
++	return bytes;
++}
++
++static void
++HnswMetadataTouchCache(HnswMetadataCacheEntry *cache)
++{
++	cache->lastUsed = ++hnsw_metadata_cache_clock;
++	cache->memoryBytes = HnswMetadataEntryMemoryBytes(cache);
++}
++
++static int64
++HnswMetadataCacheTotalBytes(void)
++{
++	HASH_SEQ_STATUS status;
++	HnswMetadataCacheEntry *entry;
++	int64		total = 0;
++
++	if (hnsw_metadata_caches == NULL)
++		return 0;
++
++	hash_seq_init(&status, hnsw_metadata_caches);
++	while ((entry = (HnswMetadataCacheEntry *) hash_seq_search(&status)) != NULL)
++		total += HnswMetadataEntryMemoryBytes(entry);
++
++	return total;
++}
++
++static void
++HnswMetadataCacheStats(int64 *entries, int64 *residentEntries, int64 *residentBytes, int64 *largestEntryBytes)
++{
++	HASH_SEQ_STATUS status;
++	HnswMetadataCacheEntry *entry;
++
++	*entries = 0;
++	*residentEntries = 0;
++	*residentBytes = 0;
++	*largestEntryBytes = 0;
++
++	if (hnsw_metadata_caches == NULL)
++		return;
++
++	hash_seq_init(&status, hnsw_metadata_caches);
++	while ((entry = (HnswMetadataCacheEntry *) hash_seq_search(&status)) != NULL)
++	{
++		int64		bytes = HnswMetadataEntryMemoryBytes(entry);
++
++		(*entries)++;
++		if (bytes > 0)
++		{
++			(*residentEntries)++;
++			*residentBytes += bytes;
++			if (bytes > *largestEntryBytes)
++				*largestEntryBytes = bytes;
++		}
++	}
++}
++
++static void
++HnswGuidanceDescriptorStats(int64 *entries, int64 *hits, int64 *exactEntries, int64 *exactRows, int64 *exactBytes, int64 *exactHits)
++{
++	HASH_SEQ_STATUS status;
++	HnswGuidanceDescriptorEntry *entry;
++
++	*entries = 0;
++	*hits = 0;
++	*exactEntries = 0;
++	*exactRows = 0;
++	*exactBytes = 0;
++	*exactHits = 0;
++
++	if (hnsw_guidance_descriptors == NULL)
++		return;
++
++	hash_seq_init(&status, hnsw_guidance_descriptors);
++	while ((entry = (HnswGuidanceDescriptorEntry *) hash_seq_search(&status)) != NULL)
++	{
++		(*entries)++;
++		*hits += entry->hits;
++		if (entry->exactTidHash != NULL)
++		{
++			(*exactEntries)++;
++			*exactRows += entry->exactRows;
++			*exactBytes += entry->exactMemoryBytes;
++			*exactHits += entry->exactHits;
++		}
++	}
++}
++
++static void
++HnswMetadataFreeCacheEntry(HnswMetadataCacheEntry *entry)
++{
++	if (entry->tidHash != NULL)
++	{
++		hash_destroy(entry->tidHash);
++		entry->tidHash = NULL;
++	}
++	if (entry->pageBits != NULL)
++	{
++		pfree(entry->pageBits);
++		entry->pageBits = NULL;
++	}
++	if (entry->bloomBits != NULL)
++	{
++		pfree(entry->bloomBits);
++		entry->bloomBits = NULL;
++	}
++
++	entry->rows = 0;
++	entry->pageRows = 0;
++	entry->pages = 0;
++	entry->bloomRows = 0;
++	entry->pageBitBytes = 0;
++	entry->bloomBytes = 0;
++	entry->bloomBitCount = 0;
++	entry->buildMs = 0;
++	entry->pageBuildMs = 0;
++	entry->bloomBuildMs = 0;
++	entry->memoryBytes = 0;
++	entry->lastUsed = 0;
++}
++
++static void
++HnswMetadataEvictIfNeeded(HnswMetadataCacheEntry *protected)
++{
++	int64		limit = (int64) hnsw_metadata_cache_max_mb * 1024L * 1024L;
++
++	while (HnswMetadataCacheTotalBytes() > limit)
++	{
++		HASH_SEQ_STATUS status;
++		HnswMetadataCacheEntry *entry;
++		HnswMetadataCacheEntry *victim = NULL;
++
++		hash_seq_init(&status, hnsw_metadata_caches);
++		while ((entry = (HnswMetadataCacheEntry *) hash_seq_search(&status)) != NULL)
++		{
++			if (entry == protected || HnswMetadataEntryMemoryBytes(entry) == 0)
++				continue;
++			if (victim == NULL || entry->lastUsed < victim->lastUsed)
++				victim = entry;
++		}
++
++		if (victim == NULL)
++			break;
++
++		HnswMetadataFreeCacheEntry(victim);
++		hnsw_metadata_cache_evictions++;
++	}
++}
++
++static const char *
++HnswMetadataPredicateSql(const char *filterName)
++{
++	if (strncmp(filterName, "sql:", 4) == 0)
++		return filterName + 4;
++	if (strcmp(filterName, "helpful_ge20") == 0)
++		return "helpful_vote >= 20";
++	if (strcmp(filterName, "grocery_long500") == 0)
++		return "main_category = 'Grocery' AND review_text_len >= 500";
++	if (strcmp(filterName, "grocery_helpful") == 0)
++		return "main_category = 'Grocery' AND helpful_vote >= 1";
++	if (strcmp(filterName, "rating5_price_le10") == 0)
++		return "has_price AND price <= 10 AND rating = 5";
++	if (strcmp(filterName, "c4_mixed_5_p_le10_pop_high") == 0)
++		return "rating = 5 AND has_price AND price <= 10 AND item_rating_number >= 1000";
++	if (strcmp(filterName, "c4_mixed_5_p_le10_pop_mid") == 0)
++		return "rating = 5 AND has_price AND price <= 10 AND item_rating_number >= 100 AND item_rating_number < 1000";
++	if (strcmp(filterName, "c4_mixed_5_p_le10_pop_low") == 0)
++		return "rating = 5 AND has_price AND price <= 10 AND item_rating_number < 100";
++	if (strcmp(filterName, "c4_mixed_5_p_10_20_pop_high") == 0)
++		return "rating = 5 AND has_price AND price > 10 AND price <= 20 AND item_rating_number >= 1000";
++	if (strcmp(filterName, "c4_mixed_5_p_10_20_pop_mid") == 0)
++		return "rating = 5 AND has_price AND price > 10 AND price <= 20 AND item_rating_number >= 100 AND item_rating_number < 1000";
++	if (strcmp(filterName, "c4_mixed_5_p_10_20_pop_low") == 0)
++		return "rating = 5 AND has_price AND price > 10 AND price <= 20 AND item_rating_number < 100";
++	if (strcmp(filterName, "c4_mixed_5_p_20_50_pop_high") == 0)
++		return "rating = 5 AND has_price AND price > 20 AND price <= 50 AND item_rating_number >= 1000";
++	if (strcmp(filterName, "c4_mixed_5_p_20_50_pop_mid") == 0)
++		return "rating = 5 AND has_price AND price > 20 AND price <= 50 AND item_rating_number >= 100 AND item_rating_number < 1000";
++	if (strcmp(filterName, "c4_mixed_5_p_20_50_pop_low") == 0)
++		return "rating = 5 AND has_price AND price > 20 AND price <= 50 AND item_rating_number < 100";
++	if (strcmp(filterName, "c4_mixed_5_p_gt50_pop_high") == 0)
++		return "rating = 5 AND has_price AND price > 50 AND item_rating_number >= 1000";
++	if (strcmp(filterName, "c4_mixed_5_p_gt50_pop_mid") == 0)
++		return "rating = 5 AND has_price AND price > 50 AND item_rating_number >= 100 AND item_rating_number < 1000";
++	if (strcmp(filterName, "c4_mixed_5_p_gt50_pop_low") == 0)
++		return "rating = 5 AND has_price AND price > 50 AND item_rating_number < 100";
++	if (strcmp(filterName, "c4_mixed_5_p_missing_pop_high") == 0)
++		return "rating = 5 AND NOT has_price AND item_rating_number >= 1000";
++	if (strcmp(filterName, "c4_mixed_5_p_missing_pop_mid") == 0)
++		return "rating = 5 AND NOT has_price AND item_rating_number >= 100 AND item_rating_number < 1000";
++	if (strcmp(filterName, "c4_mixed_5_p_missing_pop_low") == 0)
++		return "rating = 5 AND NOT has_price AND item_rating_number < 100";
++
++	ereport(ERROR,
++			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++			 errmsg("unsupported metadata cache filter \"%s\"", filterName),
++			 errhint("Supported filters: helpful_ge20, grocery_long500, grocery_helpful, rating5_price_le10.")));
++	return NULL;
++}
++
++static HnswMetadataCacheEntry *
++FindHnswMetadataCache(Oid heapOid, const char *filterName, bool *found)
++{
++	HnswMetadataCacheKey key;
++
++	InitHnswMetadataCaches();
++	MemSet(&key, 0, sizeof(key));
++	key.heapOid = heapOid;
++	strlcpy(key.filterName, filterName, sizeof(key.filterName));
++	{
++		HnswMetadataCacheEntry *entry = (HnswMetadataCacheEntry *) hash_search(hnsw_metadata_caches, &key, HASH_ENTER, found);
++
++		if (!*found)
++		{
++			HnswMetadataCacheKey savedKey = entry->key;
++
++			MemSet(entry, 0, sizeof(HnswMetadataCacheEntry));
++			entry->key = savedKey;
++		}
++
++		return entry;
++	}
++}
++
++static char *
++HnswMetadataQualifiedSource(Oid heapOid, const char **tidColumn)
++{
++	Oid			namespaceOid = get_rel_namespace(heapOid);
++	char	   *namespaceName = get_namespace_name(namespaceOid);
++	char	   *relationName = get_rel_name(heapOid);
++	char	   *metaRelationName;
++	Oid			metaOid;
++
++	if (namespaceName == NULL || relationName == NULL)
++		ereport(ERROR,
++				(errcode(ERRCODE_UNDEFINED_TABLE),
++				 errmsg("could not resolve heap relation %u", heapOid)));
++
++	metaRelationName = psprintf("%s_guidance_meta", relationName);
++	metaOid = get_relname_relid(metaRelationName, namespaceOid);
++	if (OidIsValid(metaOid))
++	{
++		*tidColumn = "heap_tid";
++		return quote_qualified_identifier(namespaceName, metaRelationName);
++	}
++
++	*tidColumn = "ctid";
++	return quote_qualified_identifier(namespaceName, relationName);
++}
++
++static bool
++HnswMetadataPageBitTest(HnswMetadataCacheEntry *cache, BlockNumber block)
++{
++	Size		byte = block / 8;
++	uint8		mask = 1 << (block % 8);
++
++	if (cache->pageBits == NULL || byte >= cache->pageBitBytes)
++		return false;
++	return (cache->pageBits[byte] & mask) != 0;
++}
++
++static bool
++HnswMetadataPageBitSet(HnswMetadataCacheEntry *cache, BlockNumber block)
++{
++	Size		byte = block / 8;
++	uint8		mask = 1 << (block % 8);
++
++	if (byte >= cache->pageBitBytes)
++	{
++		Size		oldBytes = cache->pageBitBytes;
++		Size		newBytes = oldBytes > 0 ? oldBytes : 1024;
++		MemoryContext oldCtx;
++
++		while (byte >= newBytes)
++			newBytes *= 2;
++
++		oldCtx = MemoryContextSwitchTo(TopMemoryContext);
++		if (cache->pageBits == NULL)
++			cache->pageBits = (uint8 *) palloc0(newBytes);
++		else
++		{
++			cache->pageBits = (uint8 *) repalloc(cache->pageBits, newBytes);
++			MemSet(cache->pageBits + oldBytes, 0, newBytes - oldBytes);
++		}
++		MemoryContextSwitchTo(oldCtx);
++		cache->pageBitBytes = newBytes;
++	}
++
++	if ((cache->pageBits[byte] & mask) != 0)
++		return false;
++
++	cache->pageBits[byte] |= mask;
++	return true;
++}
++
++static uint64
++HnswMetadataMix64(uint64 x)
++{
++	x ^= x >> 30;
++	x *= UINT64CONST(0xbf58476d1ce4e5b9);
++	x ^= x >> 27;
++	x *= UINT64CONST(0x94d049bb133111eb);
++	x ^= x >> 31;
++	return x;
++}
++
++static uint64
++HnswMetadataTidHash64(ItemPointer tid)
++{
++	uint64		block = ItemPointerGetBlockNumber(tid);
++	uint64		offset = ItemPointerGetOffsetNumber(tid);
++
++	return HnswMetadataMix64((block << 16) ^ offset);
++}
++
++static void
++HnswMetadataBloomSet(HnswMetadataCacheEntry *cache, ItemPointer tid)
++{
++	uint64		h1 = HnswMetadataTidHash64(tid);
++	uint64		h2 = HnswMetadataMix64(h1 ^ UINT64CONST(0x9e3779b97f4a7c15));
++
++	for (int i = 0; i < 7; i++)
++	{
++		uint64		bit = (h1 + i * h2) % cache->bloomBitCount;
++
++		cache->bloomBits[bit / 8] |= 1 << (bit % 8);
++	}
++}
++
++static bool
++HnswMetadataBloomMayContain(HnswMetadataCacheEntry *cache, ItemPointer tid)
++{
++	uint64		h1;
++	uint64		h2;
++
++	if (cache->bloomBits == NULL || cache->bloomBitCount == 0)
++		return false;
++
++	h1 = HnswMetadataTidHash64(tid);
++	h2 = HnswMetadataMix64(h1 ^ UINT64CONST(0x9e3779b97f4a7c15));
++
++	for (int i = 0; i < 7; i++)
++	{
++		uint64		bit = (h1 + i * h2) % cache->bloomBitCount;
++
++		if ((cache->bloomBits[bit / 8] & (1 << (bit % 8))) == 0)
++			return false;
++	}
++
++	return true;
++}
++
++static int64
++HnswMetadataCacheMemoryBytes(HnswMetadataCacheEntry *cache, HnswGuidanceKind kind)
++{
++	switch (kind)
++	{
++		case HNSW_GUIDANCE_KIND_EXACT:
++			return (int64) cache->rows * (int64) sizeof(HnswMetadataTidEntry) + (int64) cache->pageBitBytes;
++		case HNSW_GUIDANCE_KIND_PAGE:
++			return (int64) cache->pageBitBytes;
++		case HNSW_GUIDANCE_KIND_BLOOM:
++			return (int64) cache->bloomBytes;
++		default:
++			return 0;
++	}
++}
++
++static const char *
++HnswGuidanceKindName(HnswGuidanceKind kind);
++
++static void
++HnswMetadataEnsureFragmentStore(void)
++{
++	int			spiStatus;
++
++	spiStatus = SPI_connect();
++	if (spiStatus != SPI_OK_CONNECT)
++		elog(ERROR, "SPI_connect failed: %d", spiStatus);
++
++	spiStatus = SPI_execute(
++		"CREATE TABLE IF NOT EXISTS public.pgvector_hnsw_fragment_store ("
++		"heap_oid oid NOT NULL,"
++		"filter_name text NOT NULL,"
++		"kind text NOT NULL,"
++		"rows bigint NOT NULL,"
++		"pages bigint NOT NULL,"
++		"bloom_bit_count bigint NOT NULL,"
++		"payload bytea NOT NULL,"
++		"built_at timestamptz NOT NULL DEFAULT now(),"
++		"PRIMARY KEY (heap_oid, filter_name, kind)"
++		")",
++		false, 0);
++	if (spiStatus != SPI_OK_UTILITY)
++		elog(ERROR, "SPI_execute failed: %d", spiStatus);
++
++	SPI_finish();
++}
++
++static bool
++HnswMetadataLoadFragmentStore(Oid heapOid, const char *filterName, HnswGuidanceKind kind, HnswMetadataCacheEntry *cache)
++{
++	int			spiStatus;
++	Oid			argTypes[3] = {OIDOID, TEXTOID, TEXTOID};
++	Datum		values[3];
++	char		nulls[3] = {' ', ' ', ' '};
++	bool		isnull;
++	bool		loaded = false;
++	const char *kindName = HnswGuidanceKindName(kind);
++
++	HnswMetadataEnsureFragmentStore();
++
++	values[0] = ObjectIdGetDatum(heapOid);
++	values[1] = CStringGetTextDatum(filterName);
++	values[2] = CStringGetTextDatum(kindName);
++
++	spiStatus = SPI_connect();
++	if (spiStatus != SPI_OK_CONNECT)
++		elog(ERROR, "SPI_connect failed: %d", spiStatus);
++
++	spiStatus = SPI_execute_with_args(
++		"SELECT rows, pages, bloom_bit_count, payload "
++		"FROM public.pgvector_hnsw_fragment_store "
++		"WHERE heap_oid = $1 AND filter_name = $2 AND kind = $3",
++		3, argTypes, values, nulls, true, 1);
++	if (spiStatus != SPI_OK_SELECT)
++		elog(ERROR, "SPI_execute_with_args failed: %d", spiStatus);
++
++	if (SPI_processed == 1)
++	{
++		HeapTuple	tuple = SPI_tuptable->vals[0];
++		TupleDesc	tupdesc = SPI_tuptable->tupdesc;
++		Datum		payloadDatum;
++		bytea	   *payload;
++		Size		payloadBytes;
++		MemoryContext oldCtx;
++
++		payloadDatum = SPI_getbinval(tuple, tupdesc, 4, &isnull);
++		if (!isnull)
++		{
++			payload = DatumGetByteaPP(payloadDatum);
++			payloadBytes = VARSIZE_ANY_EXHDR(payload);
++
++			oldCtx = MemoryContextSwitchTo(TopMemoryContext);
++			if (kind == HNSW_GUIDANCE_KIND_PAGE)
++			{
++				if (cache->pageBits != NULL)
++					pfree(cache->pageBits);
++				cache->pageBits = (uint8 *) palloc(payloadBytes);
++				memcpy(cache->pageBits, VARDATA_ANY(payload), payloadBytes);
++				cache->pageBitBytes = payloadBytes;
++				cache->pageRows = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 1, &isnull));
++				cache->pages = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 2, &isnull));
++				cache->pageBuildMs = 0;
++				loaded = true;
++			}
++			else if (kind == HNSW_GUIDANCE_KIND_BLOOM)
++			{
++				if (cache->bloomBits != NULL)
++					pfree(cache->bloomBits);
++				cache->bloomBits = (uint8 *) palloc(payloadBytes);
++				memcpy(cache->bloomBits, VARDATA_ANY(payload), payloadBytes);
++				cache->bloomBytes = payloadBytes;
++				cache->bloomRows = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 1, &isnull));
++				cache->bloomBitCount = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 3, &isnull));
++				cache->bloomBuildMs = 0;
++				loaded = true;
++			}
++			MemoryContextSwitchTo(oldCtx);
++		}
++	}
++
++	SPI_finish();
++	if (loaded)
++		HnswMetadataTouchCache(cache);
++	return loaded;
++}
++
++static void
++HnswMetadataSaveFragmentStore(Oid heapOid, const char *filterName, HnswGuidanceKind kind, HnswMetadataCacheEntry *cache)
++{
++	int			spiStatus;
++	Oid			argTypes[7] = {OIDOID, TEXTOID, TEXTOID, INT8OID, INT8OID, INT8OID, BYTEAOID};
++	Datum		values[7];
++	char		nulls[7] = {' ', ' ', ' ', ' ', ' ', ' ', ' '};
++	const char *kindName = HnswGuidanceKindName(kind);
++	uint8	   *bits = NULL;
++	Size		bytes = 0;
++	int64		rows = 0;
++	int64		pages = 0;
++	int64		bloomBitCount = 0;
++	bytea	   *payload;
++
++	if (kind == HNSW_GUIDANCE_KIND_PAGE)
++	{
++		bits = cache->pageBits;
++		bytes = cache->pageBitBytes;
++		rows = cache->pageRows;
++		pages = cache->pages;
++	}
++	else if (kind == HNSW_GUIDANCE_KIND_BLOOM)
++	{
++		bits = cache->bloomBits;
++		bytes = cache->bloomBytes;
++		rows = cache->bloomRows;
++		bloomBitCount = cache->bloomBitCount;
++	}
++
++	if (bits == NULL || bytes == 0)
++		return;
++
++	HnswMetadataEnsureFragmentStore();
++
++	payload = (bytea *) palloc(VARHDRSZ + bytes);
++	SET_VARSIZE(payload, VARHDRSZ + bytes);
++	memcpy(VARDATA(payload), bits, bytes);
++
++	values[0] = ObjectIdGetDatum(heapOid);
++	values[1] = CStringGetTextDatum(filterName);
++	values[2] = CStringGetTextDatum(kindName);
++	values[3] = Int64GetDatum(rows);
++	values[4] = Int64GetDatum(pages);
++	values[5] = Int64GetDatum(bloomBitCount);
++	values[6] = PointerGetDatum(payload);
++
++	spiStatus = SPI_connect();
++	if (spiStatus != SPI_OK_CONNECT)
++		elog(ERROR, "SPI_connect failed: %d", spiStatus);
++
++	spiStatus = SPI_execute_with_args(
++		"INSERT INTO public.pgvector_hnsw_fragment_store "
++		"(heap_oid, filter_name, kind, rows, pages, bloom_bit_count, payload) "
++		"VALUES ($1, $2, $3, $4, $5, $6, $7) "
++		"ON CONFLICT (heap_oid, filter_name, kind) DO UPDATE SET "
++		"rows = EXCLUDED.rows,"
++		"pages = EXCLUDED.pages,"
++		"bloom_bit_count = EXCLUDED.bloom_bit_count,"
++		"payload = EXCLUDED.payload,"
++		"built_at = now()",
++		7, argTypes, values, nulls, false, 0);
++	if (spiStatus != SPI_OK_INSERT && spiStatus != SPI_OK_UPDATE && spiStatus != SPI_OK_INSERT_RETURNING)
++	{
++		/* INSERT ... ON CONFLICT reports SPI_OK_INSERT on supported versions. */
++		if (spiStatus != SPI_OK_UTILITY)
++			elog(ERROR, "SPI_execute_with_args failed: %d", spiStatus);
++	}
++
++	SPI_finish();
++	pfree(payload);
++}
++
++static HnswMetadataCacheEntry *
++BuildHnswMetadataCache(Oid heapOid, const char *filterName)
++{
++	bool		found;
++	HnswMetadataCacheEntry *cache;
++	HASHCTL		ctl;
++	StringInfoData sql;
++	char	   *qualifiedName;
++	const char *tidColumn;
++	int			spiStatus;
++	const char *predicate;
++	MemoryContext oldCtx;
++	instr_time	start;
++	instr_time	elapsed;
++	bool		populatePageBits;
++
++	cache = FindHnswMetadataCache(heapOid, filterName, &found);
++	if (found && cache->tidHash != NULL)
++		return cache;
++	if (!found || cache->tidHash == NULL)
++	{
++		cache->tidHash = NULL;
++		cache->rows = 0;
++		cache->buildMs = 0;
++		if (!found)
++		{
++			cache->pageBits = NULL;
++			cache->bloomBits = NULL;
++			cache->pageRows = 0;
++			cache->pages = 0;
++			cache->bloomRows = 0;
++			cache->pageBitBytes = 0;
++			cache->bloomBytes = 0;
++			cache->bloomBitCount = 0;
++			cache->pageBuildMs = 0;
++			cache->bloomBuildMs = 0;
++		}
++		else if (cache->pageBits == NULL)
++		{
++			cache->pageRows = 0;
++			cache->pages = 0;
++			cache->pageBitBytes = 0;
++			cache->pageBuildMs = 0;
++		}
++	}
++	populatePageBits = cache->pageBits == NULL;
++
++	predicate = HnswMetadataPredicateSql(filterName);
++	qualifiedName = HnswMetadataQualifiedSource(heapOid, &tidColumn);
++
++	oldCtx = MemoryContextSwitchTo(TopMemoryContext);
++	MemSet(&ctl, 0, sizeof(ctl));
++	ctl.keysize = sizeof(HnswMetadataTidKey);
++	ctl.entrysize = sizeof(HnswMetadataTidEntry);
++	ctl.hcxt = TopMemoryContext;
++	cache->tidHash = hash_create("hnsw metadata passing tids",
++								 1024,
++								 &ctl,
++								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
++	MemoryContextSwitchTo(oldCtx);
++
++	initStringInfo(&sql);
++	appendStringInfo(&sql, "SELECT %s, id FROM %s WHERE %s", tidColumn, qualifiedName, predicate);
++
++	INSTR_TIME_SET_CURRENT(start);
++	spiStatus = SPI_connect();
++	if (spiStatus != SPI_OK_CONNECT)
++		elog(ERROR, "SPI_connect failed: %d", spiStatus);
++	spiStatus = SPI_execute(sql.data, true, 0);
++	if (spiStatus != SPI_OK_SELECT)
++		elog(ERROR, "SPI_execute failed: %d", spiStatus);
++
++	for (uint64 i = 0; i < SPI_processed; i++)
++	{
++		HeapTuple	tuple = SPI_tuptable->vals[i];
++		TupleDesc	tupdesc = SPI_tuptable->tupdesc;
++		bool		isnull;
++		Datum		ctidDatum;
++		Datum		idDatum;
++		ItemPointer ctid;
++		HnswMetadataTidKey tidKey;
++		HnswMetadataTidEntry *entry;
++		bool		tidFound;
++		BlockNumber block;
++
++		ctidDatum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
++		if (isnull)
++			continue;
++		ctid = (ItemPointer) DatumGetPointer(ctidDatum);
++		block = ItemPointerGetBlockNumber(ctid);
++		if (populatePageBits)
++		{
++			if (HnswMetadataPageBitSet(cache, block))
++				cache->pages++;
++			cache->pageRows++;
++		}
++
++		idDatum = SPI_getbinval(tuple, tupdesc, 2, &isnull);
++		if (isnull)
++			continue;
++
++		tidKey.tid = *ctid;
++		entry = (HnswMetadataTidEntry *) hash_search(cache->tidHash, &tidKey, HASH_ENTER, &tidFound);
++		entry->id = DatumGetInt64(idDatum);
++		if (!tidFound)
++			cache->rows++;
++	}
++
++	SPI_finish();
++	INSTR_TIME_SET_CURRENT(elapsed);
++	INSTR_TIME_SUBTRACT(elapsed, start);
++	cache->buildMs = INSTR_TIME_GET_MILLISEC(elapsed);
++
++	pfree(sql.data);
++	return cache;
++}
++
++static HnswMetadataCacheEntry *
++BuildHnswMetadataPageCache(Oid heapOid, const char *filterName)
++{
++	bool		found;
++	HnswMetadataCacheEntry *cache;
++	StringInfoData sql;
++	char	   *qualifiedName;
++	const char *tidColumn;
++	int			spiStatus;
++	const char *predicate;
++	instr_time	start;
++	instr_time	elapsed;
++
++	cache = FindHnswMetadataCache(heapOid, filterName, &found);
++	if (found && cache->pageBits != NULL)
++		return cache;
++	if (!found)
++	{
++		cache->tidHash = NULL;
++		cache->pageBits = NULL;
++		cache->bloomBits = NULL;
++		cache->rows = 0;
++		cache->pageRows = 0;
++		cache->pages = 0;
++		cache->bloomRows = 0;
++		cache->pageBitBytes = 0;
++		cache->bloomBytes = 0;
++		cache->bloomBitCount = 0;
++		cache->buildMs = 0;
++		cache->pageBuildMs = 0;
++		cache->bloomBuildMs = 0;
++	}
++	else
++	{
++		cache->pageBits = NULL;
++		cache->pageRows = 0;
++		cache->pages = 0;
++		cache->pageBitBytes = 0;
++		cache->pageBuildMs = 0;
++	}
++
++	predicate = HnswMetadataPredicateSql(filterName);
++	qualifiedName = HnswMetadataQualifiedSource(heapOid, &tidColumn);
++
++	initStringInfo(&sql);
++	appendStringInfo(&sql, "SELECT %s FROM %s WHERE %s", tidColumn, qualifiedName, predicate);
++
++	INSTR_TIME_SET_CURRENT(start);
++	spiStatus = SPI_connect();
++	if (spiStatus != SPI_OK_CONNECT)
++		elog(ERROR, "SPI_connect failed: %d", spiStatus);
++	spiStatus = SPI_execute(sql.data, true, 0);
++	if (spiStatus != SPI_OK_SELECT)
++		elog(ERROR, "SPI_execute failed: %d", spiStatus);
++
++	for (uint64 i = 0; i < SPI_processed; i++)
++	{
++		HeapTuple	tuple = SPI_tuptable->vals[i];
++		TupleDesc	tupdesc = SPI_tuptable->tupdesc;
++		bool		isnull;
++		Datum		ctidDatum;
++		ItemPointer ctid;
++		BlockNumber block;
++
++		ctidDatum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
++		if (isnull)
++			continue;
++		ctid = (ItemPointer) DatumGetPointer(ctidDatum);
++		block = ItemPointerGetBlockNumber(ctid);
++		if (HnswMetadataPageBitSet(cache, block))
++			cache->pages++;
++		cache->pageRows++;
++	}
++
++	SPI_finish();
++	INSTR_TIME_SET_CURRENT(elapsed);
++	INSTR_TIME_SUBTRACT(elapsed, start);
++	cache->pageBuildMs = INSTR_TIME_GET_MILLISEC(elapsed);
++
++	pfree(sql.data);
++	return cache;
++}
++
++static HnswMetadataCacheEntry *
++BuildHnswMetadataBloomCache(Oid heapOid, const char *filterName)
++{
++	bool		found;
++	HnswMetadataCacheEntry *cache;
++	StringInfoData sql;
++	char	   *qualifiedName;
++	const char *tidColumn;
++	int			spiStatus;
++	const char *predicate;
++	MemoryContext oldCtx;
++	instr_time	start;
++	instr_time	elapsed;
++
++	cache = FindHnswMetadataCache(heapOid, filterName, &found);
++	if (found && cache->bloomBits != NULL)
++		return cache;
++	if (!found)
++	{
++		cache->tidHash = NULL;
++		cache->pageBits = NULL;
++		cache->bloomBits = NULL;
++		cache->rows = 0;
++		cache->pageRows = 0;
++		cache->pages = 0;
++		cache->bloomRows = 0;
++		cache->pageBitBytes = 0;
++		cache->bloomBytes = 0;
++		cache->bloomBitCount = 0;
++		cache->buildMs = 0;
++		cache->pageBuildMs = 0;
++		cache->bloomBuildMs = 0;
++	}
++	else
++	{
++		cache->bloomBits = NULL;
++		cache->bloomRows = 0;
++		cache->bloomBytes = 0;
++		cache->bloomBitCount = 0;
++		cache->bloomBuildMs = 0;
++	}
++
++	predicate = HnswMetadataPredicateSql(filterName);
++	qualifiedName = HnswMetadataQualifiedSource(heapOid, &tidColumn);
++
++	initStringInfo(&sql);
++	appendStringInfo(&sql, "SELECT %s FROM %s WHERE %s", tidColumn, qualifiedName, predicate);
++
++	INSTR_TIME_SET_CURRENT(start);
++	spiStatus = SPI_connect();
++	if (spiStatus != SPI_OK_CONNECT)
++		elog(ERROR, "SPI_connect failed: %d", spiStatus);
++	spiStatus = SPI_execute(sql.data, true, 0);
++	if (spiStatus != SPI_OK_SELECT)
++		elog(ERROR, "SPI_execute failed: %d", spiStatus);
++
++	cache->bloomRows = SPI_processed;
++	cache->bloomBitCount = Max((uint64) 1024, (uint64) cache->bloomRows * 10);
++	cache->bloomBytes = (cache->bloomBitCount + 7) / 8;
++
++	oldCtx = MemoryContextSwitchTo(TopMemoryContext);
++	cache->bloomBits = (uint8 *) palloc0(cache->bloomBytes);
++	MemoryContextSwitchTo(oldCtx);
++
++	for (uint64 i = 0; i < SPI_processed; i++)
++	{
++		HeapTuple	tuple = SPI_tuptable->vals[i];
++		TupleDesc	tupdesc = SPI_tuptable->tupdesc;
++		bool		isnull;
++		Datum		ctidDatum;
++		ItemPointer ctid;
++
++		ctidDatum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
++		if (isnull)
++			continue;
++		ctid = (ItemPointer) DatumGetPointer(ctidDatum);
++		HnswMetadataBloomSet(cache, ctid);
++	}
++
++	SPI_finish();
++	INSTR_TIME_SET_CURRENT(elapsed);
++	INSTR_TIME_SUBTRACT(elapsed, start);
++	cache->bloomBuildMs = INSTR_TIME_GET_MILLISEC(elapsed);
++
++	pfree(sql.data);
++	return cache;
++}
++
++static HnswMetadataCacheEntry *
++GetHnswMetadataCache(Oid heapOid, const char *filterName, bool buildIfMissing, bool *cacheHit, bool *storeHit)
++{
++	bool		found;
++	HnswMetadataCacheEntry *cache;
++
++	if (storeHit != NULL)
++		*storeHit = false;
++	cache = FindHnswMetadataCache(heapOid, filterName, &found);
++	if (found && cache->tidHash != NULL)
++	{
++		HnswMetadataTouchCache(cache);
++		if (cacheHit != NULL)
++			*cacheHit = true;
++		return cache;
++	}
++
++	if (!buildIfMissing)
++		ereport(ERROR,
++				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
++				 errmsg("metadata cache for filter \"%s\" has not been built", filterName)));
++
++	if (cacheHit != NULL)
++		*cacheHit = false;
++	cache = BuildHnswMetadataCache(heapOid, filterName);
++	HnswMetadataTouchCache(cache);
++	HnswMetadataEvictIfNeeded(cache);
++	return cache;
++}
++
++static HnswMetadataCacheEntry *
++GetHnswMetadataPageCache(Oid heapOid, const char *filterName, bool buildIfMissing, bool *cacheHit, bool *storeHit)
++{
++	bool		found;
++	HnswMetadataCacheEntry *cache;
++
++	if (storeHit != NULL)
++		*storeHit = false;
++	cache = FindHnswMetadataCache(heapOid, filterName, &found);
++	if (found && cache->pageBits != NULL)
++	{
++		HnswMetadataTouchCache(cache);
++		if (cacheHit != NULL)
++			*cacheHit = true;
++		return cache;
++	}
++
++	if (!buildIfMissing)
++		ereport(ERROR,
++				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
++				 errmsg("metadata page cache for filter \"%s\" has not been built", filterName)));
++
++	if (cacheHit != NULL)
++		*cacheHit = false;
++	if (HnswMetadataLoadFragmentStore(heapOid, filterName, HNSW_GUIDANCE_KIND_PAGE, cache))
++	{
++		if (storeHit != NULL)
++			*storeHit = true;
++		HnswMetadataEvictIfNeeded(cache);
++		return cache;
++	}
++
++	cache = BuildHnswMetadataPageCache(heapOid, filterName);
++	HnswMetadataTouchCache(cache);
++	HnswMetadataSaveFragmentStore(heapOid, filterName, HNSW_GUIDANCE_KIND_PAGE, cache);
++	HnswMetadataEvictIfNeeded(cache);
++	return cache;
++}
++
++static HnswMetadataCacheEntry *
++GetHnswMetadataBloomCache(Oid heapOid, const char *filterName, bool buildIfMissing, bool *cacheHit, bool *storeHit)
++{
++	bool		found;
++	HnswMetadataCacheEntry *cache;
++
++	if (storeHit != NULL)
++		*storeHit = false;
++	cache = FindHnswMetadataCache(heapOid, filterName, &found);
++	if (found && cache->bloomBits != NULL)
++	{
++		HnswMetadataTouchCache(cache);
++		if (cacheHit != NULL)
++			*cacheHit = true;
++		return cache;
++	}
++
++	if (!buildIfMissing)
++		ereport(ERROR,
++				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
++				 errmsg("metadata bloom cache for filter \"%s\" has not been built", filterName)));
++
++	if (cacheHit != NULL)
++		*cacheHit = false;
++	if (HnswMetadataLoadFragmentStore(heapOid, filterName, HNSW_GUIDANCE_KIND_BLOOM, cache))
++	{
++		if (storeHit != NULL)
++			*storeHit = true;
++		HnswMetadataEvictIfNeeded(cache);
++		return cache;
++	}
++
++	cache = BuildHnswMetadataBloomCache(heapOid, filterName);
++	HnswMetadataTouchCache(cache);
++	HnswMetadataSaveFragmentStore(heapOid, filterName, HNSW_GUIDANCE_KIND_BLOOM, cache);
++	HnswMetadataEvictIfNeeded(cache);
++	return cache;
++}
++
++static const char *
++HnswGuidanceKindName(HnswGuidanceKind kind)
++{
++	switch (kind)
++	{
++		case HNSW_GUIDANCE_KIND_EXACT:
++			return "exact";
++		case HNSW_GUIDANCE_KIND_PAGE:
++			return "page";
++		case HNSW_GUIDANCE_KIND_BLOOM:
++			return "bloom";
++		default:
++			return "off";
++	}
++}
++
++static HnswGuidanceKind
++HnswGuidanceKindFromText(const char *kindName)
++{
++	if (pg_strcasecmp(kindName, "exact") == 0 || pg_strcasecmp(kindName, "tid") == 0)
++		return HNSW_GUIDANCE_KIND_EXACT;
++	if (pg_strcasecmp(kindName, "page") == 0)
++		return HNSW_GUIDANCE_KIND_PAGE;
++	if (pg_strcasecmp(kindName, "bloom") == 0)
++		return HNSW_GUIDANCE_KIND_BLOOM;
++
++	ereport(ERROR,
++			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++			 errmsg("unsupported HNSW guidance kind \"%s\"", kindName),
++			 errhint("Supported kinds: exact, page, bloom.")));
++	return HNSW_GUIDANCE_KIND_OFF;
++}
++
++static const char *
++HnswGuidanceParseAtomKind(const char *atomName, HnswGuidanceKind defaultKind, HnswGuidanceKind *kind)
++{
++	const char *colon = strchr(atomName, ':');
++
++	*kind = defaultKind;
++	if (colon == NULL)
++		return atomName;
++
++	if (pg_strncasecmp(atomName, "exact", colon - atomName) == 0 ||
++		pg_strncasecmp(atomName, "tid", colon - atomName) == 0)
++		*kind = HNSW_GUIDANCE_KIND_EXACT;
++	else if (pg_strncasecmp(atomName, "page", colon - atomName) == 0)
++		*kind = HNSW_GUIDANCE_KIND_PAGE;
++	else if (pg_strncasecmp(atomName, "bloom", colon - atomName) == 0)
++		*kind = HNSW_GUIDANCE_KIND_BLOOM;
++	else
++		return atomName;
++
++	if (*(colon + 1) == '\0')
++		ereport(ERROR,
++				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++				 errmsg("empty HNSW guidance atom after kind prefix")));
++
++	return colon + 1;
++}
++
++static bool
++HnswGuidanceCacheAllowsTid(HnswMetadataCacheEntry *cache, HnswGuidanceKind kind, ItemPointer tid)
++{
++	switch (kind)
++	{
++		case HNSW_GUIDANCE_KIND_EXACT:
++		{
++			HnswMetadataTidKey tidKey;
++
++			if (cache->pageBits != NULL && !HnswMetadataPageBitTest(cache, ItemPointerGetBlockNumber(tid)))
++				return false;
++
++			tidKey.tid = *tid;
++			return hash_search(cache->tidHash, &tidKey, HASH_FIND, NULL) != NULL;
++		}
++		case HNSW_GUIDANCE_KIND_PAGE:
++			return HnswMetadataPageBitTest(cache, ItemPointerGetBlockNumber(tid));
++		case HNSW_GUIDANCE_KIND_BLOOM:
++			return HnswMetadataBloomMayContain(cache, tid);
++		default:
++			return true;
++	}
++}
++
++static bool
++HnswGuidanceCanComposeExactOr(HnswActiveGuidance *guidance)
++{
++	if (guidance->atoms < 2 || guidance->groups < 2 || guidance->negatedAtoms > 0)
++		return false;
++
++	for (int group = 0; group < guidance->groups; group++)
++	{
++		int			groupAtoms = 0;
++
++		for (int i = 0; i < guidance->atoms; i++)
++		{
++			HnswGuidanceAtom *atom = &guidance->atom[i];
++
++			if (atom->group != group)
++				continue;
++
++			if (atom->kind != HNSW_GUIDANCE_KIND_EXACT || atom->cache == NULL || atom->cache->tidHash == NULL)
++				return false;
++
++			groupAtoms++;
++		}
++
++		if (groupAtoms != 1)
++			return false;
++	}
++
++	return true;
++}
++
++static void
++HnswGuidanceUseComposedExact(HnswActiveGuidance *guidance, HnswGuidanceDescriptorEntry *descriptor, bool cacheHit)
++{
++	guidance->composedExactActive = true;
++	guidance->composedExactHit = cacheHit;
++	guidance->composedExactTidHash = descriptor->exactTidHash;
++	guidance->composedExactRows = descriptor->exactRows;
++	guidance->composedExactMemoryBytes = descriptor->exactMemoryBytes;
++	guidance->composedExactBuildMs = cacheHit ? 0 : descriptor->exactBuildMs;
++	if (!cacheHit)
++		guidance->lastBuildMs += descriptor->exactBuildMs;
++}
++
++static void
++HnswGuidanceBuildComposedExactOr(HnswActiveGuidance *guidance, HnswGuidanceDescriptorEntry *descriptor)
++{
++	HASHCTL		ctl;
++	instr_time	start;
++	instr_time	elapsed;
++	if (!HnswGuidanceCanComposeExactOr(guidance))
++		return;
++
++	if (descriptor->exactTidHash != NULL)
++	{
++		descriptor->exactHits++;
++		HnswGuidanceUseComposedExact(guidance, descriptor, true);
++		return;
++	}
++
++	MemSet(&ctl, 0, sizeof(ctl));
++	ctl.keysize = sizeof(HnswMetadataTidKey);
++	ctl.entrysize = sizeof(HnswMetadataTidEntry);
++	ctl.hcxt = TopMemoryContext;
++
++	descriptor->exactTidHash = hash_create("hnsw composed exact guidance tids",
++										   1024,
++										   &ctl,
++										   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
++
++	INSTR_TIME_SET_CURRENT(start);
++	for (int i = 0; i < guidance->atoms; i++)
++	{
++		HASH_SEQ_STATUS status;
++		HnswMetadataTidEntry *source;
++
++		hash_seq_init(&status, guidance->atom[i].cache->tidHash);
++		while ((source = (HnswMetadataTidEntry *) hash_seq_search(&status)) != NULL)
++		{
++			HnswMetadataTidEntry *entry;
++			bool		found;
++
++			entry = (HnswMetadataTidEntry *) hash_search(descriptor->exactTidHash, &source->key, HASH_ENTER, &found);
++			if (!found)
++			{
++				entry->id = source->id;
++				descriptor->exactRows++;
++			}
++		}
++	}
++	INSTR_TIME_SET_CURRENT(elapsed);
++	INSTR_TIME_SUBTRACT(elapsed, start);
++
++	descriptor->exactBuildMs = INSTR_TIME_GET_MILLISEC(elapsed);
++	descriptor->exactMemoryBytes = descriptor->exactRows * (int64) sizeof(HnswMetadataTidEntry);
++	descriptor->exactHits = 0;
++	HnswGuidanceUseComposedExact(guidance, descriptor, false);
++
++	/* Touch metadata caches after the potentially long merge to keep LRU roughly query-local. */
++	for (int i = 0; i < guidance->atoms; i++)
++	{
++		if (guidance->atom[i].cache != NULL)
++			HnswMetadataTouchCache(guidance->atom[i].cache);
++	}
++}
++
++bool
++HnswGuidanceIsActive(void)
++{
++	return hnsw_active_guidance.active;
++}
++
++bool
++HnswGuidanceAllowsTid(ItemPointer tid)
++{
++	if (!hnsw_active_guidance.active)
++		return true;
++
++	if (hnsw_active_guidance.composedExactActive && hnsw_active_guidance.composedExactTidHash != NULL)
++	{
++		HnswMetadataTidKey tidKey;
++
++		tidKey.tid = *tid;
++		return hash_search(hnsw_active_guidance.composedExactTidHash, &tidKey, HASH_FIND, NULL) != NULL;
++	}
++
++	for (int group = 0; group < hnsw_active_guidance.groups; group++)
++	{
++		bool		groupMatches = true;
++
++		for (int i = 0; i < hnsw_active_guidance.atoms; i++)
++		{
++			HnswGuidanceAtom *atom = &hnsw_active_guidance.atom[i];
++			bool		matches;
++
++			if (atom->group != group)
++				continue;
++
++			matches = HnswGuidanceCacheAllowsTid(atom->cache, atom->kind, tid);
++
++			if (atom->negated)
++				matches = !matches;
++			if (!matches)
++			{
++				groupMatches = false;
++				break;
++			}
++		}
++
++		if (groupMatches)
++			return true;
++	}
++
++	return false;
++}
++
++static void
++HnswGuidanceDeactivate(void)
++{
++	MemSet(&hnsw_active_guidance, 0, sizeof(hnsw_active_guidance));
++}
++
++PG_FUNCTION_INFO_V1(vector_hnsw_guidance_reset);
++Datum
++vector_hnsw_guidance_reset(PG_FUNCTION_ARGS)
++{
++	HnswGuidanceDeactivate();
++	PG_RETURN_VOID();
++}
++
++PG_FUNCTION_INFO_V1(vector_hnsw_guidance_activate);
++Datum
++vector_hnsw_guidance_activate(PG_FUNCTION_ARGS)
++{
++	Oid			indexOid = PG_GETARG_OID(0);
++	ArrayType  *filterArray = PG_GETARG_ARRAYTYPE_P(1);
++	text	   *kindText = PG_GETARG_TEXT_PP(2);
++	char	   *kindName = text_to_cstring(kindText);
++	HnswGuidanceKind kind = HnswGuidanceKindFromText(kindName);
++	Oid			heapOid = IndexGetRelation(indexOid, false);
++	Datum	   *filterDatums;
++	bool	   *filterNulls;
++	int			filterCount;
++	HnswActiveGuidance nextGuidance;
++	StringInfoData signature;
++	HnswGuidanceDescriptorKey descriptorKey;
++	HnswGuidanceDescriptorEntry *descriptor;
++	bool		descriptorFound;
++
++	deconstruct_array(filterArray, TEXTOID, -1, false, 'i', &filterDatums, &filterNulls, &filterCount);
++	if (filterCount < 1)
++		ereport(ERROR,
++				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++				 errmsg("at least one guidance atom is required")));
++	initStringInfo(&signature);
++	appendStringInfo(&signature, "kind=%s", HnswGuidanceKindName(kind));
++	for (int i = 0; i < filterCount; i++)
++	{
++		char	   *rawName;
++
++		if (filterNulls[i])
++			ereport(ERROR,
++					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
++					 errmsg("guidance atom names cannot be null")));
++		rawName = text_to_cstring(DatumGetTextPP(filterDatums[i]));
++		appendStringInfo(&signature, "|%s", rawName);
++	}
++
++	InitHnswGuidanceDescriptors();
++	MemSet(&descriptorKey, 0, sizeof(descriptorKey));
++	descriptorKey.heapOid = heapOid;
++	strlcpy(descriptorKey.signature, signature.data, sizeof(descriptorKey.signature));
++	descriptor = (HnswGuidanceDescriptorEntry *) hash_search(hnsw_guidance_descriptors, &descriptorKey, HASH_ENTER, &descriptorFound);
++	if (!descriptorFound)
++	{
++		HnswGuidanceDescriptorKey savedKey = descriptor->key;
++
++		MemSet(descriptor, 0, sizeof(HnswGuidanceDescriptorEntry));
++		descriptor->key = savedKey;
++	}
++	else
++		descriptor->hits++;
++	descriptor->lastUsed = ++hnsw_metadata_cache_clock;
++
++	MemSet(&nextGuidance, 0, sizeof(nextGuidance));
++	nextGuidance.kind = kind;
++	nextGuidance.heapOid = heapOid;
++	nextGuidance.groups = 1;
++	nextGuidance.composedGuideHit = descriptorFound;
++	nextGuidance.composedGuideHits = descriptorFound ? 1 : 0;
++	nextGuidance.composedGuideMisses = descriptorFound ? 0 : 1;
++
++	for (int i = 0; i < filterCount; i++)
++	{
++		char	   *filterName;
++		bool		negated = false;
++		bool		cacheHit = false;
++		bool		storeHit = false;
++		HnswMetadataCacheEntry *cache = NULL;
++		HnswGuidanceKind atomKind;
++		int			atomIndex;
++
++		if (filterNulls[i])
++			ereport(ERROR,
++					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
++					 errmsg("guidance atom names cannot be null")));
++
++		filterName = text_to_cstring(DatumGetTextPP(filterDatums[i]));
++		if (strcmp(filterName, "|") == 0 || pg_strcasecmp(filterName, "OR") == 0)
++		{
++			if (nextGuidance.atoms == 0 || nextGuidance.atom[nextGuidance.atoms - 1].group != nextGuidance.groups - 1)
++				ereport(ERROR,
++						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++						 errmsg("empty HNSW guidance OR group")));
++			nextGuidance.groups++;
++			continue;
++		}
++
++		if (filterName[0] == '!')
++		{
++			negated = true;
++			filterName++;
++		}
++
++		filterName = (char *) HnswGuidanceParseAtomKind(filterName, kind, &atomKind);
++		if (negated && atomKind != HNSW_GUIDANCE_KIND_EXACT)
++			ereport(ERROR,
++					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++					 errmsg("negated guidance atoms require exact kind"),
++					 errhint("Page and bloom guidance can have false positives, so NOT would be unsafe.")));
++
++		switch (atomKind)
++		{
++			case HNSW_GUIDANCE_KIND_EXACT:
++				cache = GetHnswMetadataCache(heapOid, filterName, true, &cacheHit, &storeHit);
++				nextGuidance.lastCacheRows += cache->rows;
++				nextGuidance.lastCacheMemoryBytes += HnswMetadataCacheMemoryBytes(cache, atomKind);
++				nextGuidance.lastBuildMs += cacheHit ? 0 : cache->buildMs;
++				break;
++			case HNSW_GUIDANCE_KIND_PAGE:
++				cache = GetHnswMetadataPageCache(heapOid, filterName, true, &cacheHit, &storeHit);
++				nextGuidance.lastCacheRows += cache->pageRows;
++				nextGuidance.lastCachePages += cache->pages;
++				nextGuidance.lastCacheMemoryBytes += HnswMetadataCacheMemoryBytes(cache, atomKind);
++				nextGuidance.lastBuildMs += (cacheHit || storeHit) ? 0 : cache->pageBuildMs;
++				break;
++			case HNSW_GUIDANCE_KIND_BLOOM:
++				cache = GetHnswMetadataBloomCache(heapOid, filterName, true, &cacheHit, &storeHit);
++				nextGuidance.lastCacheRows += cache->bloomRows;
++				nextGuidance.lastCacheMemoryBytes += HnswMetadataCacheMemoryBytes(cache, atomKind);
++				nextGuidance.lastBuildMs += (cacheHit || storeHit) ? 0 : cache->bloomBuildMs;
++				break;
++			default:
++				break;
++		}
++		if (cacheHit)
++			nextGuidance.fragmentCacheHits++;
++		else
++		{
++			nextGuidance.fragmentCacheMisses++;
++			if (storeHit)
++				nextGuidance.fragmentStoreHits++;
++			else
++				nextGuidance.fragmentBuilds++;
++		}
++
++		if (nextGuidance.atoms >= HNSW_GUIDANCE_MAX_ATOMS)
++			ereport(ERROR,
++					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++					 errmsg("too many guidance atoms"),
++					 errhint("Maximum supported atoms: %d.", HNSW_GUIDANCE_MAX_ATOMS)));
++
++		atomIndex = nextGuidance.atoms++;
++		nextGuidance.atom[atomIndex].cache = cache;
++		nextGuidance.atom[atomIndex].kind = atomKind;
++		nextGuidance.atom[atomIndex].negated = negated;
++		nextGuidance.atom[atomIndex].group = nextGuidance.groups - 1;
++		if (negated)
++			nextGuidance.negatedAtoms++;
++	}
++
++	if (nextGuidance.atoms == 0 || nextGuidance.atom[nextGuidance.atoms - 1].group != nextGuidance.groups - 1)
++		ereport(ERROR,
++				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++				 errmsg("empty HNSW guidance OR group")));
++
++	if (hnsw_guidance_compose_exact_or)
++		HnswGuidanceBuildComposedExactOr(&nextGuidance, descriptor);
++	nextGuidance.active = true;
++	hnsw_active_guidance = nextGuidance;
++	PG_RETURN_INT32(nextGuidance.atoms);
++}
++
++PG_FUNCTION_INFO_V1(vector_hnsw_guidance_profile);
++Datum
++vector_hnsw_guidance_profile(PG_FUNCTION_ARGS)
++{
++	StringInfoData output;
++
++	initStringInfo(&output);
++	appendStringInfo(&output,
++					 "{\"active\":%s,"
++					 "\"kind\":\"%s\","
++					 "\"heap_oid\":%u,"
++					 "\"atoms\":%d,"
++					 "\"groups\":%d,"
++					 "\"negated_atoms\":%d,"
++					 "\"last_cache_build_ms\":%.6f,"
++					 "\"last_cache_rows\":" INT64_FORMAT ","
++					 "\"last_cache_pages\":" INT64_FORMAT ","
++					 "\"last_cache_memory_bytes\":" INT64_FORMAT ","
++					 "\"fragment_cache_hits\":" INT64_FORMAT ","
++					 "\"fragment_cache_misses\":" INT64_FORMAT ","
++					 "\"fragment_store_hits\":" INT64_FORMAT ","
++						 "\"fragment_builds\":" INT64_FORMAT ","
++						 "\"composed_guide_hit\":%s,"
++						 "\"composed_guide_hits\":" INT64_FORMAT ","
++						 "\"composed_guide_misses\":" INT64_FORMAT ","
++						 "\"composed_exact_active\":%s,"
++						 "\"composed_exact_hit\":%s,"
++						 "\"composed_exact_rows\":" INT64_FORMAT ","
++						 "\"composed_exact_memory_bytes\":" INT64_FORMAT ","
++						 "\"composed_exact_build_ms\":%.6f}",
++					 hnsw_active_guidance.active ? "true" : "false",
++					 HnswGuidanceKindName(hnsw_active_guidance.kind),
++					 hnsw_active_guidance.heapOid,
++					 hnsw_active_guidance.atoms,
++					 hnsw_active_guidance.groups,
++					 hnsw_active_guidance.negatedAtoms,
++					 hnsw_active_guidance.lastBuildMs,
++					 hnsw_active_guidance.lastCacheRows,
++					 hnsw_active_guidance.lastCachePages,
++					 hnsw_active_guidance.lastCacheMemoryBytes,
++					 hnsw_active_guidance.fragmentCacheHits,
++					 hnsw_active_guidance.fragmentCacheMisses,
++					 hnsw_active_guidance.fragmentStoreHits,
++					 hnsw_active_guidance.fragmentBuilds,
++						 hnsw_active_guidance.composedGuideHit ? "true" : "false",
++						 hnsw_active_guidance.composedGuideHits,
++						 hnsw_active_guidance.composedGuideMisses,
++						 hnsw_active_guidance.composedExactActive ? "true" : "false",
++						 hnsw_active_guidance.composedExactHit ? "true" : "false",
++						 hnsw_active_guidance.composedExactRows,
++						 hnsw_active_guidance.composedExactMemoryBytes,
++						 hnsw_active_guidance.composedExactBuildMs);
++
++	PG_RETURN_TEXT_P(cstring_to_text(output.data));
++}
++
++PG_FUNCTION_INFO_V1(vector_hnsw_last_scan_profile);
++Datum
++vector_hnsw_last_scan_profile(PG_FUNCTION_ARGS)
++{
++	HnswScanProfile profile;
++	StringInfoData output;
++
++	HnswGetLastScanProfile(&profile);
++	initStringInfo(&output);
++	VectorHnswLastProfileToText(&output, &profile);
++	PG_RETURN_TEXT_P(cstring_to_text(output.data));
++}
++
++PG_FUNCTION_INFO_V1(vector_hnsw_reset_scan_profile);
++Datum
++vector_hnsw_reset_scan_profile(PG_FUNCTION_ARGS)
++{
++	HnswResetScanProfile();
++	PG_RETURN_VOID();
++}
++
++static int
++CompareMaterializeCandidatesByPage(const void *a, const void *b)
++{
++	const HnswMaterializeCandidate *ca = (const HnswMaterializeCandidate *) a;
++	const HnswMaterializeCandidate *cb = (const HnswMaterializeCandidate *) b;
++	BlockNumber ba = ItemPointerGetBlockNumber(&ca->tid);
++	BlockNumber bb = ItemPointerGetBlockNumber(&cb->tid);
++	OffsetNumber oa = ItemPointerGetOffsetNumber(&ca->tid);
++	OffsetNumber ob = ItemPointerGetOffsetNumber(&cb->tid);
++
++	if (ba < bb)
++		return -1;
++	if (ba > bb)
++		return 1;
++	if (oa < ob)
++		return -1;
++	if (oa > ob)
++		return 1;
++	return 0;
++}
++
++static int
++CompareMaterializeCandidatesByRank(const void *a, const void *b)
++{
++	const HnswMaterializeCandidate *ca = (const HnswMaterializeCandidate *) a;
++	const HnswMaterializeCandidate *cb = (const HnswMaterializeCandidate *) b;
++
++	if (ca->rank < cb->rank)
++		return -1;
++	if (ca->rank > cb->rank)
++		return 1;
++	return 0;
++}
++
++static void
++ResetHnswMaterializeProfile(void)
++{
++	hnsw_materialize_last_profile.valid = false;
++	hnsw_materialize_last_profile.candidates = 0;
++	hnsw_materialize_last_profile.visible = 0;
++	hnsw_materialize_last_profile.returned = 0;
++	hnsw_materialize_last_profile.distanceRuns = 0;
++	hnsw_materialize_last_profile.distinctPages = 0;
++	hnsw_materialize_last_profile.indexMs = 0;
++	hnsw_materialize_last_profile.fetchMs = 0;
++}
++
++PG_FUNCTION_INFO_V1(vector_hnsw_page_materialize_profile);
++Datum
++vector_hnsw_page_materialize_profile(PG_FUNCTION_ARGS)
++{
++	StringInfoData output;
++	HnswMaterializeProfile *profile = &hnsw_materialize_last_profile;
++
++	initStringInfo(&output);
++	appendStringInfo(&output,
++					 "{\"valid\":%s,"
++					 "\"candidates\":" INT64_FORMAT ","
++					 "\"visible\":" INT64_FORMAT ","
++					 "\"returned\":" INT64_FORMAT ","
++					 "\"distance_order_page_runs\":" INT64_FORMAT ","
++					 "\"distinct_heap_pages\":" INT64_FORMAT ","
++					 "\"index_ms\":%.6f,"
++					 "\"page_fetch_ms\":%.6f}",
++					 profile->valid ? "true" : "false",
++					 profile->candidates,
++					 profile->visible,
++					 profile->returned,
++					 profile->distanceRuns,
++					 profile->distinctPages,
++					 profile->indexMs,
++					 profile->fetchMs);
++
++	PG_RETURN_TEXT_P(cstring_to_text(output.data));
++}
++
++PG_FUNCTION_INFO_V1(vector_hnsw_metadata_cache_build);
++Datum
++vector_hnsw_metadata_cache_build(PG_FUNCTION_ARGS)
++{
++	Oid			indexOid = PG_GETARG_OID(0);
++	text	   *filterText = PG_GETARG_TEXT_PP(1);
++	char	   *filterName = text_to_cstring(filterText);
++	Oid			heapOid = IndexGetRelation(indexOid, false);
++	HnswMetadataCacheEntry *cache;
++	bool		cacheHit;
++
++	ResetHnswMetadataFilterProfile();
++	cache = GetHnswMetadataCache(heapOid, filterName, true, &cacheHit, NULL);
++	hnsw_metadata_filter_last_profile.valid = true;
++	hnsw_metadata_filter_last_profile.cacheHit = cacheHit;
++	hnsw_metadata_filter_last_profile.cacheKind = "exact";
++	hnsw_metadata_filter_last_profile.cacheRows = cache->rows;
++	hnsw_metadata_filter_last_profile.cacheMemoryBytes = HnswMetadataCacheMemoryBytes(cache, HNSW_GUIDANCE_KIND_EXACT);
++	hnsw_metadata_filter_last_profile.cacheBuildMs = cacheHit ? 0 : cache->buildMs;
++
++	PG_RETURN_INT64(cache->rows);
++}
++
++PG_FUNCTION_INFO_V1(vector_hnsw_metadata_page_cache_build);
++Datum
++vector_hnsw_metadata_page_cache_build(PG_FUNCTION_ARGS)
++{
++	Oid			indexOid = PG_GETARG_OID(0);
++	text	   *filterText = PG_GETARG_TEXT_PP(1);
++	char	   *filterName = text_to_cstring(filterText);
++	Oid			heapOid = IndexGetRelation(indexOid, false);
++	HnswMetadataCacheEntry *cache;
++	bool		cacheHit;
++
++	ResetHnswMetadataFilterProfile();
++	cache = GetHnswMetadataPageCache(heapOid, filterName, true, &cacheHit, NULL);
++	hnsw_metadata_filter_last_profile.valid = true;
++	hnsw_metadata_filter_last_profile.cacheHit = cacheHit;
++	hnsw_metadata_filter_last_profile.cacheKind = "page";
++	hnsw_metadata_filter_last_profile.cacheRows = cache->pageRows;
++	hnsw_metadata_filter_last_profile.cachePages = cache->pages;
++	hnsw_metadata_filter_last_profile.cacheMemoryBytes = HnswMetadataCacheMemoryBytes(cache, HNSW_GUIDANCE_KIND_PAGE);
++	hnsw_metadata_filter_last_profile.cacheBuildMs = cacheHit ? 0 : cache->pageBuildMs;
++
++	PG_RETURN_INT64(cache->pageRows);
++}
++
++PG_FUNCTION_INFO_V1(vector_hnsw_metadata_bloom_cache_build);
++Datum
++vector_hnsw_metadata_bloom_cache_build(PG_FUNCTION_ARGS)
++{
++	Oid			indexOid = PG_GETARG_OID(0);
++	text	   *filterText = PG_GETARG_TEXT_PP(1);
++	char	   *filterName = text_to_cstring(filterText);
++	Oid			heapOid = IndexGetRelation(indexOid, false);
++	HnswMetadataCacheEntry *cache;
++	bool		cacheHit;
++
++	ResetHnswMetadataFilterProfile();
++	cache = GetHnswMetadataBloomCache(heapOid, filterName, true, &cacheHit, NULL);
++	hnsw_metadata_filter_last_profile.valid = true;
++	hnsw_metadata_filter_last_profile.cacheHit = cacheHit;
++	hnsw_metadata_filter_last_profile.cacheKind = "bloom";
++	hnsw_metadata_filter_last_profile.cacheRows = cache->bloomRows;
++	hnsw_metadata_filter_last_profile.cacheMemoryBytes = HnswMetadataCacheMemoryBytes(cache, HNSW_GUIDANCE_KIND_BLOOM);
++	hnsw_metadata_filter_last_profile.cacheBuildMs = cacheHit ? 0 : cache->bloomBuildMs;
++
++	PG_RETURN_INT64(cache->bloomRows);
++}
++
++PG_FUNCTION_INFO_V1(vector_hnsw_metadata_filter_profile);
++Datum
++vector_hnsw_metadata_filter_profile(PG_FUNCTION_ARGS)
++{
++	StringInfoData output;
++	HnswMetadataFilterProfile *profile = &hnsw_metadata_filter_last_profile;
++
++	initStringInfo(&output);
++	appendStringInfo(&output,
++					 "{\"valid\":%s,"
++					 "\"cache_hit\":%s,"
++					 "\"cache_kind\":\"%s\","
++					 "\"cache_rows\":" INT64_FORMAT ","
++					 "\"cache_pages\":" INT64_FORMAT ","
++					 "\"candidates\":" INT64_FORMAT ","
++					 "\"cache_checks\":" INT64_FORMAT ","
++					 "\"cache_matches\":" INT64_FORMAT ","
++					 "\"returned\":" INT64_FORMAT ","
++					 "\"cache_memory_bytes\":" INT64_FORMAT ","
++					 "\"cache_build_ms\":%.6f,"
++					 "\"search_ms\":%.6f}",
++					 profile->valid ? "true" : "false",
++					 profile->cacheHit ? "true" : "false",
++					 profile->cacheKind != NULL ? profile->cacheKind : "none",
++					 profile->cacheRows,
++					 profile->cachePages,
++					 profile->candidates,
++					 profile->cacheChecks,
++					 profile->cacheMatches,
++					 profile->returned,
++					 profile->cacheMemoryBytes,
++					 profile->cacheBuildMs,
++					 profile->searchMs);
++
++	PG_RETURN_TEXT_P(cstring_to_text(output.data));
++}
++
++PG_FUNCTION_INFO_V1(vector_hnsw_metadata_cache_profile);
++Datum
++vector_hnsw_metadata_cache_profile(PG_FUNCTION_ARGS)
++{
++	int64		entries;
++	int64		residentEntries;
++	int64		residentBytes;
++	int64		largestEntryBytes;
++	int64		descriptorEntries;
++	int64		descriptorHits;
++	int64		descriptorExactEntries;
++	int64		descriptorExactRows;
++	int64		descriptorExactBytes;
++	int64		descriptorExactHits;
++	int64		budgetBytes = (int64) hnsw_metadata_cache_max_mb * 1024L * 1024L;
++	StringInfoData output;
++
++	HnswMetadataCacheStats(&entries, &residentEntries, &residentBytes, &largestEntryBytes);
++	HnswGuidanceDescriptorStats(&descriptorEntries, &descriptorHits, &descriptorExactEntries, &descriptorExactRows, &descriptorExactBytes, &descriptorExactHits);
++
++	initStringInfo(&output);
++	appendStringInfo(&output,
++					 "{\"entries\":" INT64_FORMAT ","
++					 "\"resident_entries\":" INT64_FORMAT ","
++					 "\"resident_bytes\":" INT64_FORMAT ","
++					 "\"largest_entry_bytes\":" INT64_FORMAT ","
++						 "\"evictions\":" INT64_FORMAT ","
++						 "\"composed_guide_entries\":" INT64_FORMAT ","
++						 "\"composed_guide_hits\":" INT64_FORMAT ","
++						 "\"composed_exact_entries\":" INT64_FORMAT ","
++						 "\"composed_exact_rows\":" INT64_FORMAT ","
++						 "\"composed_exact_bytes\":" INT64_FORMAT ","
++						 "\"composed_exact_hits\":" INT64_FORMAT ","
++						 "\"budget_mb\":%d,"
++						 "\"budget_bytes\":" INT64_FORMAT "}",
++					 entries,
++					 residentEntries,
++					 residentBytes,
++					 largestEntryBytes,
++						 hnsw_metadata_cache_evictions,
++						 descriptorEntries,
++						 descriptorHits,
++						 descriptorExactEntries,
++						 descriptorExactRows,
++						 descriptorExactBytes,
++						 descriptorExactHits,
++						 hnsw_metadata_cache_max_mb,
++						 budgetBytes);
++
++	PG_RETURN_TEXT_P(cstring_to_text(output.data));
++}
++
++PG_FUNCTION_INFO_V1(vector_hnsw_metadata_cache_reset);
++Datum
++vector_hnsw_metadata_cache_reset(PG_FUNCTION_ARGS)
++{
++	HnswMetadataResetCaches();
++	PG_RETURN_VOID();
++}
++
++PG_FUNCTION_INFO_V1(vector_hnsw_metadata_filter_search);
++Datum
++vector_hnsw_metadata_filter_search(PG_FUNCTION_ARGS)
++{
++	TupleDesc	tupdesc;
++	Tuplestorestate *tupstore;
++	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
++	Oid			indexOid = PG_GETARG_OID(0);
++	Datum		query = PG_GETARG_DATUM(1);
++	int32		k = PG_GETARG_INT32(2);
++	int32		candidateLimit = PG_GETARG_INT32(3);
++	text	   *filterText = PG_GETARG_TEXT_PP(4);
++	char	   *filterName = text_to_cstring(filterText);
++	Relation	indexRel;
++	Relation	heapRel;
++	Oid			heapOid;
++	ScanKeyData orderby;
++	IndexScanDesc scan;
++	Snapshot	snapshot;
++	HnswMetadataCacheEntry *cache;
++	bool		cacheHit;
++	int			oldPageAccess;
++	int			candidates = 0;
++	int			returned = 0;
++	instr_time	start;
++	instr_time	elapsed;
++
++	if (k < 1)
++		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++						errmsg("k must be at least 1")));
++	if (candidateLimit < k)
++		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++						errmsg("candidate limit must be at least k")));
++
++	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC | MAT_SRF_BLESS);
++	tupdesc = rsinfo->setDesc;
++	tupstore = rsinfo->setResult;
++
++	ResetHnswMetadataFilterProfile();
++
++	indexRel = index_open(indexOid, AccessShareLock);
++	heapOid = IndexGetRelation(indexOid, false);
++	heapRel = table_open(heapOid, AccessShareLock);
++	cache = GetHnswMetadataCache(heapOid, filterName, true, &cacheHit, NULL);
++
++	hnsw_metadata_filter_last_profile.cacheHit = cacheHit;
++	hnsw_metadata_filter_last_profile.cacheRows = cache->rows;
++	hnsw_metadata_filter_last_profile.cacheMemoryBytes = HnswMetadataCacheMemoryBytes(cache, HNSW_GUIDANCE_KIND_EXACT);
++	hnsw_metadata_filter_last_profile.cacheBuildMs = cacheHit ? 0 : cache->buildMs;
++
++	snapshot = GetActiveSnapshot();
++	oldPageAccess = hnsw_page_access;
++	hnsw_page_access = HNSW_PAGE_ACCESS_OFF;
++
++	MemSet(&orderby, 0, sizeof(ScanKeyData));
++	orderby.sk_attno = 1;
++	orderby.sk_strategy = InvalidStrategy;
++	orderby.sk_subtype = InvalidOid;
++	orderby.sk_collation = InvalidOid;
++	orderby.sk_argument = query;
++	scan = index_beginscan(heapRel, indexRel, snapshot, 0, 1);
++
++	INSTR_TIME_SET_CURRENT(start);
++	index_rescan(scan, NULL, 0, &orderby, 1);
++	while (candidates < candidateLimit && returned < k)
++	{
++		ItemPointer tid = index_getnext_tid(scan, ForwardScanDirection);
++		HnswMetadataTidKey tidKey;
++		HnswMetadataTidEntry *entry;
++		Datum		values[3];
++		bool		nulls[3] = {false, false, false};
++		char		ctidbuf[64];
++
++		if (tid == NULL)
++			break;
++
++		candidates++;
++		hnsw_metadata_filter_last_profile.cacheChecks++;
++		tidKey.tid = *tid;
++		entry = (HnswMetadataTidEntry *) hash_search(cache->tidHash, &tidKey, HASH_FIND, NULL);
++		if (entry == NULL)
++			continue;
++
++		hnsw_metadata_filter_last_profile.cacheMatches++;
++		snprintf(ctidbuf, sizeof(ctidbuf), "(%u,%u)",
++				 ItemPointerGetBlockNumber(tid),
++				 ItemPointerGetOffsetNumber(tid));
++		values[0] = Int32GetDatum(candidates);
++		values[1] = Int64GetDatum(entry->id);
++		values[2] = CStringGetTextDatum(ctidbuf);
++		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
++		returned++;
++	}
++	INSTR_TIME_SET_CURRENT(elapsed);
++	INSTR_TIME_SUBTRACT(elapsed, start);
++
++	index_endscan(scan);
++	hnsw_page_access = oldPageAccess;
++	table_close(heapRel, AccessShareLock);
++	index_close(indexRel, AccessShareLock);
++
++	hnsw_metadata_filter_last_profile.valid = true;
++	hnsw_metadata_filter_last_profile.candidates = candidates;
++	hnsw_metadata_filter_last_profile.returned = returned;
++	hnsw_metadata_filter_last_profile.searchMs = INSTR_TIME_GET_MILLISEC(elapsed);
++
++	PG_RETURN_VOID();
++}
++
++PG_FUNCTION_INFO_V1(vector_hnsw_metadata_page_filter_candidates);
++Datum
++vector_hnsw_metadata_page_filter_candidates(PG_FUNCTION_ARGS)
++{
++	TupleDesc	tupdesc;
++	Tuplestorestate *tupstore;
++	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
++	Oid			indexOid = PG_GETARG_OID(0);
++	Datum		query = PG_GETARG_DATUM(1);
++	int32		candidateLimit = PG_GETARG_INT32(2);
++	text	   *filterText = PG_GETARG_TEXT_PP(3);
++	char	   *filterName = text_to_cstring(filterText);
++	Relation	indexRel;
++	Relation	heapRel;
++	Oid			heapOid;
++	ScanKeyData orderby;
++	IndexScanDesc scan;
++	Snapshot	snapshot;
++	HnswMetadataCacheEntry *cache;
++	bool		cacheHit;
++	int			oldPageAccess;
++	int			candidates = 0;
++	int			returned = 0;
++	instr_time	start;
++	instr_time	elapsed;
++
++	if (candidateLimit < 1)
++		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++						errmsg("candidate limit must be at least 1")));
++
++	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC | MAT_SRF_BLESS);
++	tupdesc = rsinfo->setDesc;
++	tupstore = rsinfo->setResult;
++
++	ResetHnswMetadataFilterProfile();
++
++	indexRel = index_open(indexOid, AccessShareLock);
++	heapOid = IndexGetRelation(indexOid, false);
++	heapRel = table_open(heapOid, AccessShareLock);
++	cache = GetHnswMetadataPageCache(heapOid, filterName, true, &cacheHit, NULL);
++
++	hnsw_metadata_filter_last_profile.cacheHit = cacheHit;
++	hnsw_metadata_filter_last_profile.cacheKind = "page";
++	hnsw_metadata_filter_last_profile.cacheRows = cache->pageRows;
++	hnsw_metadata_filter_last_profile.cachePages = cache->pages;
++	hnsw_metadata_filter_last_profile.cacheMemoryBytes = HnswMetadataCacheMemoryBytes(cache, HNSW_GUIDANCE_KIND_PAGE);
++	hnsw_metadata_filter_last_profile.cacheBuildMs = cacheHit ? 0 : cache->pageBuildMs;
++
++	snapshot = GetActiveSnapshot();
++	oldPageAccess = hnsw_page_access;
++	hnsw_page_access = HNSW_PAGE_ACCESS_OFF;
++
++	MemSet(&orderby, 0, sizeof(ScanKeyData));
++	orderby.sk_attno = 1;
++	orderby.sk_strategy = InvalidStrategy;
++	orderby.sk_subtype = InvalidOid;
++	orderby.sk_collation = InvalidOid;
++	orderby.sk_argument = query;
++	scan = index_beginscan(heapRel, indexRel, snapshot, 0, 1);
++
++	INSTR_TIME_SET_CURRENT(start);
++	index_rescan(scan, NULL, 0, &orderby, 1);
++	while (candidates < candidateLimit)
++	{
++		ItemPointer tid = index_getnext_tid(scan, ForwardScanDirection);
++		BlockNumber block;
++		Datum		values[2];
++		bool		nulls[2] = {false, false};
++		char		ctidbuf[64];
++
++		if (tid == NULL)
++			break;
++
++		candidates++;
++		hnsw_metadata_filter_last_profile.cacheChecks++;
++		block = ItemPointerGetBlockNumber(tid);
++		if (!HnswMetadataPageBitTest(cache, block))
++			continue;
++
++		hnsw_metadata_filter_last_profile.cacheMatches++;
++		snprintf(ctidbuf, sizeof(ctidbuf), "(%u,%u)",
++				 ItemPointerGetBlockNumber(tid),
++				 ItemPointerGetOffsetNumber(tid));
++		values[0] = Int32GetDatum(candidates);
++		values[1] = CStringGetTextDatum(ctidbuf);
++		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
++		returned++;
++	}
++	INSTR_TIME_SET_CURRENT(elapsed);
++	INSTR_TIME_SUBTRACT(elapsed, start);
++
++	index_endscan(scan);
++	hnsw_page_access = oldPageAccess;
++	table_close(heapRel, AccessShareLock);
++	index_close(indexRel, AccessShareLock);
++
++	hnsw_metadata_filter_last_profile.valid = true;
++	hnsw_metadata_filter_last_profile.candidates = candidates;
++	hnsw_metadata_filter_last_profile.returned = returned;
++	hnsw_metadata_filter_last_profile.searchMs = INSTR_TIME_GET_MILLISEC(elapsed);
++
++	PG_RETURN_VOID();
++}
++
++PG_FUNCTION_INFO_V1(vector_hnsw_metadata_bloom_filter_candidates);
++Datum
++vector_hnsw_metadata_bloom_filter_candidates(PG_FUNCTION_ARGS)
++{
++	TupleDesc	tupdesc;
++	Tuplestorestate *tupstore;
++	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
++	Oid			indexOid = PG_GETARG_OID(0);
++	Datum		query = PG_GETARG_DATUM(1);
++	int32		candidateLimit = PG_GETARG_INT32(2);
++	text	   *filterText = PG_GETARG_TEXT_PP(3);
++	char	   *filterName = text_to_cstring(filterText);
++	Relation	indexRel;
++	Relation	heapRel;
++	Oid			heapOid;
++	ScanKeyData orderby;
++	IndexScanDesc scan;
++	Snapshot	snapshot;
++	HnswMetadataCacheEntry *cache;
++	bool		cacheHit;
++	int			oldPageAccess;
++	int			candidates = 0;
++	int			returned = 0;
++	instr_time	start;
++	instr_time	elapsed;
++
++	if (candidateLimit < 1)
++		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++						errmsg("candidate limit must be at least 1")));
++
++	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC | MAT_SRF_BLESS);
++	tupdesc = rsinfo->setDesc;
++	tupstore = rsinfo->setResult;
++
++	ResetHnswMetadataFilterProfile();
++
++	indexRel = index_open(indexOid, AccessShareLock);
++	heapOid = IndexGetRelation(indexOid, false);
++	heapRel = table_open(heapOid, AccessShareLock);
++	cache = GetHnswMetadataBloomCache(heapOid, filterName, true, &cacheHit, NULL);
++
++	hnsw_metadata_filter_last_profile.cacheHit = cacheHit;
++	hnsw_metadata_filter_last_profile.cacheKind = "bloom";
++	hnsw_metadata_filter_last_profile.cacheRows = cache->bloomRows;
++	hnsw_metadata_filter_last_profile.cacheMemoryBytes = HnswMetadataCacheMemoryBytes(cache, HNSW_GUIDANCE_KIND_BLOOM);
++	hnsw_metadata_filter_last_profile.cacheBuildMs = cacheHit ? 0 : cache->bloomBuildMs;
++
++	snapshot = GetActiveSnapshot();
++	oldPageAccess = hnsw_page_access;
++	hnsw_page_access = HNSW_PAGE_ACCESS_OFF;
++
++	MemSet(&orderby, 0, sizeof(ScanKeyData));
++	orderby.sk_attno = 1;
++	orderby.sk_strategy = InvalidStrategy;
++	orderby.sk_subtype = InvalidOid;
++	orderby.sk_collation = InvalidOid;
++	orderby.sk_argument = query;
++	scan = index_beginscan(heapRel, indexRel, snapshot, 0, 1);
++
++	INSTR_TIME_SET_CURRENT(start);
++	index_rescan(scan, NULL, 0, &orderby, 1);
++	while (candidates < candidateLimit)
++	{
++		ItemPointer tid = index_getnext_tid(scan, ForwardScanDirection);
++		Datum		values[2];
++		bool		nulls[2] = {false, false};
++		char		ctidbuf[64];
++
++		if (tid == NULL)
++			break;
++
++		candidates++;
++		hnsw_metadata_filter_last_profile.cacheChecks++;
++		if (!HnswMetadataBloomMayContain(cache, tid))
++			continue;
++
++		hnsw_metadata_filter_last_profile.cacheMatches++;
++		snprintf(ctidbuf, sizeof(ctidbuf), "(%u,%u)",
++				 ItemPointerGetBlockNumber(tid),
++				 ItemPointerGetOffsetNumber(tid));
++		values[0] = Int32GetDatum(candidates);
++		values[1] = CStringGetTextDatum(ctidbuf);
++		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
++		returned++;
++	}
++	INSTR_TIME_SET_CURRENT(elapsed);
++	INSTR_TIME_SUBTRACT(elapsed, start);
++
++	index_endscan(scan);
++	hnsw_page_access = oldPageAccess;
++	table_close(heapRel, AccessShareLock);
++	index_close(indexRel, AccessShareLock);
++
++	hnsw_metadata_filter_last_profile.valid = true;
++	hnsw_metadata_filter_last_profile.candidates = candidates;
++	hnsw_metadata_filter_last_profile.returned = returned;
++	hnsw_metadata_filter_last_profile.searchMs = INSTR_TIME_GET_MILLISEC(elapsed);
++
++	PG_RETURN_VOID();
++}
++
++PG_FUNCTION_INFO_V1(vector_hnsw_metadata_bloom_filter_candidates_limited);
++Datum
++vector_hnsw_metadata_bloom_filter_candidates_limited(PG_FUNCTION_ARGS)
++{
++	TupleDesc	tupdesc;
++	Tuplestorestate *tupstore;
++	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
++	Oid			indexOid = PG_GETARG_OID(0);
++	Datum		query = PG_GETARG_DATUM(1);
++	int32		candidateLimit = PG_GETARG_INT32(2);
++	int32		matchLimit = PG_GETARG_INT32(3);
++	text	   *filterText = PG_GETARG_TEXT_PP(4);
++	char	   *filterName = text_to_cstring(filterText);
++	Relation	indexRel;
++	Relation	heapRel;
++	Oid			heapOid;
++	ScanKeyData orderby;
++	IndexScanDesc scan;
++	Snapshot	snapshot;
++	HnswMetadataCacheEntry *cache;
++	bool		cacheHit;
++	int			oldPageAccess;
++	int			candidates = 0;
++	int			returned = 0;
++	instr_time	start;
++	instr_time	elapsed;
++
++	if (candidateLimit < 1)
++		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++						errmsg("candidate limit must be at least 1")));
++	if (matchLimit < 1)
++		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++						errmsg("match limit must be at least 1")));
++
++	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC | MAT_SRF_BLESS);
++	tupdesc = rsinfo->setDesc;
++	tupstore = rsinfo->setResult;
++
++	ResetHnswMetadataFilterProfile();
++
++	indexRel = index_open(indexOid, AccessShareLock);
++	heapOid = IndexGetRelation(indexOid, false);
++	heapRel = table_open(heapOid, AccessShareLock);
++	cache = GetHnswMetadataBloomCache(heapOid, filterName, true, &cacheHit, NULL);
++
++	hnsw_metadata_filter_last_profile.cacheHit = cacheHit;
++	hnsw_metadata_filter_last_profile.cacheKind = "bloom_limited";
++	hnsw_metadata_filter_last_profile.cacheRows = cache->bloomRows;
++	hnsw_metadata_filter_last_profile.cacheMemoryBytes = HnswMetadataCacheMemoryBytes(cache, HNSW_GUIDANCE_KIND_BLOOM);
++	hnsw_metadata_filter_last_profile.cacheBuildMs = cacheHit ? 0 : cache->bloomBuildMs;
++
++	snapshot = GetActiveSnapshot();
++	oldPageAccess = hnsw_page_access;
++	hnsw_page_access = HNSW_PAGE_ACCESS_OFF;
++
++	MemSet(&orderby, 0, sizeof(ScanKeyData));
++	orderby.sk_attno = 1;
++	orderby.sk_strategy = InvalidStrategy;
++	orderby.sk_subtype = InvalidOid;
++	orderby.sk_collation = InvalidOid;
++	orderby.sk_argument = query;
++	scan = index_beginscan(heapRel, indexRel, snapshot, 0, 1);
++
++	INSTR_TIME_SET_CURRENT(start);
++	index_rescan(scan, NULL, 0, &orderby, 1);
++	while (candidates < candidateLimit && returned < matchLimit)
++	{
++		ItemPointer tid = index_getnext_tid(scan, ForwardScanDirection);
++		Datum		values[2];
++		bool		nulls[2] = {false, false};
++		char		ctidbuf[64];
++
++		if (tid == NULL)
++			break;
++
++		candidates++;
++		hnsw_metadata_filter_last_profile.cacheChecks++;
++		if (!HnswMetadataBloomMayContain(cache, tid))
++			continue;
++
++		hnsw_metadata_filter_last_profile.cacheMatches++;
++		snprintf(ctidbuf, sizeof(ctidbuf), "(%u,%u)",
++				 ItemPointerGetBlockNumber(tid),
++				 ItemPointerGetOffsetNumber(tid));
++		values[0] = Int32GetDatum(candidates);
++		values[1] = CStringGetTextDatum(ctidbuf);
++		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
++		returned++;
++	}
++	INSTR_TIME_SET_CURRENT(elapsed);
++	INSTR_TIME_SUBTRACT(elapsed, start);
++
++	index_endscan(scan);
++	hnsw_page_access = oldPageAccess;
++	table_close(heapRel, AccessShareLock);
++	index_close(indexRel, AccessShareLock);
++
++	hnsw_metadata_filter_last_profile.valid = true;
++	hnsw_metadata_filter_last_profile.candidates = candidates;
++	hnsw_metadata_filter_last_profile.returned = returned;
++	hnsw_metadata_filter_last_profile.searchMs = INSTR_TIME_GET_MILLISEC(elapsed);
++
++	PG_RETURN_VOID();
++}
++
++PG_FUNCTION_INFO_V1(vector_hnsw_page_materialize);
++Datum
++vector_hnsw_page_materialize(PG_FUNCTION_ARGS)
++{
++	Oid			indexOid = PG_GETARG_OID(0);
++	Datum		query = PG_GETARG_DATUM(1);
++	int32		k = PG_GETARG_INT32(2);
++	int32		candidateLimit = PG_GETARG_INT32(3);
++	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
++	Relation	indexRel;
++	Relation	heapRel;
++	Oid			heapOid;
++	AttrNumber	idAttnum;
++	ScanKeyData orderby;
++	IndexScanDesc scan;
++	Snapshot	snapshot;
++	HnswMaterializeCandidate *items;
++	int			count = 0;
++	int			returned = 0;
++	BlockNumber previousBlock = InvalidBlockNumber;
++	BlockNumber previousPageBlock = InvalidBlockNumber;
++	TupleTableSlot *slot;
++	TupleDesc	tupdesc;
++	Tuplestorestate *tupstore;
++	int			oldPageAccess;
++	instr_time	start;
++	instr_time	elapsed;
++
++	if (k < 1)
++		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++						errmsg("k must be at least 1")));
++	if (candidateLimit < k)
++		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++						errmsg("candidate limit must be at least k")));
++
++	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC | MAT_SRF_BLESS);
++	tupdesc = rsinfo->setDesc;
++	tupstore = rsinfo->setResult;
++
++	ResetHnswMaterializeProfile();
++
++	indexRel = index_open(indexOid, AccessShareLock);
++	heapOid = IndexGetRelation(indexOid, false);
++	heapRel = table_open(heapOid, AccessShareLock);
++	idAttnum = get_attnum(heapOid, "id");
++	if (idAttnum == InvalidAttrNumber)
++		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_COLUMN),
++						errmsg("heap relation \"%s\" does not have an id column",
++							   RelationGetRelationName(heapRel))));
++
++	items = (HnswMaterializeCandidate *) palloc0(sizeof(HnswMaterializeCandidate) * candidateLimit);
++	snapshot = GetActiveSnapshot();
++
++	/*
++	 * Collect candidate TIDs from the HNSW AM without letting the regular
++	 * executor fetch heap tuples one-by-one. Disable HNSW page access here so
++	 * the collected rank order is the standard distance order.
++	 */
++	oldPageAccess = hnsw_page_access;
++	hnsw_page_access = HNSW_PAGE_ACCESS_OFF;
++
++	MemSet(&orderby, 0, sizeof(ScanKeyData));
++	orderby.sk_attno = 1;
++	orderby.sk_strategy = InvalidStrategy;
++	orderby.sk_subtype = InvalidOid;
++	orderby.sk_collation = InvalidOid;
++	orderby.sk_argument = query;
++	scan = index_beginscan(heapRel, indexRel, snapshot, 0, 1);
++
++	INSTR_TIME_SET_CURRENT(start);
++	index_rescan(scan, NULL, 0, &orderby, 1);
++	while (count < candidateLimit)
++	{
++		ItemPointer tid = index_getnext_tid(scan, ForwardScanDirection);
++		BlockNumber block;
++
++		if (tid == NULL)
++			break;
++
++		items[count].tid = *tid;
++		items[count].rank = count;
++		block = ItemPointerGetBlockNumber(&items[count].tid);
++		if (count == 0 || block != previousBlock)
++			hnsw_materialize_last_profile.distanceRuns++;
++		previousBlock = block;
++		count++;
++	}
++	INSTR_TIME_SET_CURRENT(elapsed);
++	INSTR_TIME_SUBTRACT(elapsed, start);
++	hnsw_materialize_last_profile.indexMs = INSTR_TIME_GET_MILLISEC(elapsed);
++
++	index_endscan(scan);
++	hnsw_page_access = oldPageAccess;
++
++	qsort(items, count, sizeof(HnswMaterializeCandidate), CompareMaterializeCandidatesByPage);
++	slot = table_slot_create(heapRel, NULL);
++
++	INSTR_TIME_SET_CURRENT(start);
++	for (int i = 0; i < count; i++)
++	{
++		BlockNumber block = ItemPointerGetBlockNumber(&items[i].tid);
++
++		if (i == 0 || block != previousPageBlock)
++			hnsw_materialize_last_profile.distinctPages++;
++		previousPageBlock = block;
++
++		if (table_tuple_fetch_row_version(heapRel, &items[i].tid, snapshot, slot))
++		{
++			bool		isnull;
++			Datum		idDatum = slot_getattr(slot, idAttnum, &isnull);
++
++			if (!isnull)
++			{
++				items[i].id = DatumGetInt64(idDatum);
++				items[i].visible = true;
++				hnsw_materialize_last_profile.visible++;
++			}
++
++			ExecClearTuple(slot);
++		}
++	}
++	INSTR_TIME_SET_CURRENT(elapsed);
++	INSTR_TIME_SUBTRACT(elapsed, start);
++	hnsw_materialize_last_profile.fetchMs = INSTR_TIME_GET_MILLISEC(elapsed);
++	ExecDropSingleTupleTableSlot(slot);
++
++	qsort(items, count, sizeof(HnswMaterializeCandidate), CompareMaterializeCandidatesByRank);
++	for (int i = 0; i < count && returned < k; i++)
++	{
++		Datum		values[3];
++		bool		nulls[3] = {false, false, false};
++		char		ctidbuf[64];
++
++		if (!items[i].visible)
++			continue;
++
++		snprintf(ctidbuf, sizeof(ctidbuf), "(%u,%u)",
++				 ItemPointerGetBlockNumber(&items[i].tid),
++				 ItemPointerGetOffsetNumber(&items[i].tid));
++		values[0] = Int32GetDatum(items[i].rank + 1);
++		values[1] = Int64GetDatum(items[i].id);
++		values[2] = CStringGetTextDatum(ctidbuf);
++		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
++		returned++;
++	}
++
++	hnsw_materialize_last_profile.valid = true;
++	hnsw_materialize_last_profile.candidates = count;
++	hnsw_materialize_last_profile.returned = returned;
++
++	table_close(heapRel, AccessShareLock);
++	index_close(indexRel, AccessShareLock);
++
++	PG_RETURN_VOID();
+ }
+ 
+ /*

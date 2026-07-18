@@ -25,11 +25,33 @@ wheels/
 .installed.cfg
 *.egg
 
+# Local agent/tool state
+.agents/
+.codex/
+Hybrid-Retrieval-Late-Bound-Visibility-Handoff.md
+
+# Local secrets/config
+.env
+.env.*
+
 # Results
 results/
+research/results/
+research/
 *.csv
+!paper/scripts/motivation_data/*.csv
 *.png
 *.pdf
+
+# Paper build products
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
 
 # IDE
 .vscode/
@@ -46,7 +68,22 @@ results/
 
 # Data
 data/
+*.db
+*.duckdb
+*.faiss
+*.fbin
+*.hnsw
 *.pkl
 *.pickle
+*.ibin
+*.npy
+*.npz
+*.parquet
+*.sqlite
+*.sqlite3
 *.h5
 *.hdf5
+
+# Third-party source checkouts should be referenced by docs, patches, or
+# explicit submodules instead of committed wholesale.
+external/*
