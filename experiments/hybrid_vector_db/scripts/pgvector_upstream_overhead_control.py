@@ -27,10 +27,11 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_FILTERS = ROOT / "experiments/hybrid_vector_db/configs/amazon10m_selectivity14_filters.csv"
-DEFAULT_TRUTH = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_formal.csv"
+DEFAULT_TRUTH = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_valid_embeddings_formal.csv"
 DEFAULT_OUT_DIR = ROOT / "results/hybrid_vector_db"
 DEFAULT_TABLE = "public.amazon_grocery_reviews_10m_pgvector"
-DEFAULT_INDEX = "public.amazon_grocery_reviews_10m_pgvector_embedding_hnsw_idx"
+DEFAULT_INDEX = "public.amazon10m_embedding_valid_hnsw_source_idx"
+DEFAULT_CANDIDATE_VALIDITY_PREDICATE = "embedding_valid"
 UPSTREAM_MAX_EF_SEARCH = 1000
 EVALUATION_EF_PATCH_SHA256 = {
     10_000: "d63b8d75015cffb90d9bd7f04d0c8f572502f0b84f77f59f581d224db7601bcf",
@@ -3633,7 +3634,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--candidate-validity-predicate",
-        default="",
+        default=DEFAULT_CANDIDATE_VALIDITY_PREDICATE,
         help="Global SQL predicate implied by the partial HNSW index and exact truth.",
     )
     parser.add_argument("--table", type=validate_identifier, default=DEFAULT_TABLE)
