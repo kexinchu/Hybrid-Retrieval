@@ -1757,7 +1757,7 @@ def calibration_row_is_complete(row: dict[str, object]) -> bool:
 def calibration_stop_reached(rows: list[dict[str, object]], target: float) -> bool:
     return bool(rows) and all(calibration_row_is_complete(row) for row in rows) and any(
         calibration_row_is_complete(row)
-        and float(row.get("recall_lcb95", row["recall_mean"])) >= target
+        and float(row["recall_mean"]) >= target
         for row in rows
     )
 
@@ -2038,14 +2038,14 @@ def select_row(rows: list[dict[str, object]], target: float) -> tuple[dict[str, 
     reached = [
         row
         for row in valid
-        if float(row.get("recall_lcb95", row["recall_mean"])) >= target
+        if float(row["recall_mean"]) >= target
     ]
     if reached:
         return min(
             reached,
             key=lambda row: (
                 float(row["latency_mean_ms"]),
-                -float(row.get("recall_lcb95", row["recall_mean"])),
+                -float(row["recall_mean"]),
                 str(row["config"]),
             ),
         ), True
@@ -2117,6 +2117,10 @@ def selected_rows(
                             "target_recall": target,
                             "target_met_in_calibration": True,
                             "target_confirmed_in_calibration": True,
+                            "target_lcb95_met_in_calibration": (
+                                float(selected.get("recall_lcb95", selected["recall_mean"]))
+                                >= target
+                            ),
                             "selection_status": "selected",
                             "feasibility_status": "selected",
                             **selected,
@@ -2138,6 +2142,7 @@ def selected_rows(
                         "target_recall": target,
                         "target_met_in_calibration": False,
                         "target_confirmed_in_calibration": False,
+                        "target_lcb95_met_in_calibration": False,
                         "selection_status": status,
                         "feasibility_status": status,
                         "filter_name": filter_name,
@@ -2482,8 +2487,10 @@ def consolidate_final(
                     "target_recall": selected_row["target_recall"],
                     "target_met_in_calibration": selected_row["target_met_in_calibration"],
                     "target_confirmed_in_calibration": selected_row.get("target_confirmed_in_calibration", False),
+                    "target_lcb95_met_in_calibration": selected_row.get("target_lcb95_met_in_calibration", False),
                     "target_met_in_final": False,
                     "target_confirmed_in_final": False,
+                    "target_lcb95_met_in_final": False,
                     "filter_name": selected_row["filter_name"],
                     "mode": selected_row["mode"],
                     "guidance_filter_strategy": selected_row.get("guidance_filter_strategy", ""),
@@ -2507,8 +2514,10 @@ def consolidate_final(
                 "target_recall": selected_row["target_recall"],
                 "target_met_in_calibration": selected_row["target_met_in_calibration"],
                 "target_confirmed_in_calibration": selected_row.get("target_confirmed_in_calibration", False),
+                "target_lcb95_met_in_calibration": selected_row.get("target_lcb95_met_in_calibration", False),
                 "target_met_in_final": float(final["recall_mean"]) >= float(selected_row["target_recall"]),
-                "target_confirmed_in_final": float(final.get("recall_lcb95", final["recall_mean"])) >= float(selected_row["target_recall"]),
+                "target_confirmed_in_final": float(final["recall_mean"]) >= float(selected_row["target_recall"]),
+                "target_lcb95_met_in_final": float(final.get("recall_lcb95", final["recall_mean"])) >= float(selected_row["target_recall"]),
                 "filter_name": selected_row["filter_name"],
                 "mode": selected_row["mode"],
                 "guidance_filter_strategy": selected_row.get("guidance_filter_strategy", ""),
@@ -2834,9 +2843,9 @@ def main() -> None:
                     "stop_condition": (
                         "independently per iterative-scan family, after every distinct configuration "
                         "in an ef_search block completes without errors, stop that family when any "
-                        "recall_lcb95 reaches the highest requested target"
+                        "mean Recall@10 reaches the highest requested target"
                     ),
-                    "selection": "lowest mean latency among complete error-free configurations with recall_lcb95 at or above target",
+                    "selection": "lowest mean latency among complete error-free configurations with mean Recall@10 at or above target; bootstrap CI/LCB is report-only",
                     "unattainable_condition": "full grid evaluated with every block complete and error-free",
                 },
                 "calibration_pairs": calibration_pairs,

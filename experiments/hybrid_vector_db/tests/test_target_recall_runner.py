@@ -22,6 +22,7 @@ from experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_run
     bootstrap_mean_ci,
     acquire_formal_data_guard,
     build_configs,
+    calibration_stop_reached,
     calibrate_mode_filter,
     consolidate_final,
     configs_for_mode,
@@ -373,7 +374,7 @@ class TargetRecallRunnerTests(unittest.TestCase):
         self.assertFalse(met)
         self.assertIsNone(selected)
 
-    def test_select_row_requires_recall_lower_bound(self):
+    def test_select_row_uses_mean_recall_and_reports_lower_bound_separately(self):
         rows = [
             {
                 "config": "uncertain-fast",
@@ -398,7 +399,36 @@ class TargetRecallRunnerTests(unittest.TestCase):
         selected, met = select_row(rows, target=0.95)
 
         self.assertTrue(met)
-        self.assertEqual(selected["config"], "confirmed")
+        self.assertEqual(selected["config"], "uncertain-fast")
+
+        rows[0]["filter_name"] = rows[1]["filter_name"] = "f"
+        rows[0]["mode"] = rows[1]["mode"] = "design1_bloom"
+        rows[0].update({
+            "ef_search": 100,
+            "guided_collect_target": 100,
+            "max_scan_tuples": 5000000,
+            "scan_mem_multiplier": 32.0,
+            "iterative_scan": "off",
+        })
+        rows[1].update(rows[0] | {"config": "confirmed", "recall_mean": 0.98,
+                                "recall_lcb95": 0.96, "latency_mean_ms": 20.0})
+        selected_rows_for_target = selected_rows(
+            rows, ["f"], ["design1_bloom"], [0.95]
+        )
+        self.assertTrue(selected_rows_for_target[0]["target_met_in_calibration"])
+        self.assertFalse(
+            selected_rows_for_target[0]["target_lcb95_met_in_calibration"]
+        )
+
+    def test_calibration_stop_uses_mean_recall_not_lcb95(self):
+        rows = [{
+            "ok": 80,
+            "errors": 0,
+            "rows_complete": True,
+            "recall_mean": 0.96,
+            "recall_lcb95": 0.93,
+        }]
+        self.assertTrue(calibration_stop_reached(rows, 0.95))
 
     def test_final_eligible_rows_requires_a_jointly_attainable_method(self):
         rows = [
