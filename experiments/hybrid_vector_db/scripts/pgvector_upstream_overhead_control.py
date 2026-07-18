@@ -31,7 +31,8 @@ DEFAULT_TRUTH = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_trut
 DEFAULT_OUT_DIR = ROOT / "results/hybrid_vector_db"
 DEFAULT_TABLE = "public.amazon_grocery_reviews_10m_pgvector"
 DEFAULT_INDEX = "public.amazon_grocery_reviews_10m_pgvector_embedding_hnsw_idx"
-DEFAULT_EF_VALUES = (250, 500, 750, 1000, 1500, 2000, 3000, 4000, 5000, 7000, 8500, 10000)
+UPSTREAM_MAX_EF_SEARCH = 1000
+DEFAULT_EF_VALUES = (250, 500, 750, UPSTREAM_MAX_EF_SEARCH)
 DEFAULT_BUDGET_RUNGS = (
     (1, 100_000, 1.0),
     (2, 1_000_000, 8.0),
@@ -507,6 +508,11 @@ def config_from_mapping(row: Mapping[str, Any]) -> Config:
     )
     if config.ef_search <= 0 or config.max_scan_tuples <= 0:
         raise ValueError("ef_search and max_scan_tuples must be positive")
+    if config.ef_search > UPSTREAM_MAX_EF_SEARCH:
+        raise ValueError(
+            "binary overhead control must stay inside official pgvector's "
+            f"hnsw.ef_search range (<= {UPSTREAM_MAX_EF_SEARCH})"
+        )
     if not math.isfinite(config.scan_mem_multiplier) or config.scan_mem_multiplier <= 0:
         raise ValueError("scan_mem_multiplier must be finite and positive")
     if config.budget_rank < 0:

@@ -43,16 +43,20 @@ def completed_summary(config, recall, latency):
 
 
 class PgvectorUpstreamOverheadControlTests(unittest.TestCase):
-    def test_default_ladder_has_84_effective_configs_without_cartesian_duplicates(self):
+    def test_default_ladder_uses_only_the_official_upstream_ef_range(self):
         raw = runner.default_config_ladder()
         effective, proof = runner.effective_config_grid(raw)
 
-        self.assertEqual(len(raw), 84)
-        self.assertEqual(len(effective), 84)
+        self.assertEqual(len(raw), 28)
+        self.assertEqual(len(effective), 28)
         self.assertEqual(proof["dropped_equivalent_configs"], 0)
+        self.assertLessEqual(
+            max(config.ef_search for config in effective),
+            runner.UPSTREAM_MAX_EF_SEARCH,
+        )
         self.assertEqual(
             {family: sum(config.family == family for config in effective) for family in {config.family for config in effective}},
-            {"off": 12, "strict_order": 36, "relaxed_order": 36},
+            {"off": 4, "strict_order": 12, "relaxed_order": 12},
         )
         self.assertEqual(
             len({(config.max_scan_tuples, config.scan_mem_multiplier) for config in effective if config.family == "strict_order"}),
@@ -70,7 +74,7 @@ class PgvectorUpstreamOverheadControlTests(unittest.TestCase):
 
         effective, proof = runner.effective_config_grid(configs)
 
-        self.assertEqual(len(effective), 84)
+        self.assertEqual(len(effective), 28)
         self.assertEqual(proof["dropped_equivalent_configs"], 2)
         off_250 = [config for config in effective if config.family == "off" and config.ef_search == 250]
         self.assertEqual(len(off_250), 1)
@@ -83,14 +87,26 @@ class PgvectorUpstreamOverheadControlTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "conflicting budget_rank"):
             runner.effective_config_grid(conflicting)
 
-    def test_default_query_count_bound_is_68880_per_implementation(self):
-        counts = runner.default_query_count_bounds(84)
+    def test_default_query_count_bound_is_53200_per_implementation(self):
+        counts = runner.default_query_count_bounds(28)
 
-        self.assertEqual(counts["screen_queries"], 23_520)
+        self.assertEqual(counts["screen_queries"], 7_840)
         self.assertEqual(counts["max_promoted_configs_per_filter"], 9)
         self.assertEqual(counts["verification_query_upper_bound"], 20_160)
         self.assertEqual(counts["final_query_upper_bound"], 25_200)
-        self.assertEqual(counts["total_query_upper_bound"], 68_880)
+        self.assertEqual(counts["total_query_upper_bound"], 53_200)
+
+    def test_custom_ladder_rejects_sqlens_only_ef_values(self):
+        with self.assertRaisesRegex(ValueError, "official pgvector"):
+            runner.config_from_mapping(
+                {
+                    "ef_search": 1500,
+                    "iterative_scan": "strict_order",
+                    "max_scan_tuples": 5_000_000,
+                    "scan_mem_multiplier": 32,
+                    "budget_rank": 3,
+                }
+            )
 
     def test_promotion_includes_margin_winner_family_recall_and_max_budget_proofs(self):
         configs = [
@@ -621,11 +637,11 @@ class PgvectorUpstreamOverheadControlTests(unittest.TestCase):
 
         payload = json.loads(output.getvalue())
         bounds = payload["default_query_count_bounds_per_implementation"]
-        self.assertEqual(payload["default_effective_config_count"], 84)
-        self.assertEqual(payload["formal_family_effective_config_count"], 12)
+        self.assertEqual(payload["default_effective_config_count"], 28)
+        self.assertEqual(payload["formal_family_effective_config_count"], 4)
         self.assertEqual(payload["formal_cell_count"], 42)
-        self.assertEqual(bounds["screen_queries"], 3_360)
-        self.assertEqual(bounds["total_query_upper_bound"], 39_760)
+        self.assertEqual(bounds["screen_queries"], 1_120)
+        self.assertEqual(bounds["total_query_upper_bound"], 35_280)
         self.assertFalse(payload["file_access"])
         self.assertFalse(payload["docker_access"])
         self.assertFalse(payload["database_access"])
