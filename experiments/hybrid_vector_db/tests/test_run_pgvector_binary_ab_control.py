@@ -73,6 +73,21 @@ def controller_args(temporary: str) -> object:
 
 
 class RunPgvectorBinaryAbControlTests(unittest.TestCase):
+    def test_dry_run_reports_the_requested_official_binary_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            args = controller_args(temporary)
+            requested_digest = "b" * 64
+            args.official_vector_so_sha256 = requested_digest
+
+            payload = controller.dry_run_payload(args)
+
+            self.assertEqual(
+                payload["official_pinned_vector_so_sha256"], requested_digest
+            )
+            self.assertEqual(
+                payload["official_requested_vector_so_sha256"], requested_digest
+            )
+
     def test_high_ef_controller_forwards_audited_ceiling_and_validity_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             args = controller_args(temporary)

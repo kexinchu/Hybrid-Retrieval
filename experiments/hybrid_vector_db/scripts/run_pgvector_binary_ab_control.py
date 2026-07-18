@@ -2071,7 +2071,7 @@ def dry_run_payload(args: argparse.Namespace) -> dict[str, Any]:
         "run_uuid": dry_uuid,
         "server_container": args.server_container,
         "manifest": str(manifest),
-        "official_pinned_vector_so_sha256": OFFICIAL_VECTOR_SO_SHA256,
+        "official_pinned_vector_so_sha256": args.official_vector_so_sha256,
         "official_requested_vector_so_sha256": args.official_vector_so_sha256,
         "max_ef_search": args.max_ef_search,
         "candidate_validity_predicate": args.candidate_validity_predicate,
