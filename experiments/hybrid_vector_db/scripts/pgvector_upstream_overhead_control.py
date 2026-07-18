@@ -32,7 +32,10 @@ DEFAULT_OUT_DIR = ROOT / "results/hybrid_vector_db"
 DEFAULT_TABLE = "public.amazon_grocery_reviews_10m_pgvector"
 DEFAULT_INDEX = "public.amazon_grocery_reviews_10m_pgvector_embedding_hnsw_idx"
 UPSTREAM_MAX_EF_SEARCH = 1000
-EVALUATION_MAX_EF_SEARCH = 10000
+EVALUATION_EF_PATCH_SHA256 = {
+    10_000: "d63b8d75015cffb90d9bd7f04d0c8f572502f0b84f77f59f581d224db7601bcf",
+    100_000: "2393fff3ac210d9fd19478ed7552db559359d19cdae693de51e42c71d04cf225",
+}
 DEFAULT_EF_VALUES = (250, 500, 750, UPSTREAM_MAX_EF_SEARCH)
 DEFAULT_BUDGET_RUNGS = (
     (1, 100_000, 1.0),
@@ -42,7 +45,6 @@ DEFAULT_BUDGET_RUNGS = (
 OFF_REPRESENTATIVE_MAX_SCAN = 100_000
 OFF_REPRESENTATIVE_SCAN_MEM = 1.0
 OFFICIAL_UPSTREAM_VECTOR_SO_SHA256 = "812292e3e7553c3dbe6a4187b528430a7f9c25693f4876b8d22f88829592a778"
-UPSTREAM_EF10000_PATCH_SHA256 = "d63b8d75015cffb90d9bd7f04d0c8f572502f0b84f77f59f581d224db7601bcf"
 DEFAULT_SQLENS_BUILD_PREFIX = "sqlens-v11-"
 DEFAULT_SQLENS_PROFILE_SEMANTICS = 4.0
 FORMAL_TARGET_RECALLS = (0.90, 0.95, 0.99)
@@ -340,15 +342,17 @@ def upstream_parameter_ceiling_provenance(
             "max_ef_search": UPSTREAM_MAX_EF_SEARCH,
             "patch_applied": False,
         }
-    if max_ef_search != EVALUATION_MAX_EF_SEARCH or patch_path is None:
+    expected_patch_sha256 = EVALUATION_EF_PATCH_SHA256.get(max_ef_search)
+    if expected_patch_sha256 is None or patch_path is None:
         raise ProvenanceGateError(
-            "the evaluation arm supports only max_ef_search=10000 with an explicit patch"
+            "an extended evaluation ceiling requires a supported max_ef_search "
+            "and its explicit canonical patch"
         )
     if not patch_path.is_file():
         raise ProvenanceGateError(f"upstream evaluation patch is missing: {patch_path}")
     patch_bytes = patch_path.read_bytes()
     patch_sha256 = hashlib.sha256(patch_bytes).hexdigest()
-    if patch_sha256 != UPSTREAM_EF10000_PATCH_SHA256:
+    if patch_sha256 != expected_patch_sha256:
         raise ProvenanceGateError(
             "upstream evaluation patch does not match the canonical ef_search-only patch"
         )
@@ -387,7 +391,7 @@ def upstream_parameter_ceiling_provenance(
         )
     return {
         "mode": "upstream_algorithm_evaluation_only_guc_ceiling_extension",
-        "max_ef_search": EVALUATION_MAX_EF_SEARCH,
+        "max_ef_search": max_ef_search,
         "patch_applied": True,
         "patch_path": str(patch_path.resolve()),
         "patch_sha256": patch_sha256,
@@ -1070,10 +1074,11 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
     )
     if getattr(args, "max_ef_search", 0) not in {
         UPSTREAM_MAX_EF_SEARCH,
-        EVALUATION_MAX_EF_SEARCH,
+        *EVALUATION_EF_PATCH_SHA256,
     }:
         raise ProvenanceGateError(
-            "formal max_ef_search must be the release limit 1000 or audited evaluation limit 10000"
+            "formal max_ef_search must be the release limit 1000 or an audited "
+            "evaluation limit (10000 or 100000)"
         )
     if args.max_ef_search > UPSTREAM_MAX_EF_SEARCH and args.config_ladder is None:
         raise ProvenanceGateError(
@@ -3606,12 +3611,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-ef-search",
         type=positive_int,
         default=UPSTREAM_MAX_EF_SEARCH,
-        help="Provenance-gated binary ceiling; formal values are 1000 or 10000.",
+        help="Provenance-gated binary ceiling; formal values are 1000, 10000, or 100000.",
     )
     parser.add_argument(
         "--upstream-evaluation-patch",
         type=Path,
-        help="Canonical two-line upstream patch required for official max_ef_search=10000.",
+        help="Canonical two-line upstream patch required for an extended official ceiling.",
     )
     parser.add_argument(
         "--candidate-validity-predicate",

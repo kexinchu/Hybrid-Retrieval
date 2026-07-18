@@ -32,9 +32,10 @@ from typing import Any, Mapping, Sequence
 OFFICIAL_VECTOR_SO_SHA256 = (
     "812292e3e7553c3dbe6a4187b528430a7f9c25693f4876b8d22f88829592a778"
 )
-UPSTREAM_EF10000_PATCH_SHA256 = (
-    "d63b8d75015cffb90d9bd7f04d0c8f572502f0b84f77f59f581d224db7601bcf"
-)
+UPSTREAM_EF_PATCH_SHA256 = {
+    10_000: "d63b8d75015cffb90d9bd7f04d0c8f572502f0b84f77f59f581d224db7601bcf",
+    100_000: "2393fff3ac210d9fd19478ed7552db559359d19cdae693de51e42c71d04cf225",
+}
 DEFAULT_SQLENS_BUILD_PREFIX = "sqlens-v11-"
 DEFAULT_SQLENS_PROFILE_SEMANTICS = 4.0
 RUNNER_PATH = Path(__file__).with_name("pgvector_upstream_overhead_control.py")
@@ -938,10 +939,10 @@ def finalize_ab_artifacts(
         ):
             raise FinalizationError("official arm does not use the pinned upstream binary")
     elif (
-        max_ef_search != 10000
+        max_ef_search not in UPSTREAM_EF_PATCH_SHA256
         or actual_official_digest == OFFICIAL_VECTOR_SO_SHA256
         or ceiling.get("algorithm_change") is not False
-        or ceiling.get("patch_sha256") != UPSTREAM_EF10000_PATCH_SHA256
+        or ceiling.get("patch_sha256") != UPSTREAM_EF_PATCH_SHA256[max_ef_search]
         or ceiling.get("changed_files") != ["src/hnsw.c", "src/hnsw.h"]
     ):
         raise FinalizationError(
@@ -1631,8 +1632,8 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
         raise ControllerError("formal target recalls must be exactly 0.90,0.95,0.99")
     if args.formal_family not in {"off", "strict_order"}:
         raise ControllerError("formal family must be off or strict_order")
-    if args.max_ef_search not in {1000, 10000}:
-        raise ControllerError("max_ef_search must be 1000 or 10000")
+    if args.max_ef_search not in {1000, *UPSTREAM_EF_PATCH_SHA256}:
+        raise ControllerError("max_ef_search must be 1000, 10000, or 100000")
     if any(
         marker in args.candidate_validity_predicate.lower()
         for marker in (";", "--", "/*", "*/")
@@ -1645,12 +1646,15 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
             raise ControllerError("release-limit official arm must not declare an evaluation patch")
     else:
         if args.config_ladder is None:
-            raise ControllerError("max_ef_search=10000 requires an explicit config ladder")
+            raise ControllerError("an extended max_ef_search requires an explicit config ladder")
         if args.official_vector_so_sha256 == OFFICIAL_VECTOR_SO_SHA256:
             raise ControllerError("ceiling-extended official-algorithm binary must have a new digest")
         if args.upstream_evaluation_patch is None or not args.upstream_evaluation_patch.is_file():
-            raise ControllerError("max_ef_search=10000 requires the canonical evaluation patch")
-        if sha256_file(args.upstream_evaluation_patch) != UPSTREAM_EF10000_PATCH_SHA256:
+            raise ControllerError("an extended max_ef_search requires the canonical evaluation patch")
+        if (
+            sha256_file(args.upstream_evaluation_patch)
+            != UPSTREAM_EF_PATCH_SHA256[args.max_ef_search]
+        ):
             raise ControllerError("upstream evaluation patch SHA256 is not canonical")
     if args.filter_names:
         raise ControllerError("formal controller runs always use the fixed 14-filter CSV")

@@ -1195,7 +1195,7 @@ index 7fc3671..e286039 100644
  	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
  
 diff --git a/src/hnsw.c b/src/hnsw.c
-index bfc92a1..3082ac9 100644
+index bfc92a1..19b4ebf 100644
 --- a/src/hnsw.c
 +++ b/src/hnsw.c
 @@ -6,7 +6,12 @@
@@ -1403,7 +1403,7 @@ index bfc92a1..3082ac9 100644
  
  	DefineCustomIntVariable("hnsw.ef_search", "Sets the size of the dynamic candidate list for search",
 -							"Valid range is 1..1000.", &hnsw_ef_search,
-+							"Valid range is 1..10000.", &hnsw_ef_search,
++							"Valid range is 1..100000.", &hnsw_ef_search,
  							HNSW_DEFAULT_EF_SEARCH, HNSW_MIN_EF_SEARCH, HNSW_MAX_EF_SEARCH, PGC_USERSET, 0, NULL, NULL, NULL);
  
  	DefineCustomEnumVariable("hnsw.iterative_scan", "Sets the mode for iterative scans",
@@ -1527,7 +1527,7 @@ index bfc92a1..3082ac9 100644
  	/* Never use index without order */
  	if (path->indexorderbys == NIL)
 diff --git a/src/hnsw.h b/src/hnsw.h
-index 841af0f..90d9528 100644
+index 841af0f..cbf09c2 100644
 --- a/src/hnsw.h
 +++ b/src/hnsw.h
 @@ -7,13 +7,17 @@
@@ -1543,7 +1543,7 @@ index 841af0f..90d9528 100644
  #include "utils/sampling.h"
  #include "vector.h"
  
-+#define SQLENS_BUILD_ID "sqlens-v11-bfs-locality-proof-20260718-r8"
++#define SQLENS_BUILD_ID "sqlens-v11-bfs-locality-proof-ef100000-20260718-r9"
 +
  #if PG_VERSION_NUM >= 190000
  typedef Pointer Item;
@@ -1553,7 +1553,7 @@ index 841af0f..90d9528 100644
  #define HNSW_DEFAULT_EF_SEARCH	40
  #define HNSW_MIN_EF_SEARCH		1
 -#define HNSW_MAX_EF_SEARCH		1000
-+#define HNSW_MAX_EF_SEARCH		10000
++#define HNSW_MAX_EF_SEARCH		100000
  
  /* Tuple types */
  #define HNSW_ELEMENT_TUPLE_TYPE  1
@@ -12025,7 +12025,7 @@ index 0000000..e69e865
 +  $$;
 +
 diff --git a/test/expected/hnsw_vector.out b/test/expected/hnsw_vector.out
-index cb4d8b9..0cdb399 100644
+index cb4d8b9..1625a73 100644
 --- a/test/expected/hnsw_vector.out
 +++ b/test/expected/hnsw_vector.out
 @@ -168,9 +168,9 @@ SHOW hnsw.ef_search;
@@ -12035,9 +12035,9 @@ index cb4d8b9..0cdb399 100644
 -ERROR:  0 is outside the valid range for parameter "hnsw.ef_search" (1 .. 1000)
 -SET hnsw.ef_search = 1001;
 -ERROR:  1001 is outside the valid range for parameter "hnsw.ef_search" (1 .. 1000)
-+ERROR:  0 is outside the valid range for parameter "hnsw.ef_search" (1 .. 10000)
-+SET hnsw.ef_search = 10001;
-+ERROR:  10001 is outside the valid range for parameter "hnsw.ef_search" (1 .. 10000)
++ERROR:  0 is outside the valid range for parameter "hnsw.ef_search" (1 .. 100000)
++SET hnsw.ef_search = 100001;
++ERROR:  100001 is outside the valid range for parameter "hnsw.ef_search" (1 .. 100000)
  SHOW hnsw.iterative_scan;
   hnsw.iterative_scan 
  ---------------------
@@ -12148,7 +12148,7 @@ index 0000000..1999f0c
 +
 +permutation "prepare_table" "take_old_snapshot" "hot_update" "build_source" "build_clone" "plan_with_old_snapshot" "finish_old_snapshot" "plan_with_fresh_snapshot"
 diff --git a/test/sql/hnsw_vector.sql b/test/sql/hnsw_vector.sql
-index a928ba4..e19b7b4 100644
+index a928ba4..b31b622 100644
 --- a/test/sql/hnsw_vector.sql
 +++ b/test/sql/hnsw_vector.sql
 @@ -99,7 +99,7 @@ CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (m = 16, ef_construction =
@@ -12156,7 +12156,7 @@ index a928ba4..e19b7b4 100644
  
  SET hnsw.ef_search = 0;
 -SET hnsw.ef_search = 1001;
-+SET hnsw.ef_search = 10001;
++SET hnsw.ef_search = 100001;
  
  SHOW hnsw.iterative_scan;
  

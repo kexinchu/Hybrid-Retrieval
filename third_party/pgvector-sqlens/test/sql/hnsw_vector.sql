@@ -99,7 +99,7 @@ CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (m = 16, ef_construction =
 SHOW hnsw.ef_search;
 
 SET hnsw.ef_search = 0;
-SET hnsw.ef_search = 10001;
+SET hnsw.ef_search = 100001;
 
 SHOW hnsw.iterative_scan;
 

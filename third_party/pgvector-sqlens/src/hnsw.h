@@ -16,7 +16,7 @@
 #include "utils/sampling.h"
 #include "vector.h"
 
-#define SQLENS_BUILD_ID "sqlens-v11-bfs-locality-proof-20260718-r8"
+#define SQLENS_BUILD_ID "sqlens-v11-bfs-locality-proof-ef100000-20260718-r9"
 
 #if PG_VERSION_NUM >= 190000
 typedef Pointer Item;
@@ -51,7 +51,7 @@ typedef Pointer Item;
 #define HNSW_MAX_EF_CONSTRUCTION		1000
 #define HNSW_DEFAULT_EF_SEARCH	40
 #define HNSW_MIN_EF_SEARCH		1
-#define HNSW_MAX_EF_SEARCH		10000
+#define HNSW_MAX_EF_SEARCH		100000
 
 /* Tuple types */
 #define HNSW_ELEMENT_TUPLE_TYPE  1

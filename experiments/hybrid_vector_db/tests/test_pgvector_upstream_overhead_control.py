@@ -142,7 +142,7 @@ class PgvectorUpstreamOverheadControlTests(unittest.TestCase):
         self.assertEqual(counts["final_query_upper_bound"], 25_200)
         self.assertEqual(counts["total_query_upper_bound"], 53_200)
 
-    def test_custom_ladder_rejects_sqlens_only_ef_values(self):
+    def test_custom_ladder_rejects_values_above_the_declared_ceiling(self):
         with self.assertRaisesRegex(ValueError, "official pgvector"):
             runner.config_from_mapping(
                 {
@@ -156,15 +156,41 @@ class PgvectorUpstreamOverheadControlTests(unittest.TestCase):
 
         accepted = runner.config_from_mapping(
             {
-                "ef_search": 10_000,
+                "ef_search": 100_000,
                 "iterative_scan": "strict_order",
                 "max_scan_tuples": 5_000_000,
                 "scan_mem_multiplier": 32,
                 "budget_rank": 3,
             },
-            max_ef_search=10_000,
+            max_ef_search=100_000,
         )
-        self.assertEqual(accepted.ef_search, 10_000)
+        self.assertEqual(accepted.ef_search, 100_000)
+
+    def test_ef100000_formal_ladder_uses_sparse_high_ef_anchors(self):
+        configs = runner.load_config_ladder(
+            Path(
+                "experiments/hybrid_vector_db/configs/"
+                "pgvector_v082_ef100000_formal_ladder.csv"
+            ),
+            max_ef_search=100_000,
+        )
+        high_ef_values = sorted(
+            {config.ef_search for config in configs if config.ef_search > 10_000}
+        )
+
+        self.assertEqual(
+            high_ef_values,
+            [15_000, 20_000, 30_000, 50_000, 75_000, 100_000],
+        )
+        self.assertEqual(max(config.ef_search for config in configs), 100_000)
+        self.assertTrue(
+            any(
+                config.ef_search == 100_000
+                and config.family == "strict_order"
+                and config.budget_rank == 3
+                for config in configs
+            )
+        )
 
     def test_candidate_validity_is_part_of_sql_but_not_the_workload_predicate(self):
         sql = runner.build_hybrid_sql(
@@ -182,7 +208,7 @@ class PgvectorUpstreamOverheadControlTests(unittest.TestCase):
             runner.build_hybrid_sql("public.items", "rating = 5", 10, "true; DROP")
 
     def test_upstream_evaluation_patch_must_equal_the_canonical_two_file_diff(self):
-        canonical = Path("patches/pgvector-v0.8.2-ef-search-10000.patch").read_bytes()
+        canonical = Path("patches/pgvector-v0.8.2-ef-search-100000.patch").read_bytes()
         with TemporaryDirectory() as temporary:
             source = Path(temporary) / "source"
             source.mkdir()
@@ -199,16 +225,48 @@ class PgvectorUpstreamOverheadControlTests(unittest.TestCase):
             ]
             with mock.patch.object(runner.subprocess, "run", side_effect=command_results):
                 proof = runner.upstream_parameter_ceiling_provenance(
-                    source, patch, 10_000
+                    source, patch, 100_000
                 )
 
             self.assertFalse(proof["algorithm_change"])
-            self.assertEqual(proof["patch_sha256"], runner.UPSTREAM_EF10000_PATCH_SHA256)
+            self.assertEqual(
+                proof["patch_sha256"], runner.EVALUATION_EF_PATCH_SHA256[100_000]
+            )
             self.assertEqual(proof["changed_files"], ["src/hnsw.c", "src/hnsw.h"])
 
             patch.write_bytes(canonical + b"\n")
             with self.assertRaisesRegex(runner.ProvenanceGateError, "canonical"):
-                runner.upstream_parameter_ceiling_provenance(source, patch, 10_000)
+                runner.upstream_parameter_ceiling_provenance(source, patch, 100_000)
+
+    def test_legacy_ef10000_patch_remains_provenance_valid(self):
+        canonical = Path("patches/pgvector-v0.8.2-ef-search-10000.patch")
+        with TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            source.mkdir()
+            with mock.patch.object(
+                runner.subprocess,
+                "run",
+                side_effect=[
+                    SimpleNamespace(
+                        returncode=0,
+                        stdout=canonical.read_bytes(),
+                        stderr=b"",
+                    ),
+                    SimpleNamespace(
+                        returncode=0,
+                        stdout="src/hnsw.c\nsrc/hnsw.h\n",
+                        stderr="",
+                    ),
+                    SimpleNamespace(returncode=0, stdout="", stderr=""),
+                ],
+            ):
+                proof = runner.upstream_parameter_ceiling_provenance(
+                    source, canonical, 10_000
+                )
+
+        self.assertEqual(
+            proof["patch_sha256"], runner.EVALUATION_EF_PATCH_SHA256[10_000]
+        )
 
     def test_promotion_includes_margin_winner_family_recall_and_max_budget_proofs(self):
         configs = [

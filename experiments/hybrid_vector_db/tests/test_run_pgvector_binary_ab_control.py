@@ -106,18 +106,20 @@ class RunPgvectorBinaryAbControlTests(unittest.TestCase):
             args = controller_args(temporary)
             patch = Path(temporary) / "ceiling.patch"
             patch.write_bytes(
-                Path("patches/pgvector-v0.8.2-ef-search-10000.patch").read_bytes()
+                Path("patches/pgvector-v0.8.2-ef-search-100000.patch").read_bytes()
             )
-            args.max_ef_search = 10_000
+            args.max_ef_search = 100_000
             args.upstream_evaluation_patch = patch
             args.config_ladder = Path(temporary) / "ladder.csv"
+            args.config_ladder.write_text("ef_search\n100000\n", encoding="utf-8")
             args.candidate_validity_predicate = "embedding_valid"
             args.official_vector_so_sha256 = "b" * 64
 
+            controller.validate_runtime_args(args)
             argv = controller.build_runner_argv(args, "official")
 
             self.assertIn("--max-ef-search", argv)
-            self.assertIn("10000", argv)
+            self.assertIn("100000", argv)
             self.assertIn("--upstream-evaluation-patch", argv)
             self.assertIn("--candidate-validity-predicate", argv)
             self.assertIn("embedding_valid", argv)
