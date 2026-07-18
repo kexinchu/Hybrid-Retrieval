@@ -23,6 +23,13 @@ from typing import Any, Iterable, Mapping, Sequence
 
 ARTIFACTS = ("raw", "calibration", "final", "summary")
 OUTPUT_SUFFIXES = {name: f"_{name}.csv" for name in ARTIFACTS}
+DATASET = "amazon10m"
+CANDIDATE_VALIDITY_PREDICATE = "embedding_valid"
+EXPECTED_CANDIDATE_ROWS = 9_979_556
+EXPECTED_TARGETS = (0.90, 0.95, 0.99)
+EXPECTED_CALIBRATION_QUERY_NOS = tuple(range(20, 100))
+EXPECTED_FINAL_QUERY_NOS = tuple(range(100, 200))
+SHA256_LENGTH = 64
 SHARD_LOCAL_RUN_FIELDS = {
     "filter_names",
     "out_dir",
@@ -148,7 +155,8 @@ def _required(label: str, value: Any, path: Path) -> Any:
     return value
 
 
-def _hash_value(manifest: Mapping[str, Any], *names: str) -> Any:
+def _hash_values(manifest: Mapping[str, Any], *names: str) -> list[Any]:
+    values: list[Any] = []
     for root_name in ("source_hashes", "input_hashes", "hashes"):
         root = manifest.get(root_name)
         if isinstance(root, Mapping):
@@ -158,12 +166,12 @@ def _hash_value(manifest: Mapping[str, Any], *names: str) -> Any:
                     if isinstance(value, Mapping):
                         value = value.get("sha256")
                     if value:
-                        return value
+                        values.append(value)
     for name in names:
         for root_name in ("faiss", "faiss_index", "fbin", "truth", "ground_truth"):
             root = manifest.get(root_name)
             if root_name == name and isinstance(root, Mapping) and root.get("sha256"):
-                return root["sha256"]
+                values.append(root["sha256"])
         for root_name in ("inputs", "input_artifacts"):
             root = manifest.get(root_name)
             if isinstance(root, Mapping) and name in root:
@@ -171,8 +179,8 @@ def _hash_value(manifest: Mapping[str, Any], *names: str) -> Any:
                 if isinstance(value, Mapping):
                     value = value.get("sha256")
                 if value:
-                    return value
-    return None
+                    values.append(value)
+    return values
 
 
 def _args_value(manifest: Mapping[str, Any], *names: str) -> Any:
@@ -207,6 +215,161 @@ def _normal_targets(value: Any, path: Path) -> list[float]:
     return result
 
 
+def _normal_query_nos(value: Any, label: str, path: Path) -> list[int]:
+    try:
+        result = [int(item) for item in _list_contract_value(value, label, path)]
+    except (TypeError, ValueError) as exc:
+        raise ValidationFailure(f"{path}: invalid {label}") from exc
+    if result != sorted(set(result)):
+        raise ValidationFailure(f"{path}: {label} must be sorted and unique")
+    return result
+
+
+def _sha256(value: Any, label: str, path: Path) -> str:
+    digest = str(_required(label, value, path)).lower()
+    if len(digest) != SHA256_LENGTH or any(character not in "0123456789abcdef" for character in digest):
+        raise ValidationFailure(f"{path}: {label} is not a SHA256 digest")
+    return digest
+
+
+def _consistent_hash(
+    manifest_path: Path, manifest: Mapping[str, Any], label: str, *names: str
+) -> str:
+    values = [_sha256(value, label, manifest_path) for value in _hash_values(manifest, *names)]
+    if not values:
+        raise ValidationFailure(f"{manifest_path}: missing provenance field {label}")
+    if len(set(values)) != 1:
+        raise ValidationFailure(f"{manifest_path}: conflicting {label} attestations")
+    return values[0]
+
+
+def _candidate_universe(manifest_path: Path, manifest: Mapping[str, Any]) -> dict[str, Any]:
+    predicate_values = [
+        value
+        for value in (
+            _first(manifest, ("candidate_validity_predicate",)),
+            _first(manifest, ("candidate_universe", "predicate")),
+            _first(manifest, ("run_contract", "candidate_universe", "predicate")),
+            _first(manifest, ("args", "candidate_validity_predicate")),
+            _first(manifest, ("postgres", "candidate_universe", "predicate")),
+            _first(manifest, ("service", "candidate_universe", "predicate")),
+        )
+        if value is not None
+    ]
+    if not predicate_values:
+        raise ValidationFailure(f"{manifest_path}: missing candidate universe predicate")
+    normalized = {" ".join(str(value).strip().split()) for value in predicate_values}
+    if normalized != {CANDIDATE_VALIDITY_PREDICATE}:
+        raise ValidationFailure(
+            f"{manifest_path}: candidate universe must be {CANDIDATE_VALIDITY_PREDICATE!r}"
+        )
+
+    expected_values = [
+        value
+        for value in (
+            _first(manifest, ("candidate_universe", "expected_rows")),
+            _first(manifest, ("run_contract", "candidate_universe", "expected_rows")),
+            _first(manifest, ("config", "candidate_universe", "expected_rows")),
+        )
+        if value is not None
+    ]
+    observed_values = [
+        value
+        for value in (
+            _first(manifest, ("candidate_universe", "observed_rows")),
+            _first(manifest, ("config", "candidate_universe", "observed_rows")),
+            _first(manifest, ("postgres", "candidate_universe", "rows")),
+            _first(manifest, ("service", "candidate_universe", "count")),
+        )
+        if value is not None
+    ]
+    for label, values in (("expected", expected_values), ("observed", observed_values)):
+        for value in values:
+            try:
+                rows = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValidationFailure(
+                    f"{manifest_path}: candidate universe {label} rows is not an integer"
+                ) from exc
+            if rows != EXPECTED_CANDIDATE_ROWS:
+                raise ValidationFailure(
+                    f"{manifest_path}: candidate universe {label} rows must be "
+                    f"{EXPECTED_CANDIDATE_ROWS}, got {rows}"
+                )
+    return {
+        "predicate": CANDIDATE_VALIDITY_PREDICATE,
+        "expected_rows": EXPECTED_CANDIDATE_ROWS,
+        "observed_rows": EXPECTED_CANDIDATE_ROWS if observed_values else None,
+    }
+
+
+def _query_splits(manifest_path: Path, manifest: Mapping[str, Any]) -> dict[str, Any]:
+    split_values = [
+        value
+        for value in (
+            _first(manifest, ("query_splits",)),
+            _first(manifest, ("run_contract", "query_splits")),
+        )
+        if value is not None
+    ]
+    if not split_values or any(not isinstance(value, Mapping) for value in split_values):
+        raise ValidationFailure(f"{manifest_path}: missing query_splits")
+    normalized_values: list[dict[str, Any]] = []
+    for splits in split_values:
+        calibration = _normal_query_nos(
+            _first(splits, ("calibration_query_nos",), ("calibration", "query_nos")),
+            "calibration query cohort",
+            manifest_path,
+        )
+        final = _normal_query_nos(
+            _first(splits, ("final_query_nos",), ("final", "query_nos")),
+            "final query cohort",
+            manifest_path,
+        )
+        if calibration != list(EXPECTED_CALIBRATION_QUERY_NOS):
+            raise ValidationFailure(f"{manifest_path}: calibration cohort is not exactly q20..99")
+        if final != list(EXPECTED_FINAL_QUERY_NOS):
+            raise ValidationFailure(f"{manifest_path}: final cohort is not exactly q100..199")
+        if set(calibration) & set(final):
+            raise ValidationFailure(f"{manifest_path}: calibration and final cohorts overlap")
+        normalized_values.append({
+            "reserved_query_nos": list(range(20)),
+            "calibration_query_nos": calibration,
+            "final_query_nos": final,
+            "query_no_overlap": False,
+        })
+    if any(_json(value) != _json(normalized_values[0]) for value in normalized_values[1:]):
+        raise ValidationFailure(f"{manifest_path}: conflicting query split attestations")
+    return normalized_values[0]
+
+
+def _latency_scope(manifest_path: Path, manifest: Mapping[str, Any]) -> dict[str, str]:
+    values = [
+        value
+        for value in (
+            _first(manifest, ("latency_scope",)),
+            _first(manifest, ("latency_definition",)),
+            _first(manifest, ("execution", "latency")),
+            _first(manifest, ("run_contract", "latency_scope")),
+        )
+        if value is not None
+    ]
+    if not values:
+        raise ValidationFailure(f"{manifest_path}: missing provenance field latency scope")
+    scopes: list[str] = []
+    for value in values:
+        text = str(value).strip().lower().replace("-", "_")
+        if "search_only" in text or "search only" in text:
+            scopes.append("search_only")
+        elif "end_to_end" in text or "end to end" in text or "e2e" in text:
+            scopes.append("end_to_end")
+        else:
+            raise ValidationFailure(f"{manifest_path}: unsupported latency scope {value!r}")
+    if len(set(scopes)) != 1:
+        raise ValidationFailure(f"{manifest_path}: conflicting latency scope attestations")
+    return {"scope": scopes[0], "definition": str(values[0])}
+
+
 def _normal_ef(value: Any, path: Path) -> list[int]:
     result = sorted({int(item) for item in _list_contract_value(value, "ef ladder", path)})
     if any(item <= 0 for item in result):
@@ -231,9 +394,9 @@ def _contract(manifest_path: Path, manifest: Mapping[str, Any]) -> dict[str, Any
 
     source_db = _first(
         manifest,
+        ("postgres",),
         ("source_db",),
         ("provenance", "source_db"),
-        ("postgres",),
         ("inputs", "source_db"),
     )
     if source_db is None:
@@ -242,13 +405,29 @@ def _contract(manifest_path: Path, manifest: Mapping[str, Any]) -> dict[str, Any
             "postgres": manifest.get("postgres"),
         }
     _required("source_db", source_db, manifest_path)
+    if not isinstance(source_db, Mapping) or not source_db.get("server_version"):
+        raise ValidationFailure(
+            f"{manifest_path}: PostgreSQL binary provenance lacks server_version"
+        )
 
-    faiss_hash = _required("faiss sha256", _hash_value(manifest, "faiss", "faiss_index"), manifest_path)
-    fbin_hash = _required("fbin sha256", _hash_value(manifest, "fbin", "vectors"), manifest_path)
-    truth_hash = _required("truth sha256", _hash_value(manifest, "truth", "ground_truth"), manifest_path)
+    faiss_hash = _consistent_hash(
+        manifest_path, manifest, "faiss sha256", "faiss", "faiss_index"
+    )
+    fbin_hash = _consistent_hash(
+        manifest_path, manifest, "fbin sha256", "fbin", "vectors"
+    )
+    truth_hash = _consistent_hash(
+        manifest_path, manifest, "truth sha256", "truth", "ground_truth"
+    )
+    runner_hash = _consistent_hash(
+        manifest_path,
+        manifest,
+        "measurement runner sha256",
+        "runner",
+        "measurement_runner",
+    )
 
-    splits = _first(manifest, ("query_splits",), ("run_contract", "query_splits"))
-    _required("query_splits", splits, manifest_path)
+    splits = _query_splits(manifest_path, manifest)
     calibration_repeats = _first(
         manifest,
         ("repeats", "calibration"),
@@ -263,33 +442,65 @@ def _contract(manifest_path: Path, manifest: Mapping[str, Any]) -> dict[str, Any
     )
     _required("calibration repeats", calibration_repeats, manifest_path)
     _required("final repeats", final_repeats, manifest_path)
-    targets = _first(
-        manifest,
-        ("target_recalls",),
-        ("run_contract", "target_recalls"),
-        ("args", "target_recalls"),
-    )
+    target_values = [
+        value
+        for value in (
+            _first(manifest, ("target_recalls",)),
+            _first(manifest, ("run_contract", "target_recalls")),
+            _first(manifest, ("args", "target_recalls")),
+        )
+        if value is not None
+    ]
     ef_ladder = _first(
         manifest,
         ("ef_ladder",),
         ("run_contract", "ef_ladder"),
         ("args", "ef_search_values"),
     )
-    _required("target_recalls", targets, manifest_path)
+    if not target_values:
+        raise ValidationFailure(f"{manifest_path}: missing provenance field target_recalls")
     _required("ef ladder", ef_ladder, manifest_path)
     environment = _first(manifest, ("software_versions",), ("environment",))
     _required("software versions", environment, manifest_path)
+    target_evidence = [_normal_targets(value, manifest_path) for value in target_values]
+    if any(value != list(EXPECTED_TARGETS) for value in target_evidence):
+        raise ValidationFailure(
+            f"{manifest_path}: target recalls must be exactly {list(EXPECTED_TARGETS)}"
+        )
+    normalized_targets = target_evidence[0]
+    candidate_universe = _candidate_universe(manifest_path, manifest)
+    latency = _latency_scope(manifest_path, manifest)
+    faiss_index = _first(manifest, ("faiss_index",), ("inputs", "faiss_index"))
+    _required("faiss index provenance", faiss_index, manifest_path)
 
     return {
+        "dataset": DATASET,
         "run_contract": run_contract,
         "source_db": source_db,
-        "faiss_sha256": str(faiss_hash),
-        "fbin_sha256": str(fbin_hash),
-        "truth_sha256": str(truth_hash),
+        "binary_provenance": {
+            "source_db": source_db,
+            "faiss_index": faiss_index,
+            "faiss_sha256": faiss_hash,
+        },
+        "runner_provenance": {
+            "measurement_runner_sha256": runner_hash,
+            "software_versions": environment,
+        },
+        "source_hashes": {
+            "runner": runner_hash,
+            "faiss": faiss_hash,
+            "fbin": fbin_hash,
+            "truth": truth_hash,
+        },
+        "candidate_universe": candidate_universe,
+        "latency": latency,
+        "faiss_sha256": faiss_hash,
+        "fbin_sha256": fbin_hash,
+        "truth_sha256": truth_hash,
         "query_splits": splits,
         "calibration_repeats": int(calibration_repeats),
         "final_repeats": int(final_repeats),
-        "target_recalls": _normal_targets(targets, manifest_path),
+        "target_recalls": normalized_targets,
         "ef_ladder": _normal_ef(ef_ladder, manifest_path),
         "software_versions": environment,
     }
@@ -537,7 +748,26 @@ def combine(input_manifests: Sequence[Path], expected_filters_csv: Path, out_pre
             "artifact_valid": True,
             "status": "complete",
             "validation_errors": [],
+            "dataset": DATASET,
             "filters": expected,
+            "filter_names": expected,
+            "target_recalls": reference_contract["target_recalls"],
+            "query_splits": reference_contract["query_splits"],
+            "query_cohort": {
+                "calibration_query_nos": reference_contract["query_splits"]["calibration_query_nos"],
+                "query_nos": reference_contract["query_splits"]["final_query_nos"],
+                "gt_hash": reference_contract["truth_sha256"],
+            },
+            "candidate_validity_predicate": CANDIDATE_VALIDITY_PREDICATE,
+            "candidate_universe": reference_contract["candidate_universe"],
+            "latency_scope": reference_contract["latency"]["scope"],
+            "latency_definition": reference_contract["latency"]["definition"],
+            "source_hashes": reference_contract["source_hashes"],
+            "measurement_runner_sha256": reference_contract["source_hashes"]["runner"],
+            "software_versions": reference_contract["software_versions"],
+            "source_db": reference_contract["source_db"],
+            "binary_provenance": reference_contract["binary_provenance"],
+            "runner_provenance": reference_contract["runner_provenance"],
             "input_manifests": [
                 {
                     "path": item["manifest"],

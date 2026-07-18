@@ -28,7 +28,12 @@ from typing import Any, Iterable, Mapping, Sequence
 EXPECTED_SHARDS = 4
 EXPECTED_FILTERS = 14
 EXPECTED_ROWS = 10_000_000
+EXPECTED_CANDIDATE_ROWS = 9_979_556
+DATASET = "amazon10m"
+CANDIDATE_VALIDITY_PREDICATE = "embedding_valid"
 EXPECTED_TARGETS = (0.90, 0.95, 0.99)
+EXPECTED_CALIBRATION_QUERY_NOS = tuple(range(20, 100))
+EXPECTED_FINAL_QUERY_NOS = tuple(range(100, 200))
 EXPECTED_K = 10
 MANIFEST_PATTERN = "weaviate_production_matched_recall_*_manifest.json"
 DATA_OUTPUTS = ("raw_csv", "summary_csv", "schema_json", "config_json")
@@ -43,6 +48,7 @@ OUTPUT_SUFFIXES = {
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 IMAGE_DIGEST_RE = re.compile(r"^(?:[^@\s]+@)?sha256:[0-9a-f]{64}$")
 LATENCY_DEFINITION = "end_to_end_http_json_parse_row_id_transfer"
+LATENCY_SCOPE = "end_to_end"
 QPS_DEFINITION = "single_client_sequential_completed_requests_per_measured_service_time"
 RECALL_CONTRACT = "distance_threshold_tie_aware_v1"
 MEASUREMENT_MODE = "single_client_sequential"
@@ -320,6 +326,89 @@ def _normal_int_list(value: Any, label: str, *, allow_zero: bool = False) -> lis
     return result
 
 
+def _candidate_universe(
+    manifest_path: Path, manifest: Mapping[str, Any], config: Mapping[str, Any]
+) -> dict[str, Any]:
+    manifest_value = manifest.get("candidate_universe")
+    service = _mapping(manifest.get("service"), f"{manifest_path}: service")
+    service_value = service.get("candidate_universe")
+    config_value = config.get("candidate_universe")
+    attestations = [
+        ("manifest.candidate_universe", manifest_value),
+        ("service.candidate_universe", service_value),
+        ("config.candidate_universe", config_value),
+    ]
+    mappings: list[tuple[str, Mapping[str, Any]]] = []
+    for label, value in attestations:
+        if value is not None:
+            mappings.append((label, _mapping(value, f"{manifest_path}: {label}")))
+    if not mappings:
+        raise ValidationFailure(f"{manifest_path}: candidate universe attestation is missing")
+
+    observed = False
+    for label, value in mappings:
+        if "predicate" in value:
+            predicate = " ".join(str(value["predicate"]).strip().split())
+            if predicate != CANDIDATE_VALIDITY_PREDICATE:
+                raise ValidationFailure(
+                    f"{manifest_path}: {label}.predicate must be "
+                    f"{CANDIDATE_VALIDITY_PREDICATE!r}"
+                )
+        for row_field in ("expected_rows", "observed_rows", "rows", "count"):
+            if row_field not in value:
+                continue
+            _exact_int(
+                value[row_field],
+                EXPECTED_CANDIDATE_ROWS,
+                f"{manifest_path}: {label}.{row_field}",
+            )
+            if row_field in {"observed_rows", "rows", "count"}:
+                observed = True
+
+    predicates = {
+        " ".join(str(value.get("predicate", "")).strip().split())
+        for _, value in mappings
+        if value.get("predicate") is not None
+    }
+    if predicates != {CANDIDATE_VALIDITY_PREDICATE}:
+        raise ValidationFailure(
+            f"{manifest_path}: every candidate universe attestation must identify "
+            f"{CANDIDATE_VALIDITY_PREDICATE!r}"
+        )
+    return {
+        "predicate": CANDIDATE_VALIDITY_PREDICATE,
+        "expected_rows": EXPECTED_CANDIDATE_ROWS,
+        "observed_rows": EXPECTED_CANDIDATE_ROWS if observed else None,
+    }
+
+
+def _query_cohorts(
+    manifest_path: Path, config: Mapping[str, Any]
+) -> dict[str, list[int] | bool]:
+    calibration = _mapping(config.get("calibration"), f"{manifest_path}: config.calibration")
+    final = _mapping(config.get("final"), f"{manifest_path}: config.final")
+    calibration_query_nos = _normal_int_list(
+        calibration.get("query_nos"),
+        f"{manifest_path}: config.calibration.query_nos",
+        allow_zero=True,
+    )
+    final_query_nos = _normal_int_list(
+        final.get("query_nos"),
+        f"{manifest_path}: config.final.query_nos",
+        allow_zero=True,
+    )
+    if calibration_query_nos != list(EXPECTED_CALIBRATION_QUERY_NOS):
+        raise ValidationFailure(f"{manifest_path}: calibration cohort is not exactly q20..99")
+    if final_query_nos != list(EXPECTED_FINAL_QUERY_NOS):
+        raise ValidationFailure(f"{manifest_path}: final cohort is not exactly q100..199")
+    return {
+        "reserved_query_nos": list(range(20)),
+        "calibration_query_nos": calibration_query_nos,
+        "final_query_nos": final_query_nos,
+        "query_no_overlap": False,
+    }
+
+
 def _run_contract(
     manifest_path: Path,
     manifest: Mapping[str, Any],
@@ -375,7 +464,11 @@ def _run_contract(
     calibration = _mapping(config.get("calibration"), f"{manifest_path}: config.calibration")
     final = _mapping(config.get("final"), f"{manifest_path}: config.final")
     checkpoint = _mapping(config.get("checkpoint"), f"{manifest_path}: config.checkpoint")
-    _exact_int(calibration.get("queries"), 100, f"{manifest_path}: calibration.queries")
+    _exact_int(
+        calibration.get("queries"),
+        len(EXPECTED_CALIBRATION_QUERY_NOS),
+        f"{manifest_path}: calibration.queries",
+    )
     _exact_int(calibration.get("repeats"), 2, f"{manifest_path}: calibration.repeats")
     _exact_int(final.get("queries"), 100, f"{manifest_path}: final.queries")
     _exact_int(final.get("repeats"), 5, f"{manifest_path}: final.repeats")
@@ -449,7 +542,7 @@ def _run_contract(
         "service_identity": dict(identity),
         "measurement_mode": MEASUREMENT_MODE,
         "calibration": {
-            "queries": 100,
+            "queries": len(EXPECTED_CALIBRATION_QUERY_NOS),
             "repeats": 2,
             "schedule_order": calibration["schedule_order"],
             "selection_rule": calibration["selection_rule"],
@@ -466,6 +559,21 @@ def _run_contract(
         raise ValidationFailure(f"{manifest_path}: config.git_revision is missing")
     if manifest.get("git_revision") != contract["git_revision"]:
         raise ValidationFailure(f"{manifest_path}: git_revision does not match config")
+    contract["dataset"] = DATASET
+    contract["candidate_universe"] = _candidate_universe(manifest_path, manifest, config)
+    contract["query_splits"] = _query_cohorts(manifest_path, config)
+    contract["latency_scope"] = LATENCY_SCOPE
+    contract["latency_definition"] = LATENCY_DEFINITION
+    contract["runner_provenance"] = {
+        "runner_sha256": source_hashes["runner"],
+        "baseline_runner_sha256": source_hashes["baseline_runner"],
+        "git_revision": contract["git_revision"],
+    }
+    contract["service_provenance"] = {
+        "version": identity["actual_version"],
+        "expected_version": identity["expected_version"],
+        "service_image_digest": identity["service_image_digest"],
+    }
     return filters, contract
 
 
@@ -535,8 +643,16 @@ def _validate_raw_rows(
         if phase == "final":
             final_blocks.add(block)
     for block, pairs in block_pairs.items():
-        expected_queries, expected_repeats = (100, 2) if block[0] == "calibration" else (100, 5)
-        expected_query_nos = range(0, 100) if block[0] == "calibration" else range(100, 200)
+        expected_queries, expected_repeats = (
+            (len(EXPECTED_CALIBRATION_QUERY_NOS), 2)
+            if block[0] == "calibration"
+            else (len(EXPECTED_FINAL_QUERY_NOS), 5)
+        )
+        expected_query_nos = (
+            EXPECTED_CALIBRATION_QUERY_NOS
+            if block[0] == "calibration"
+            else EXPECTED_FINAL_QUERY_NOS
+        )
         expected_pairs = {
             (query_no, repeat)
             for query_no in expected_query_nos
@@ -636,7 +752,11 @@ def _validate_summary_rows(
         observed_samples = int(row["observed_samples"])
         if expected_samples != expected_queries * expected_repeats or observed_samples != expected_samples:
             raise ValidationFailure(f"{manifest_path}: summary row {number} sample pairs are incomplete")
-        expected_contract = (100, 2) if phase == "calibration" else (100, 5)
+        expected_contract = (
+            (len(EXPECTED_CALIBRATION_QUERY_NOS), 2)
+            if phase == "calibration"
+            else (len(EXPECTED_FINAL_QUERY_NOS), 5)
+        )
         if (expected_queries, expected_repeats) != expected_contract:
             raise ValidationFailure(
                 f"{manifest_path}: summary row {number} query/repeat contract changed"
@@ -1042,10 +1162,17 @@ def combine(
     ]
     combined_config = {
         "artifact": "weaviate_production_matched_recall_combined",
+        "dataset": DATASET,
         "source_hashes": reference_contract["source_hashes"],
         "run_contract": reference_contract,
         "filter_names": expected_filters,
         "targets": list(EXPECTED_TARGETS),
+        "candidate_universe": reference_contract["candidate_universe"],
+        "query_splits": reference_contract["query_splits"],
+        "latency_scope": LATENCY_SCOPE,
+        "latency_definition": LATENCY_DEFINITION,
+        "runner_provenance": reference_contract["runner_provenance"],
+        "service_provenance": reference_contract["service_provenance"],
         "target_records": target_records,
         "input_shards": [
             {
@@ -1103,23 +1230,43 @@ def combine(
             "status": "complete",
             "manifest_commit": "atomic_last",
             "validation_errors": [],
+            "dataset": DATASET,
             "source_hashes": reference_contract["source_hashes"],
+            "measurement_runner_sha256": reference_contract["source_hashes"]["runner"],
             "expected_filters_csv": {
                 "path": str(Path(expected_filters_csv).resolve()),
                 "sha256": expected_filters_sha256,
             },
             "run_contract": reference_contract,
+            "candidate_validity_predicate": CANDIDATE_VALIDITY_PREDICATE,
+            "candidate_universe": reference_contract["candidate_universe"],
+            "query_splits": reference_contract["query_splits"],
+            "query_cohort": {
+                "calibration_query_nos": reference_contract["query_splits"]["calibration_query_nos"],
+                "query_nos": reference_contract["query_splits"]["final_query_nos"],
+                "gt_hash": reference_contract["source_hashes"]["truth_csv"],
+            },
+            "latency_scope": LATENCY_SCOPE,
+            "latency_definition": LATENCY_DEFINITION,
+            "runner_provenance": reference_contract["runner_provenance"],
+            "service_provenance": reference_contract["service_provenance"],
+            "software_versions": {
+                "measurement_runner_sha256": reference_contract["source_hashes"]["runner"],
+                "baseline_runner_sha256": reference_contract["source_hashes"]["baseline_runner"],
+            },
             "service": {
                 "version": reference_contract["service_identity"]["actual_version"],
                 "expected_version": reference_contract["service_identity"]["expected_version"],
                 "version_gate_passed": True,
                 "image_digest": reference_contract["service_identity"]["service_image_digest"],
                 "count": EXPECTED_ROWS,
+                "candidate_universe": reference_contract["candidate_universe"],
                 "measurement_mode": MEASUREMENT_MODE,
                 "concurrency": 1,
                 "errors": [],
             },
             "filter_names": expected_filters,
+            "target_recalls": list(EXPECTED_TARGETS),
             "calibration_selection": {
                 "targets": target_records,
                 "scope": "exactly one explicit status per filter/target",

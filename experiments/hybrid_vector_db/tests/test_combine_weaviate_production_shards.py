@@ -17,6 +17,16 @@ combiner = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = combiner
 SPEC.loader.exec_module(combiner)
 
+FINALIZER_SCRIPT = ROOT / "experiments/hybrid_vector_db/scripts/finalize_sqlens_matched_recall_comparison.py"
+FINALIZER_SPEC = importlib.util.spec_from_file_location(
+    "finalize_sqlens_matched_recall_comparison_for_weaviate_combiner_test",
+    FINALIZER_SCRIPT,
+)
+assert FINALIZER_SPEC and FINALIZER_SPEC.loader
+finalizer = importlib.util.module_from_spec(FINALIZER_SPEC)
+sys.modules[FINALIZER_SPEC.name] = finalizer
+FINALIZER_SPEC.loader.exec_module(finalizer)
+
 
 RAW_FIELDS = [
     "phase", "configured_filter_strategy", "filter_name", "ef", "flat_search_cutoff",
@@ -83,7 +93,11 @@ def raw_row(phase, name, query_no, repeat):
 
 def summary_row(phase, name, target="N/A"):
     final = phase == "final"
-    expected_queries = 100
+    expected_queries = (
+        len(combiner.EXPECTED_FINAL_QUERY_NOS)
+        if final
+        else len(combiner.EXPECTED_CALIBRATION_QUERY_NOS)
+    )
     expected_repeats = 5 if final else 2
     row = {
         "phase": phase,
@@ -170,6 +184,11 @@ class Fixture:
             "vector_rows": 10_000_000,
             "dimensions": 128,
             "k": 10,
+            "candidate_universe": {
+                "predicate": "embedding_valid",
+                "expected_rows": 9_979_556,
+                "observed_rows": 9_979_556,
+            },
             "configured_filter_strategies": ["acorn", "sweeping"],
             "filter_names": filters,
             "ef_values": [100, 250],
@@ -183,12 +202,14 @@ class Fixture:
             },
             "measurement_mode": "single_client_sequential",
             "calibration": {
-                "queries": 100,
+                "query_nos": list(combiner.EXPECTED_CALIBRATION_QUERY_NOS),
+                "queries": len(combiner.EXPECTED_CALIBRATION_QUERY_NOS),
                 "repeats": 2,
                 "schedule_order": "all flat representatives before HNSW",
                 "selection_rule": "fastest measured LCB-qualified configuration",
             },
             "final": {
+                "query_nos": list(combiner.EXPECTED_FINAL_QUERY_NOS),
                 "queries": 100,
                 "repeats": 5,
                 "deduplication_key": [
@@ -225,7 +246,7 @@ class Fixture:
         for name in filters:
             raw_rows.extend(
                 raw_row("calibration", name, query_no, repeat)
-                for query_no in range(100)
+                for query_no in combiner.EXPECTED_CALIBRATION_QUERY_NOS
                 for repeat in range(2)
             )
             raw_rows.extend(
@@ -275,6 +296,10 @@ class Fixture:
                 "version_gate_passed": True,
                 "image_digest": image_digest,
                 "count": 10_000_000,
+                "candidate_universe": {
+                    "predicate": "embedding_valid",
+                    "count": 9_979_556,
+                },
                 "filter_counts": {name: 1000 + offset for offset, name in enumerate(filters)},
                 "measurement_mode": "single_client_sequential",
                 "concurrency": 1,
@@ -358,6 +383,32 @@ class CombineWeaviateProductionShardsTests(unittest.TestCase):
             self.assertEqual(manifest["status"], "complete")
             self.assertEqual(len(manifest["input_shards"]), 4)
             self.assertEqual(len(manifest["filter_names"]), 14)
+            self.assertEqual(manifest["dataset"], "amazon10m")
+            self.assertEqual(manifest["target_recalls"], [0.90, 0.95, 0.99])
+            self.assertEqual(manifest["latency_scope"], "end_to_end")
+            self.assertEqual(
+                manifest["query_splits"]["calibration_query_nos"], list(range(20, 100))
+            )
+            self.assertEqual(
+                manifest["query_splits"]["final_query_nos"], list(range(100, 200))
+            )
+            self.assertEqual(manifest["query_cohort"]["gt_hash"], digest("truth"))
+            self.assertEqual(manifest["candidate_universe"], {
+                "predicate": "embedding_valid",
+                "expected_rows": 9_979_556,
+                "observed_rows": 9_979_556,
+            })
+            self.assertEqual(manifest["service_provenance"]["version"], "1.38.0")
+            self.assertEqual(manifest["measurement_runner_sha256"], digest("runner"))
+            finalizer._validate_metadata(
+                manifest,
+                [name for group in SHARD_FILTERS for name in group],
+                combiner.EXPECTED_TARGETS,
+                digest("truth"),
+                "end_to_end",
+            )
+            provenance = finalizer._provenance(manifest, "weaviate_production")
+            self.assertEqual(provenance["runner_sha256"], digest("runner"))
             self.assertEqual(len(manifest["calibration_selection"]["targets"]), 42)
             self.assertEqual(manifest["target_outcomes"]["unattainable_on_grid"], 1)
             self.assertEqual(
@@ -444,6 +495,76 @@ class CombineWeaviateProductionShardsTests(unittest.TestCase):
             rows.pop()
             write_csv(fixture.filters_csv, fields, rows)
             with self.assertRaisesRegex(combiner.ValidationFailure, "exactly 14"):
+                combiner.combine(fixture.manifests, fixture.filters_csv, fixture.out_prefix)
+
+    def test_rejects_candidate_cohort_target_gt_runner_and_latency_mismatches(self):
+        mutations = {
+            "candidate predicate": lambda config: config["candidate_universe"].update(
+                {"predicate": "has_vector"}
+            ),
+            "candidate rows": lambda config: config["candidate_universe"].update(
+                {"observed_rows": 9_979_555}
+            ),
+            "calibration cohort": lambda config: config["calibration"].update(
+                {"query_nos": list(range(21, 100))}
+            ),
+            "final cohort": lambda config: config["final"].update(
+                {"query_nos": list(range(99, 199))}
+            ),
+            "targets": lambda config: config.update({"targets": [0.90, 0.95]}),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                fixture = Fixture(tmp)
+                manifest = fixture.manifest(0)
+                config = read_json(Path(manifest["outputs"]["config_json"]))
+                mutate(config)
+                fixture.rewrite_output(0, "config_json", config)
+                with self.assertRaises(combiner.ValidationFailure):
+                    combiner.combine(fixture.manifests, fixture.filters_csv, fixture.out_prefix)
+
+        for source_name in ("truth_csv", "runner", "baseline_runner"):
+            with self.subTest(source_hash=source_name), tempfile.TemporaryDirectory() as tmp:
+                fixture = Fixture(tmp)
+                manifest = fixture.manifest(1)
+                changed = digest(f"changed-{source_name}")
+                manifest["source_hashes"][source_name] = changed
+                config = read_json(Path(manifest["outputs"]["config_json"]))
+                config["source_hashes"][source_name] = changed
+                fixture.rewrite_output(1, "config_json", config)
+                schema = read_json(Path(manifest["outputs"]["schema_json"]))
+                schema["source_hashes"][source_name] = changed
+                fixture.rewrite_output(1, "schema_json", schema)
+                manifest = fixture.manifest(1)
+                manifest["source_hashes"][source_name] = changed
+                fixture.rewrite_manifest(1, manifest)
+                with self.assertRaisesRegex(combiner.ValidationFailure, "run contract"):
+                    combiner.combine(fixture.manifests, fixture.filters_csv, fixture.out_prefix)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Fixture(tmp)
+            manifest = fixture.manifest(1)
+            manifest["service"].update({"version": "1.39.0", "expected_version": "1.39.0"})
+            config = read_json(Path(manifest["outputs"]["config_json"]))
+            config["service_identity"].update({
+                "actual_version": "1.39.0", "expected_version": "1.39.0",
+            })
+            fixture.rewrite_output(1, "config_json", config)
+            manifest = fixture.manifest(1)
+            manifest["service"].update({"version": "1.39.0", "expected_version": "1.39.0"})
+            fixture.rewrite_manifest(1, manifest)
+            with self.assertRaisesRegex(combiner.ValidationFailure, "run contract"):
+                combiner.combine(fixture.manifests, fixture.filters_csv, fixture.out_prefix)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Fixture(tmp)
+            manifest = fixture.manifest(0)
+            raw_path = Path(manifest["outputs"]["raw_csv"])
+            with raw_path.open(newline="", encoding="utf-8") as source:
+                rows = list(csv.DictReader(source))
+            rows[0]["latency_definition"] = "server_compute_only"
+            fixture.rewrite_output(0, "raw_csv", rows)
+            with self.assertRaisesRegex(combiner.ValidationFailure, "timing contract"):
                 combiner.combine(fixture.manifests, fixture.filters_csv, fixture.out_prefix)
 
     def test_accepts_uniform_conservative_policy_and_records_provenance(self):
