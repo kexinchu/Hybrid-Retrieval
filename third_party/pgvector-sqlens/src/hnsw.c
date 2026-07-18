@@ -321,7 +321,7 @@ HnswInit(void)
 							   HnswPreferredIndexAssign, NULL);
 
 	DefineCustomEnumVariable("hnsw.filter_strategy", "Sets predicate-aware HNSW traversal strategy",
-							 "off preserves pgvector behavior; safe_guided is validation-only and preserves stock graph traversal; traversal_guided performs planner-proven pre-distance filtering with bounded bridge expansion and fresh-stock fallback when iterative_scan is off, and otherwise bypasses to stock; acorn1 and guided_collect are experimental heuristic modes.",
+							 "off preserves pgvector behavior; safe_guided is validation-only and preserves stock graph traversal; traversal_guided performs native graph expansion and vector distance computation followed by planner-proven predicate-aware result-heap admission and pre-heap TID suppression when iterative_scan is off, and otherwise bypasses to stock; acorn1 and guided_collect are experimental heuristic modes.",
 							 &hnsw_filter_strategy,
 							 HNSW_FILTER_STRATEGY_OFF, hnsw_filter_strategy_options, PGC_USERSET, 0, NULL, NULL, NULL);
 
@@ -330,18 +330,18 @@ HnswInit(void)
 							&hnsw_guided_collect_target,
 							 100, 1, 1000000, PGC_USERSET, 0, NULL, NULL, NULL);
 
-	DefineCustomIntVariable("hnsw.traversal_guided_target", "Sets the minimum matching candidate batch for traversal_guided",
-							 "A guided phase that cannot produce this many candidates before uncertainty is discarded and rerun through a fresh stock traversal.",
+	DefineCustomIntVariable("hnsw.traversal_guided_target", "Deprecated compatibility target for legacy traversal_guided search",
+							 "Retained for configuration compatibility; native candidate admission ignores this value and collects the hnsw.ef_search result batch.",
 							 &hnsw_traversal_guided_target,
 							 40, 1, 1000000, PGC_USERSET, 0, NULL, NULL, NULL);
 
-	DefineCustomIntVariable("hnsw.traversal_guided_max_bridge_hops", "Sets the maximum consecutive predicate-miss bridge hops for traversal_guided",
-							 "Miss nodes may be expanded without vector distance only up to this level-0 hop bound.",
+	DefineCustomIntVariable("hnsw.traversal_guided_max_bridge_hops", "Deprecated compatibility limit for legacy traversal_guided bridge hops",
+							 "Retained for configuration compatibility; native candidate admission ignores this value and does not bound predicate-miss graph expansion.",
 							 &hnsw_traversal_guided_max_bridge_hops,
 							 2, 0, 64, PGC_USERSET, 0, NULL, NULL, NULL);
 
-	DefineCustomIntVariable("hnsw.traversal_guided_max_bridge_work", "Sets the maximum predicate-miss bridge work for traversal_guided",
-							 "The bound counts expanded miss nodes and their newly discovered level-0 edges before a fresh-stock fallback.",
+	DefineCustomIntVariable("hnsw.traversal_guided_max_bridge_work", "Deprecated compatibility limit for legacy traversal_guided bridge work",
+							 "Retained for configuration compatibility; native candidate admission ignores this value and does not use bridge-work fallback.",
 							 &hnsw_traversal_guided_max_bridge_work,
 							 10000, 1, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
 

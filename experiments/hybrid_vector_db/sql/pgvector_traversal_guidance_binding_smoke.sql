@@ -55,7 +55,9 @@ SET hnsw.ef_search = 100;
 SET hnsw.page_access = off;
 SET hnsw.index_page_access = off;
 
--- Successful production D1: membership is checked before vector distance.
+-- Successful production D1: native graph expansion and vector distance
+-- computation precede predicate-aware result-heap admission. Rejected result
+-- candidates have their heap TIDs suppressed before the AM returns them.
 -- This seeded fixture has a deterministic matched-ID contract; production D1
 -- remains approximate ANN and must be calibrated against stock at matched recall.
 SET hnsw.filter_strategy = off;
@@ -80,8 +82,8 @@ SELECT vector_hnsw_guidance_activate(
     'exact'
 );
 SET hnsw.filter_strategy = traversal_guided;
--- The target GUC is deliberately below both LIMIT and ef_search.  A successful
--- guided phase must still collect at least the layer-0 ef candidate batch.
+-- These legacy target and bridge-budget GUCs are deliberately varied. Native
+-- candidate admission ignores them and collects the ef_search result batch.
 SET hnsw.traversal_guided_target = 2;
 SET hnsw.traversal_guided_max_bridge_hops = 3;
 SET hnsw.traversal_guided_max_bridge_work = 10000;
@@ -146,8 +148,6 @@ BEGIN
 	   guided_profile->>'traversal_guided_suppressions' IS DISTINCT FROM
 	       guided_profile->>'traversal_heap_tids_suppressed' OR
 	   (guided_profile->>'distance_computations_avoided')::bigint <> 0 OR
-	   (guided_profile->>'miss_bridge_nodes')::bigint <= 0 OR
-	   (guided_profile->>'miss_bridge_edges')::bigint <= 0 OR
 	   (guided_profile->>'fallback_requests')::bigint <> 0 OR
 	   (guided_profile->>'stock_bypass_requests')::bigint <> 0 THEN
 		RAISE EXCEPTION 'traversal-guided proof or admission counters failed: %',
@@ -160,9 +160,6 @@ BEGIN
 		   guided_profile->>'guided_phase_distance_computations' OR
        guided_profile->>'traversal_expanded_nodes' IS DISTINCT FROM
            guided_profile->>'guided_expanded_nodes' OR
-       (guided_profile->>'guided_expanded_nodes')::bigint <>
-           (guided_profile->>'traversal_matching_expanded')::bigint +
-           (guided_profile->>'traversal_bridge_expanded')::bigint OR
 	   (guided_profile->>'distance_computations_avoided_attempted')::bigint <> 0 OR
 	   (guided_profile->>'net_distance_saved_available')::boolean OR
 	   (guided_profile->>'net_distance_saved')::bigint <> 0 THEN
@@ -209,8 +206,8 @@ BEGIN
 END
 $$;
 
--- A rare predicate remains safe with a zero legacy bridge-hop budget because
--- candidate admission never prunes distance-ordered graph expansion.
+-- The deprecated bridge-hop compatibility setting has no effect: candidate
+-- admission never prunes or bounds distance-ordered graph expansion.
 SET hnsw.filter_strategy = off;
 SELECT vector_hnsw_guidance_reset();
 SELECT vector_hnsw_reset_scan_profile();
@@ -249,7 +246,7 @@ FROM (
       AND id % 20 = 0
     ORDER BY embedding <-> '[500,500]'::vector
     LIMIT 5
-) AS fallback;
+) AS guided;
 UPDATE traversal_guidance_results
 SET profile = vector_hnsw_last_scan_profile()::jsonb
 WHERE method = 'admission_hop_budget_independent';
@@ -289,7 +286,7 @@ BEGIN
 END
 $$;
 
--- The legacy work budget is likewise irrelevant to candidate admission.
+-- The deprecated bridge-work compatibility setting is likewise inactive.
 SET hnsw.traversal_guided_max_bridge_hops = 3;
 SET hnsw.traversal_guided_max_bridge_work = 1;
 SELECT vector_hnsw_reset_scan_profile();
@@ -306,7 +303,7 @@ FROM (
       AND id % 20 = 0
     ORDER BY embedding <-> '[500,500]'::vector
     LIMIT 5
-) AS fallback;
+) AS guided;
 UPDATE traversal_guidance_results
 SET profile = vector_hnsw_last_scan_profile()::jsonb
 WHERE method = 'admission_work_budget_independent';
@@ -423,8 +420,8 @@ BEGIN
 END
 $$;
 
--- Iterative/resume scans conservatively bypass before creating guided heaps;
--- this avoids any possibility of a late fallback after output has begun.
+-- Iterative/resume scans bypass to stock before candidate-admission state is
+-- created; production candidate admission currently supports non-iterative scans.
 SELECT vector_hnsw_guidance_reset();
 SELECT vector_hnsw_guidance_activate(
     'traversal_guidance_binding_smoke_hnsw'::regclass,
