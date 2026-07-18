@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 import unittest
@@ -59,12 +60,60 @@ class Amazon10MSqlNativeExactTruthTests(unittest.TestCase):
         self.assertNotIn("LIMIT", sql_by_workload["acl_only"].upper())
         self.assertIn("CURRENT_USER", sql_by_workload["acl_only"])
         self.assertIn("v.rating = 5", sql_by_workload["acl_only"])
+        self.assertIn("v.embedding_valid", sql_by_workload["acl_only"])
         self.assertNotIn("valid_from <= %(as_of)s", sql_by_workload["acl_only"])
         self.assertIn("grant_row.valid_from <= %(as_of)s", sql_by_workload["grant_temporal_selectivity"])
         self.assertIn("fact.valid_from <= %(as_of)s", sql_by_workload["fact_temporal_selectivity"])
         for sql_text in sql_by_workload.values():
             truth.validate_candidate_sql(sql_text)
             self.assertNotIn("hnsw", sql_text.lower())
+        spot_sql = truth.build_spot_check_sql(
+            "public.vectors", "rating = 5", truth.WORKLOADS[0], "embedding_valid"
+        )
+        self.assertIn("v.embedding_valid", spot_sql)
+        self.assertIn("query_row.embedding_valid", spot_sql)
+
+    def test_candidate_validity_predicate_accepts_only_preregistered_universe(self) -> None:
+        self.assertEqual(
+            truth.validate_candidate_validity_predicate(" embedding_valid "),
+            "embedding_valid",
+        )
+        for predicate in (
+            "",
+            "embedding_valid; SELECT 1",
+            "embedding_valid -- x",
+            "/*x*/ true",
+            "embedding_valid) OR true OR (embedding_valid",
+        ):
+            with self.subTest(predicate=predicate):
+                with self.assertRaisesRegex(
+                    argparse.ArgumentTypeError, "empty|must be exactly"
+                ):
+                    truth.validate_candidate_validity_predicate(predicate)
+
+    def test_candidate_and_workload_predicates_have_separate_hash_contracts(self) -> None:
+        args = truth.create_argument_parser().parse_args([])
+        run_spec = truth.build_run_spec(
+            args,
+            [truth.FilterSpec("f", "1%", "rating = 5", 10, 1.0)],
+            {0: 10},
+            {"script": "s"},
+            {"backend": "faiss"},
+            {"checked_rows": 1},
+        )
+        self.assertEqual(run_spec["candidate_universe"]["predicate"], "embedding_valid")
+        self.assertEqual(
+            run_spec["candidate_universe"]["predicate_sha256"],
+            truth.candidate_universe_predicate_sha256("embedding_valid"),
+        )
+        self.assertEqual(
+            run_spec["workload_scalar_predicates"][0]["predicate_sha256"],
+            truth.workload_scalar_predicate_sha256("rating = 5"),
+        )
+        self.assertNotEqual(
+            run_spec["candidate_universe"]["predicate_sha256"],
+            run_spec["workload_scalar_predicates"][0]["predicate_sha256"],
+        )
 
     def test_chunked_topk_is_direct_float32_tie_sorted_and_self_excluded(self) -> None:
         vectors = np.asarray(
@@ -122,7 +171,13 @@ class Amazon10MSqlNativeExactTruthTests(unittest.TestCase):
         self.assertEqual(truth.select_spot_query_nos(dict(enumerate(range(200))), 2), [0, 199])
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "queries.csv"
-            path.write_text("query_no,query_id\n0,10\n1,11\n2,10\n", encoding="utf-8")
+            path.write_text(
+                "query_no,query_id,query_split,candidate_validity_predicate,query_validity_predicate\n"
+                "0,10,calibration,embedding_valid,embedding_valid\n"
+                "1,11,calibration,embedding_valid,embedding_valid\n"
+                "2,10,final,embedding_valid,embedding_valid\n",
+                encoding="utf-8",
+            )
             with self.assertRaisesRegex(ValueError, "unique"):
                 truth.load_query_ids(path, 2, 1)
 
@@ -144,6 +199,39 @@ class Amazon10MSqlNativeExactTruthTests(unittest.TestCase):
                     2: np.asarray([2.0, 2.1], dtype=np.float32),
                 },
             )
+
+    def test_query_candidate_universe_proof_rejects_invalid_query_row(self) -> None:
+        cursor = mock.MagicMock()
+        cursor.fetchall.return_value = [(10,)]
+        with self.assertRaisesRegex(RuntimeError, "candidate-validity universe"):
+            truth.verify_query_candidate_universe(
+                cursor,
+                "public.items",
+                {0: 10, 1: 11},
+                "embedding_valid",
+            )
+        self.assertIn("query_row.embedding_valid", cursor.execute.call_args.args[0])
+
+    def test_truth_cohort_rejects_unrelated_filter_provenance(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "truth.csv"
+            path.write_text(
+                "query_no,query_id,query_split,filter_name,predicate,method,self_excluded,"
+                "kth_distance_sq,candidate_validity_predicate,query_validity_predicate\n"
+                "0,10,calibration,unrelated,rating = 1,pre_filter_exact,true,1.0,"
+                "embedding_valid,embedding_valid\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "filter names/predicates"):
+                truth.load_query_cohort(
+                    path,
+                    {0: "calibration"},
+                    "embedding_valid",
+                    source_manifest_path=Path(tmp) / "manifest.json",
+                    expected_filters=[
+                        truth.FilterSpec("expected", "1%", "rating = 5", 1, 1.0)
+                    ],
+                )
 
     def test_checkpoint_rejects_stale_run_or_source_hash(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -273,7 +361,15 @@ class Amazon10MSqlNativeExactTruthTests(unittest.TestCase):
         cursor.fetchall.side_effect = [
             [("id", "bigint", True)],
             [("policy", "{reader}", "SELECT", "qual", None)],
-            [("amazon_sql_native_epoch_bump", "CREATE TRIGGER ...")],
+            [
+                (
+                    "amazon_sql_native_epoch_bump",
+                    "O",
+                    "public.amazon_sql_native_bump_relation_epoch()",
+                    "INSERT INTO public.amazon_sql_native_relation_epoch; DO UPDATE SET epoch = epoch + 1",
+                    "CREATE TRIGGER amazon_sql_native_epoch_bump AFTER INSERT OR DELETE OR UPDATE OR TRUNCATE ON t FOR EACH STATEMENT EXECUTE FUNCTION amazon_sql_native_bump_relation_epoch()",
+                )
+            ],
         ]
         fingerprint = truth.relation_fingerprint(cursor, "public.t")
         self.assertEqual(fingerprint["columns"], [["id", "bigint", True]])
@@ -281,10 +377,45 @@ class Amazon10MSqlNativeExactTruthTests(unittest.TestCase):
         self.assertEqual(fingerprint["data_epoch"], 9)
         self.assertEqual(fingerprint["triggers"][0][0], "amazon_sql_native_epoch_bump")
 
+    def test_epoch_trigger_proof_rejects_disabled_or_wrong_function(self) -> None:
+        valid = (
+            "amazon_sql_native_epoch_bump",
+            "O",
+            "public.amazon_sql_native_bump_relation_epoch()",
+            "INSERT INTO public.amazon_sql_native_relation_epoch VALUES (1); "
+            "ON CONFLICT DO UPDATE SET epoch = epoch + 1",
+            "CREATE TRIGGER amazon_sql_native_epoch_bump AFTER INSERT OR DELETE OR UPDATE OR TRUNCATE "
+            "ON t FOR EACH STATEMENT EXECUTE FUNCTION amazon_sql_native_bump_relation_epoch()",
+        )
+        self.assertTrue(truth.valid_epoch_trigger(valid))
+        self.assertFalse(truth.valid_epoch_trigger((valid[0], "D", *valid[2:])))
+        self.assertFalse(
+            truth.valid_epoch_trigger((valid[0], valid[1], "public.noop()", *valid[3:]))
+        )
+
     def test_manifest_builder_binds_data_version_proof(self) -> None:
-        relations = {"public.amazon_review_facts": {"policies": []}}
+        relations = {
+            "public.amazon_review_facts": {"policies": [], "data_epoch": 7}
+        }
+        query_ids = {0: 10}
+        query_splits = {0: "calibration"}
+        cohort_hash = truth.query_cohort_sha256(query_ids, query_splits)
+        candidate_universe = {
+            "predicate": "embedding_valid",
+            "predicate_sha256": truth.candidate_universe_predicate_sha256(
+                "embedding_valid"
+            ),
+        }
         manifest = truth.build_artifact_manifest(
-            run_spec={"a": 1, "principal": "principal"},
+            run_spec={
+                "a": 1,
+                "principal": "principal",
+                "query_ids": query_ids,
+                "query_splits": query_splits,
+                "query_cohort_sha256": cohort_hash,
+                "query_cohort": {"query_cohort_sha256": cohort_hash},
+                "candidate_universe": candidate_universe,
+            },
             source_hashes={"script": "s"},
             fbin={"path": "f"},
             base_table_mapping={"checked_rows": 1},
@@ -310,6 +441,10 @@ class Amazon10MSqlNativeExactTruthTests(unittest.TestCase):
             manifest["data_version_proof"]["start_hash"],
             truth.canonical_sha256(relations),
         )
+        self.assertEqual(manifest["query_cohort_sha256"], cohort_hash)
+        self.assertEqual(manifest["relation_epoch"]["relations"], {
+            "public.amazon_review_facts": 7
+        })
 
     def test_exact_artifact_publication_fails_closed_before_writing_csv(self) -> None:
         rows = [{"workload": "acl_only", "id": 1}]

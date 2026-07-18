@@ -23,15 +23,29 @@ except ImportError:  # Direct script execution puts this directory on sys.path.
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_FBIN = ROOT / "data/amazon_reviews_2023/processed/grocery_reviews_10m_tfidf_svd128.fbin"
 DEFAULT_FILTERS = ROOT / "experiments/hybrid_vector_db/configs/amazon10m_selectivity14_filters.csv"
-DEFAULT_QUERY_IDS = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_formal.csv"
-DEFAULT_ARTIFACT_DIR = ROOT / "results/hybrid_vector_db/amazon10m_sql_native_exact_truth"
+DEFAULT_QUERY_IDS = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_valid_embeddings_formal.csv"
+DEFAULT_QUERY_COHORT_MANIFEST = (
+    ROOT
+    / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_valid_embeddings_formal_manifest.json"
+)
+DEFAULT_ARTIFACT_DIR = (
+    ROOT / "results/hybrid_vector_db/amazon10m_sql_native_exact_truth_valid_embeddings"
+)
 DEFAULT_VECTOR_TABLE = "public.amazon_grocery_reviews_10m_pgvector"
 DEFAULT_PRINCIPAL = "amazon10m_sql_native_benchmark"
 DEFAULT_K = 10
 DEFAULT_CALIBRATION_QUERIES = 100
 DEFAULT_FINAL_QUERIES = 100
 DEFAULT_BASE_TABLE_MAPPING_SAMPLE_SIZE = 1024
-CHECKPOINT_VERSION = 3
+DEFAULT_CANDIDATE_VALIDITY_PREDICATE = "embedding_valid"
+CHECKPOINT_VERSION = 4
+QUERY_COHORT_PARSER_VERSION = 1
+QUERY_COHORT_HASH_CONTRACT = (
+    "sha256(canonical-json [[query_no,query_id,query_split],...]), ordered by query_no"
+)
+RELATION_EPOCH_HASH_CONTRACT = (
+    "sha256(canonical-json {qualified_relation:data_epoch,...})"
+)
 FILTER_COLUMNS = (
     "rating",
     "verified_purchase",
@@ -45,6 +59,7 @@ FILTER_COLUMNS = (
     "item_avg_rating",
     "item_rating_number",
 )
+CANDIDATE_VALIDITY_COLUMNS = ("embedding_valid",)
 
 
 def require_numpy() -> Any:
@@ -70,6 +85,14 @@ class WorkloadSpec:
     description: str
     bucket_pct: float
     temporal_kind: str
+
+
+@dataclass(frozen=True)
+class QueryCohort:
+    query_ids: dict[int, int]
+    query_splits: dict[int, str]
+    sha256: str
+    provenance: dict[str, Any]
 
 
 WORKLOADS = (
@@ -104,6 +127,57 @@ def sha256_file(path: Path) -> str:
 
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def validate_candidate_validity_predicate(value: str) -> str:
+    """Accept only the preregistered formal candidate-universe predicate."""
+    predicate = str(value or "").strip()
+    if not predicate:
+        raise argparse.ArgumentTypeError("candidate validity predicate must not be empty")
+    if predicate != DEFAULT_CANDIDATE_VALIDITY_PREDICATE:
+        raise argparse.ArgumentTypeError(
+            "candidate validity predicate must be exactly "
+            f"{DEFAULT_CANDIDATE_VALIDITY_PREDICATE!r}"
+        )
+    return predicate
+
+
+def candidate_universe_predicate_sha256(value: str) -> str:
+    return sha256_text(validate_candidate_validity_predicate(value))
+
+
+def workload_scalar_predicate_sha256(value: str) -> str:
+    return sha256_text(str(value).strip())
+
+
+def query_cohort_sha256(
+    query_ids: dict[int, int], query_splits: dict[int, str]
+) -> str:
+    if set(query_ids) != set(query_splits):
+        raise ValueError("query cohort IDs and split metadata have different keyspaces")
+    records = [
+        [int(query_no), int(query_ids[query_no]), str(query_splits[query_no])]
+        for query_no in sorted(query_ids)
+    ]
+    return canonical_sha256(records)
+
+
+def relation_epoch_contract(relations: dict[str, Any]) -> dict[str, Any]:
+    if not relations:
+        raise RuntimeError("relation epoch contract requires relation fingerprints")
+    epochs: dict[str, int] = {}
+    for relation, fingerprint in sorted(relations.items()):
+        if not isinstance(fingerprint, dict):
+            raise RuntimeError(f"relation epoch fingerprint is malformed: {relation}")
+        epoch = fingerprint.get("data_epoch")
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+            raise RuntimeError(f"relation epoch is missing or invalid: {relation}")
+        epochs[str(relation)] = epoch
+    return {
+        "hash_contract": RELATION_EPOCH_HASH_CONTRACT,
+        "relations": epochs,
+        "sha256": canonical_sha256(epochs),
+    }
 
 
 def git_revision() -> str:
@@ -229,28 +303,249 @@ def read_filters(path: Path, selected: set[str] | None = None) -> list[FilterSpe
     return specs
 
 
-def load_query_ids(path: Path, calibration_queries: int, final_queries: int) -> dict[int, int]:
-    wanted = set(range(calibration_queries + final_queries))
+def _load_query_source_manifest(
+    path: Path,
+    manifest_path: Path,
+    candidate_validity_predicate: str,
+    expected_splits: dict[int, str],
+    source_rows: int,
+    filter_predicates: dict[str, str],
+) -> dict[str, Any]:
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"query cohort provenance manifest is unreadable: {manifest_path}") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("query cohort provenance manifest must be a JSON object")
+    outputs = manifest.get("outputs")
+    truth_output = outputs.get("truth_csv") if isinstance(outputs, dict) else None
+    validity = manifest.get("validity_contract")
+    manifest_filters = manifest.get("filters")
+    calibration = manifest.get("calibration")
+    final = manifest.get("final")
+    expected_calibration = sum(
+        split == "calibration" for split in expected_splits.values()
+    )
+    expected_final = sum(split == "final" for split in expected_splits.values())
+    if (
+        manifest.get("artifact_valid") is not True
+        or not isinstance(truth_output, dict)
+        or truth_output.get("sha256") != sha256_file(path)
+        or not isinstance(validity, dict)
+        or validity.get("candidate_validity_predicate") != candidate_validity_predicate
+        or validity.get("query_validity_predicate") != candidate_validity_predicate
+        or validity.get("query_inherits_candidate") is not True
+        or int(manifest.get("truth_rows", -1)) != source_rows
+        or isinstance(manifest_filters, bool)
+        or not isinstance(manifest_filters, int)
+        or manifest_filters != len(filter_predicates)
+        or not isinstance(calibration, dict)
+        or int(calibration.get("queries", -1)) != expected_calibration
+        or not isinstance(final, dict)
+        or int(final.get("queries", -1)) != expected_final
+        or manifest.get("query_ids_disjoint") is not True
+        or manifest.get("self_excluded") is not True
+        or manifest.get("method") != "exact_filtered_l2_tie_aware"
+    ):
+        raise ValueError("query cohort provenance manifest does not bind the CSV/validity universe")
+    return {
+        "path": str(manifest_path.resolve()),
+        "sha256": sha256_file(manifest_path),
+        "artifact_valid": True,
+        "source_truth_csv_sha256": str(truth_output["sha256"]),
+    }
+
+
+def load_query_cohort(
+    path: Path,
+    expected_splits: dict[int, str],
+    candidate_validity_predicate: str = DEFAULT_CANDIDATE_VALIDITY_PREDICATE,
+    *,
+    source_manifest_path: Path | None = None,
+    expected_filters: Sequence[FilterSpec] | None = None,
+) -> QueryCohort:
+    """Load either a dedicated cohort CSV or a formal truth CSV without lossy extraction."""
+    candidate_validity_predicate = validate_candidate_validity_predicate(
+        candidate_validity_predicate
+    )
+    if not expected_splits or any(
+        split not in {"calibration", "final"} for split in expected_splits.values()
+    ):
+        raise ValueError("query cohort requires explicit calibration/final split metadata")
+    truth_required = {
+        "query_no",
+        "query_id",
+        "query_split",
+        "filter_name",
+        "predicate",
+        "method",
+        "self_excluded",
+        "kth_distance_sq",
+        "candidate_validity_predicate",
+        "query_validity_predicate",
+    }
+    dedicated_required = {
+        "query_no",
+        "query_id",
+        "query_split",
+        "candidate_validity_predicate",
+        "query_validity_predicate",
+    }
     found: dict[int, int] = {}
+    observed_filters: dict[int, set[str]] = {}
+    observed_filter_predicates: dict[str, str] = {}
+    seen_truth_keys: set[tuple[int, str]] = set()
+    seen_dedicated_query_nos: set[int] = set()
+    row_count = 0
+    source_kind = ""
+    source_fields: list[str]
     with path.open(newline="", encoding="utf-8") as source:
         reader = csv.DictReader(source)
-        required = {"query_no", "query_id"}
-        missing = required - set(reader.fieldnames or ())
-        if missing:
-            raise ValueError(f"query CSV missing columns: {sorted(missing)}")
+        source_fields = list(reader.fieldnames or ())
+        field_set = set(source_fields)
+        if truth_required <= field_set:
+            source_kind = "formal_exact_truth_csv"
+        elif field_set == dedicated_required:
+            source_kind = "dedicated_query_cohort_csv"
+        else:
+            missing = sorted(truth_required - field_set)
+            raise ValueError(
+                "query cohort CSV has neither the dedicated schema nor the strict formal "
+                f"truth schema: missing_truth_columns={missing}"
+            )
         for row in reader:
-            query_no = int(str(row["query_no"]))
-            if query_no not in wanted:
-                continue
-            query_id = int(str(row["query_id"]))
-            old = found.setdefault(query_no, query_id)
-            if old != query_id:
+            row_count += 1
+            try:
+                query_no = int(str(row["query_no"]))
+                query_id = int(str(row["query_id"]))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"query cohort has a non-integer query mapping at row={row_count}") from exc
+            if query_no not in expected_splits:
+                raise ValueError(f"query cohort has unexpected query_no={query_no}")
+            expected_split = expected_splits[query_no]
+            if row.get("query_split") != expected_split:
+                raise ValueError(
+                    f"query_no={query_no} has query_split={row.get('query_split')!r}; "
+                    f"expected={expected_split!r}"
+                )
+            if (
+                row.get("candidate_validity_predicate") != candidate_validity_predicate
+                or row.get("query_validity_predicate") != candidate_validity_predicate
+            ):
+                raise ValueError(
+                    f"query_no={query_no} is outside the requested candidate/query validity universe"
+                )
+            previous = found.setdefault(query_no, query_id)
+            if previous != query_id:
                 raise ValueError(f"query_no={query_no} maps to multiple query IDs")
+            if source_kind == "formal_exact_truth_csv":
+                filter_name = str(row.get("filter_name", ""))
+                predicate = str(row.get("predicate", "")).strip()
+                key = (query_no, filter_name)
+                try:
+                    distance = float(str(row.get("kth_distance_sq", "")))
+                except ValueError as exc:
+                    raise ValueError(f"query truth row has invalid kth_distance_sq: {key}") from exc
+                if (
+                    not filter_name
+                    or not predicate
+                    or key in seen_truth_keys
+                    or row.get("method") != "pre_filter_exact"
+                    or str(row.get("self_excluded", "")).strip().lower() != "true"
+                    or not (distance >= 0.0 and distance < float("inf"))
+                ):
+                    raise ValueError(f"query truth row violates the formal extraction contract: {key}")
+                seen_truth_keys.add(key)
+                observed_filters.setdefault(query_no, set()).add(filter_name)
+                previous_predicate = observed_filter_predicates.setdefault(
+                    filter_name, predicate
+                )
+                if previous_predicate != predicate:
+                    raise ValueError(
+                        f"query truth filter has inconsistent predicates: {filter_name}"
+                    )
+            elif query_no in seen_dedicated_query_nos:
+                raise ValueError(f"dedicated query cohort has duplicate query_no={query_no}")
+            else:
+                seen_dedicated_query_nos.add(query_no)
+    wanted = set(expected_splits)
     if set(found) != wanted:
-        raise ValueError(f"query CSV is incomplete: missing={sorted(wanted - set(found))}")
+        raise ValueError(f"query cohort is incomplete: missing={sorted(wanted - set(found))}")
     if len(set(found.values())) != len(found):
         raise ValueError("query IDs must be unique across calibration and final splits")
-    return dict(sorted(found.items()))
+    if source_kind == "formal_exact_truth_csv":
+        if source_manifest_path is None:
+            raise ValueError("truth-format query cohort requires an explicit provenance manifest")
+        if expected_filters is None:
+            raise ValueError("truth-format query cohort requires expected filter predicates")
+        expected_filter_predicates = {
+            spec.name: spec.predicate for spec in expected_filters
+        }
+        if len(expected_filter_predicates) != len(expected_filters):
+            raise ValueError("expected query cohort filters contain duplicate names")
+        filter_sets = {tuple(sorted(values)) for values in observed_filters.values()}
+        if len(observed_filters) != len(found) or len(filter_sets) != 1:
+            raise ValueError("truth-format query cohort does not have one complete filter keyspace")
+        if observed_filter_predicates != expected_filter_predicates:
+            raise ValueError(
+                "truth-format query cohort filter names/predicates do not match the workload"
+            )
+        source_manifest = _load_query_source_manifest(
+            path,
+            source_manifest_path,
+            candidate_validity_predicate,
+            expected_splits,
+            row_count,
+            expected_filter_predicates,
+        )
+    else:
+        source_manifest = None
+    ordered = dict(sorted(found.items()))
+    ordered_splits = {query_no: expected_splits[query_no] for query_no in ordered}
+    cohort_hash = query_cohort_sha256(ordered, ordered_splits)
+    provenance = {
+        "parser": "amazon10m_query_cohort_csv",
+        "parser_version": QUERY_COHORT_PARSER_VERSION,
+        "source_kind": source_kind,
+        "source_csv": str(path.resolve()),
+        "source_csv_sha256": sha256_file(path),
+        "source_schema_sha256": canonical_sha256(source_fields),
+        "source_rows": row_count,
+        "source_manifest": source_manifest,
+        "query_count": len(ordered),
+        "query_cohort_sha256": cohort_hash,
+        "query_cohort_hash_contract": QUERY_COHORT_HASH_CONTRACT,
+        "candidate_universe_predicate": candidate_validity_predicate,
+        "candidate_universe_predicate_sha256": candidate_universe_predicate_sha256(
+            candidate_validity_predicate
+        ),
+        "source_filter_predicates_sha256": (
+            canonical_sha256(observed_filter_predicates)
+            if source_kind == "formal_exact_truth_csv"
+            else None
+        ),
+    }
+    return QueryCohort(ordered, ordered_splits, cohort_hash, provenance)
+
+
+def load_query_ids(
+    path: Path,
+    calibration_queries: int,
+    final_queries: int,
+    candidate_validity_predicate: str = DEFAULT_CANDIDATE_VALIDITY_PREDICATE,
+    *,
+    source_manifest_path: Path | None = None,
+) -> dict[int, int]:
+    expected_splits = {
+        query_no: query_split(query_no, calibration_queries)
+        for query_no in range(calibration_queries + final_queries)
+    }
+    return load_query_cohort(
+        path,
+        expected_splits,
+        candidate_validity_predicate,
+        source_manifest_path=source_manifest_path,
+    ).query_ids
 
 
 def query_split(query_no: int, calibration_queries: int) -> str:
@@ -261,6 +556,17 @@ def qualify_predicate(predicate: str, alias: str = "v") -> str:
     result = predicate
     for column in sorted(FILTER_COLUMNS, key=len, reverse=True):
         result = re.sub(rf"(?<![A-Za-z0-9_$.]){re.escape(column)}\b", f"{alias}.{column}", result)
+    return result
+
+
+def qualify_candidate_validity_predicate(predicate: str, alias: str = "v") -> str:
+    result = validate_candidate_validity_predicate(predicate)
+    for column in CANDIDATE_VALIDITY_COLUMNS:
+        result = re.sub(
+            rf"(?<![A-Za-z0-9_$.]){re.escape(column)}\b",
+            f"{alias}.{column}",
+            result,
+        )
     return result
 
 
@@ -278,7 +584,12 @@ def temporal_predicate(workload: WorkloadSpec) -> str:
     raise ValueError(f"unknown temporal workload kind: {workload.temporal_kind}")
 
 
-def build_candidate_sql(table: str, predicate: str, workload: WorkloadSpec) -> str:
+def build_candidate_sql(
+    table: str,
+    predicate: str,
+    workload: WorkloadSpec,
+    candidate_validity_predicate: str = DEFAULT_CANDIDATE_VALIDITY_PREDICATE,
+) -> str:
     """The one unbounded, vector-free relational candidate export per pair."""
     return f"""
 SELECT v.id
@@ -289,7 +600,8 @@ JOIN public.amazon_product_dim AS product
   ON product.parent_asin = fact.parent_asin
 JOIN public.amazon_principal_tenant_grants AS grant_row
   ON grant_row.tenant_id = product.tenant_id
-WHERE {qualify_predicate(predicate)}
+WHERE ({qualify_predicate(predicate)})
+  AND ({qualify_candidate_validity_predicate(candidate_validity_predicate)})
   AND grant_row.principal_name = CURRENT_USER::text
   AND grant_row.can_read
 {temporal_predicate(workload)}
@@ -297,13 +609,19 @@ ORDER BY v.id
 """.strip()
 
 
-def build_spot_check_sql(table: str, predicate: str, workload: WorkloadSpec) -> str:
+def build_spot_check_sql(
+    table: str,
+    predicate: str,
+    workload: WorkloadSpec,
+    candidate_validity_predicate: str = DEFAULT_CANDIDATE_VALIDITY_PREDICATE,
+) -> str:
     """Exact PostgreSQL reference query. MATERIALIZED prevents an ANN vector scan."""
     return f"""
 WITH query_vector AS (
     SELECT id AS query_id, embedding
     FROM {qualified_name(table)} AS query_row
     WHERE query_row.id = %(query_id)s
+      AND ({qualify_candidate_validity_predicate(candidate_validity_predicate, 'query_row')})
 ), valid AS MATERIALIZED (
     SELECT v.id, v.embedding
     FROM {qualified_name(table)} AS v
@@ -314,7 +632,8 @@ WITH query_vector AS (
     JOIN public.amazon_principal_tenant_grants AS grant_row
       ON grant_row.tenant_id = product.tenant_id
     CROSS JOIN query_vector
-    WHERE {qualify_predicate(predicate)}
+    WHERE ({qualify_predicate(predicate)})
+      AND ({qualify_candidate_validity_predicate(candidate_validity_predicate)})
       AND v.id <> query_vector.query_id
       AND grant_row.principal_name = CURRENT_USER::text
       AND grant_row.can_read
@@ -426,6 +745,7 @@ def verify_base_table_vector_mapping(
     vectors: np.ndarray,
     query_ids: dict[int, int],
     sample_size: int,
+    candidate_validity_predicate: str = DEFAULT_CANDIDATE_VALIDITY_PREDICATE,
 ) -> dict[str, Any]:
     """Audit base-table/fbin mapping before any relational candidate or Faiss work."""
     base_sample_ids, checked_ids = base_table_mapping_ids(len(vectors), sample_size, query_ids.values())
@@ -437,6 +757,12 @@ def verify_base_table_vector_mapping(
             (checked_ids,),
         )
         observed = {int(row[0]): parse_vector_text(str(row[1])) for row in cur.fetchall()}
+        query_universe = verify_query_candidate_universe(
+            cur,
+            table,
+            query_ids,
+            candidate_validity_predicate,
+        )
         cur.execute("COMMIT")
     except BaseException:
         try:
@@ -453,7 +779,40 @@ def verify_base_table_vector_mapping(
         "query_ids_included": sorted(int(query_id) for query_id in query_ids.values()),
         "checked_ids": checked_ids,
         "checked_ids_sha256": canonical_sha256(checked_ids),
+        "query_candidate_universe": query_universe,
         **validate_vector_mapping(vectors, checked_ids, observed),
+    }
+
+
+def verify_query_candidate_universe(
+    cur: Any,
+    table: str,
+    query_ids: dict[int, int],
+    candidate_validity_predicate: str = DEFAULT_CANDIDATE_VALIDITY_PREDICATE,
+) -> dict[str, Any]:
+    predicate = validate_candidate_validity_predicate(candidate_validity_predicate)
+    expected_ids = sorted(int(query_id) for query_id in query_ids.values())
+    if not expected_ids or len(set(expected_ids)) != len(expected_ids):
+        raise RuntimeError("query candidate-universe proof requires distinct query IDs")
+    cur.execute(
+        f"SELECT query_row.id FROM {qualified_name(table)} AS query_row "
+        "WHERE query_row.id = ANY(%s::bigint[]) "
+        f"AND ({qualify_candidate_validity_predicate(predicate, 'query_row')}) "
+        "ORDER BY query_row.id",
+        (expected_ids,),
+    )
+    observed_ids = [int(row[0]) for row in cur.fetchall()]
+    if observed_ids != expected_ids:
+        raise RuntimeError(
+            "query cohort is not fully contained in the current candidate-validity universe: "
+            f"missing={sorted(set(expected_ids) - set(observed_ids))[:10]}"
+        )
+    return {
+        "valid": True,
+        "predicate": predicate,
+        "predicate_sha256": candidate_universe_predicate_sha256(predicate),
+        "query_count": len(expected_ids),
+        "query_ids_sha256": canonical_sha256(expected_ids),
     }
 
 
@@ -838,8 +1197,16 @@ def relation_fingerprint(cur: Any, relation: str) -> dict[str, Any]:
     policies = [list(value) for value in cur.fetchall()]
     cur.execute(
         """
-        SELECT trigger_row.tgname, pg_get_triggerdef(trigger_row.oid, true)
+        SELECT trigger_row.tgname,
+               trigger_row.tgenabled,
+               format('%%I.%%I(%%s)', function_namespace.nspname, function_row.proname,
+                      pg_get_function_identity_arguments(function_row.oid)),
+               pg_get_functiondef(function_row.oid),
+               pg_get_triggerdef(trigger_row.oid, true)
         FROM pg_catalog.pg_trigger AS trigger_row
+        JOIN pg_catalog.pg_proc AS function_row ON function_row.oid = trigger_row.tgfoid
+        JOIN pg_catalog.pg_namespace AS function_namespace
+          ON function_namespace.oid = function_row.pronamespace
         WHERE trigger_row.tgrelid = to_regclass(%s)
           AND NOT trigger_row.tgisinternal
         ORDER BY trigger_row.tgname
@@ -994,7 +1361,7 @@ def fingerprint_relations(cur: Any, vector_table: str) -> dict[str, Any]:
         relation
         for relation, fingerprint in fingerprints.items()
         if not any(
-            trigger[0] == "amazon_sql_native_epoch_bump"
+            valid_epoch_trigger(trigger)
             for trigger in fingerprint.get("triggers", [])
         )
     ]
@@ -1004,6 +1371,31 @@ def fingerprint_relations(cur: Any, vector_table: str) -> dict[str, Any]:
             + ",".join(missing_epoch_triggers)
         )
     return fingerprints
+
+
+def valid_epoch_trigger(trigger: Sequence[Any]) -> bool:
+    if len(trigger) != 5:
+        return False
+    name, enabled, function_identity, function_definition, trigger_definition = (
+        str(value) for value in trigger
+    )
+    normalized_function = " ".join(function_definition.lower().split())
+    normalized_trigger = " ".join(trigger_definition.lower().split())
+    return (
+        name == "amazon_sql_native_epoch_bump"
+        and enabled in {"O", "A"}
+        and function_identity == "public.amazon_sql_native_bump_relation_epoch()"
+        and "insert into public.amazon_sql_native_relation_epoch" in normalized_function
+        and "do update" in normalized_function
+        and "epoch + 1" in normalized_function
+        and "after insert or delete or update or truncate" in normalized_trigger
+        and "for each statement" in normalized_trigger
+        and re.search(
+            r"execute function (?:public\.)?amazon_sql_native_bump_relation_epoch\(\)",
+            normalized_trigger,
+        )
+        is not None
+    )
 
 
 def formal_data_relations(vector_table: str) -> tuple[str, ...]:
@@ -1141,7 +1533,16 @@ def build_run_spec(
     source_hashes: dict[str, str],
     backend_config: dict[str, Any],
     base_table_mapping: dict[str, Any],
+    query_cohort_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    query_splits = {
+        query_no: query_split(query_no, args.calibration_queries)
+        for query_no in query_ids
+    }
+    cohort_hash = query_cohort_sha256(query_ids, query_splits)
+    validity_predicate = validate_candidate_validity_predicate(
+        args.candidate_validity_predicate
+    )
     return {
         "version": CHECKPOINT_VERSION,
         "vector_table": args.vector_table,
@@ -1157,8 +1558,30 @@ def build_run_spec(
         "base_table_mapping": base_table_mapping,
         "spot_check_queries": args.spot_check_queries,
         "filters": [asdict(spec) for spec in filters],
+        "workload_scalar_predicates": [
+            {
+                "filter_name": spec.name,
+                "predicate": spec.predicate,
+                "predicate_sha256": workload_scalar_predicate_sha256(spec.predicate),
+            }
+            for spec in filters
+        ],
+        "candidate_universe": {
+            "predicate": validity_predicate,
+            "predicate_sha256": candidate_universe_predicate_sha256(validity_predicate),
+            "sql_role": "candidate_relation_only; separate from workload scalar predicate",
+        },
         "workloads": [asdict(workload) for workload in WORKLOADS],
         "query_ids": query_ids,
+        "query_splits": query_splits,
+        "query_cohort_sha256": cohort_hash,
+        "query_cohort_hash_contract": QUERY_COHORT_HASH_CONTRACT,
+        "query_cohort": query_cohort_provenance
+        or {
+            "query_count": len(query_ids),
+            "query_cohort_sha256": cohort_hash,
+            "query_cohort_hash_contract": QUERY_COHORT_HASH_CONTRACT,
+        },
         "source_hashes": source_hashes,
     }
 
@@ -1215,13 +1638,19 @@ def truth_rows_for_pair(
     calibration_queries: int,
     exact_ms: float,
     as_of: int,
+    candidate_validity_predicate: str = DEFAULT_CANDIDATE_VALIDITY_PREDICATE,
 ) -> list[dict[str, Any]]:
+    validity_hash = candidate_universe_predicate_sha256(candidate_validity_predicate)
+    scalar_hash = workload_scalar_predicate_sha256(filter_spec.predicate)
     rows: list[dict[str, Any]] = []
     for position, (query_no, query_id) in enumerate(sorted(query_ids.items())):
         metadata = truth_metadata(top_distances[position], k)
         rows.append({
             "workload": workload.name, "filter_name": filter_spec.name,
             "target_rate": filter_spec.target_rate, "predicate": filter_spec.predicate,
+            "workload_scalar_predicate_sha256": scalar_hash,
+            "candidate_universe_predicate": candidate_validity_predicate,
+            "candidate_universe_predicate_sha256": validity_hash,
             "query_no": query_no, "query_id": query_id,
             "query_split": query_split(query_no, calibration_queries), "k": k,
             "as_of": as_of, "self_excluded": True,
@@ -1291,8 +1720,18 @@ def execute_pair(
         assert_principal_and_rls(cur, args.principal)
         context = session_context(cur)
         relations = fingerprint_relations(cur, args.vector_table)
-        candidate_sql = build_candidate_sql(args.vector_table, filter_spec.predicate, workload)
-        spot_sql = build_spot_check_sql(args.vector_table, filter_spec.predicate, workload)
+        candidate_sql = build_candidate_sql(
+            args.vector_table,
+            filter_spec.predicate,
+            workload,
+            args.candidate_validity_predicate,
+        )
+        spot_sql = build_spot_check_sql(
+            args.vector_table,
+            filter_spec.predicate,
+            workload,
+            args.candidate_validity_predicate,
+        )
         validate_candidate_sql(candidate_sql)
         validate_exact_sql_text(spot_sql)
         cur.execute("EXPLAIN (FORMAT JSON, VERBOSE, SETTINGS) " + candidate_sql, {"as_of": as_of})
@@ -1316,12 +1755,21 @@ def execute_pair(
         )
         exact_ms = float(exact_backend["elapsed_ms"])
         rows = truth_rows_for_pair(workload, filter_spec, query_ids, top_ids, top_distances, candidate,
-                                   args.k, args.calibration_queries, exact_ms, as_of)
+                                   args.k, args.calibration_queries, exact_ms, as_of,
+                                   args.candidate_validity_predicate)
         spot_checks = run_spot_checks(cur, vectors, query_ids, top_ids, top_distances, spot_sql, as_of,
                                       args.k, args.spot_check_queries)
         cur.execute("COMMIT")
         payload = {
             "workload": workload.name, "filter": asdict(filter_spec), "as_of": as_of,
+            "workload_scalar_predicate": filter_spec.predicate,
+            "workload_scalar_predicate_sha256": workload_scalar_predicate_sha256(
+                filter_spec.predicate
+            ),
+            "candidate_universe_predicate": args.candidate_validity_predicate,
+            "candidate_universe_predicate_sha256": candidate_universe_predicate_sha256(
+                args.candidate_validity_predicate
+            ),
             "session": context, "relations": relations,
             "candidate_sql": candidate_sql, "candidate_sql_sha256": hashlib.sha256(candidate_sql.encode()).hexdigest(),
             "candidate_explain": candidate_plan, "candidate_explain_gate": candidate_plan_gate,
@@ -1347,12 +1795,24 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fbin", type=Path, default=DEFAULT_FBIN)
     parser.add_argument("--filters-csv", type=Path, default=DEFAULT_FILTERS)
     parser.add_argument("--query-ids-csv", type=Path, default=DEFAULT_QUERY_IDS)
+    parser.add_argument(
+        "--query-cohort-manifest",
+        type=Path,
+        default=DEFAULT_QUERY_COHORT_MANIFEST,
+        help="provenance manifest for a truth-format query cohort CSV",
+    )
     parser.add_argument("--artifact-dir", type=Path, default=DEFAULT_ARTIFACT_DIR)
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--manifest", type=Path, default=None)
     parser.add_argument("--checkpoint-dir", type=Path, default=None)
     parser.add_argument("--vector-table", type=qualified_name, default=DEFAULT_VECTOR_TABLE)
     parser.add_argument("--principal", type=role_name, default=DEFAULT_PRINCIPAL)
+    parser.add_argument(
+        "--candidate-validity-predicate",
+        type=validate_candidate_validity_predicate,
+        default=DEFAULT_CANDIDATE_VALIDITY_PREDICATE,
+        help="global candidate-universe SQL predicate; formal value is embedding_valid",
+    )
     parser.add_argument("--k", type=positive_int, default=DEFAULT_K)
     parser.add_argument("--calibration-queries", type=positive_int, default=DEFAULT_CALIBRATION_QUERIES)
     parser.add_argument("--final-queries", type=positive_int, default=DEFAULT_FINAL_QUERIES)
@@ -1412,6 +1872,13 @@ def print_dry_run(args: argparse.Namespace) -> None:
     print(f"k={args.k}; retained=k+1; self_excluded=true; spot_checks_per_pair={args.spot_check_queries}")
     print(f"backend={args.backend}; faiss_threads={args.faiss_threads}; cpu_affinity={available_cpu_count()}")
     print(f"base_table_mapping_sample_size={args.base_table_mapping_sample_size}; query_ids_included=true")
+    print(f"query_ids_csv={args.query_ids_csv}")
+    print(f"query_cohort_manifest={args.query_cohort_manifest}")
+    print(f"candidate_validity_predicate={args.candidate_validity_predicate}")
+    print(
+        "candidate_universe_predicate_sha256="
+        + candidate_universe_predicate_sha256(args.candidate_validity_predicate)
+    )
     print(f"artifact_dir={args.artifact_dir}")
 
 
@@ -1448,6 +1915,32 @@ def build_artifact_manifest(
         facts.get("policies", [])
     ):
         raise RuntimeError("exact-truth RLS policy hash does not match data-version proof")
+    try:
+        run_query_ids = {
+            int(query_no): int(query_id)
+            for query_no, query_id in run_spec["query_ids"].items()
+        }
+        run_query_splits = {
+            int(query_no): str(split)
+            for query_no, split in run_spec["query_splits"].items()
+        }
+        expected_cohort_hash = query_cohort_sha256(run_query_ids, run_query_splits)
+        cohort = run_spec["query_cohort"]
+        candidate_universe = run_spec["candidate_universe"]
+        validity_predicate = validate_candidate_validity_predicate(
+            candidate_universe["predicate"]
+        )
+        validity_hash = candidate_universe_predicate_sha256(validity_predicate)
+    except (KeyError, TypeError, ValueError, argparse.ArgumentTypeError) as exc:
+        raise RuntimeError("exact-truth artifact has malformed cohort/universe provenance") from exc
+    if (
+        run_spec.get("query_cohort_sha256") != expected_cohort_hash
+        or not isinstance(cohort, dict)
+        or cohort.get("query_cohort_sha256") != expected_cohort_hash
+        or candidate_universe.get("predicate_sha256") != validity_hash
+    ):
+        raise RuntimeError("exact-truth artifact cohort/universe hashes do not match the run spec")
+    relation_epoch = relation_epoch_contract(data_version_proof["start_relations"])
     manifest = {
         "artifact_valid": True,
         "artifact": "amazon10m_sql_native_exact_truth",
@@ -1456,6 +1949,11 @@ def build_artifact_manifest(
         "git_revision": git_revision(),
         "run_spec": run_spec,
         "run_spec_hash": canonical_sha256(run_spec),
+        "query_cohort": cohort,
+        "query_cohort_sha256": expected_cohort_hash,
+        "candidate_universe": candidate_universe,
+        "candidate_universe_predicate_sha256": validity_hash,
+        "relation_epoch": relation_epoch,
         "source_hashes": source_hashes,
         "fbin": fbin,
         "base_table_mapping": base_table_mapping,
@@ -1479,11 +1977,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     require_psycopg()
     filters = read_filters(args.filters_csv, set(args.filter_names))
     validate_formal_dimensions(args, filters)
-    query_ids = load_query_ids(args.query_ids_csv, args.calibration_queries, args.final_queries)
+    expected_splits = {
+        query_no: query_split(query_no, args.calibration_queries)
+        for query_no in range(args.calibration_queries + args.final_queries)
+    }
+    query_cohort = load_query_cohort(
+        args.query_ids_csv,
+        expected_splits,
+        args.candidate_validity_predicate,
+        source_manifest_path=args.query_cohort_manifest,
+        expected_filters=filters,
+    )
+    query_ids = query_cohort.query_ids
     vectors, vector_rows, dimensions = read_fbin_memmap(args.fbin)
     source_hashes = {
         "script": sha256_file(Path(__file__)), "filters_csv": sha256_file(args.filters_csv),
         "query_ids_csv": sha256_file(args.query_ids_csv), "fbin": sha256_file(args.fbin),
+        "query_cohort_manifest": sha256_file(args.query_cohort_manifest),
     }
     import psycopg
     conninfo = pg_config_from_env().conninfo
@@ -1515,9 +2025,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 security_cur.close()
                 conn.commit()
             base_table_mapping = verify_base_table_vector_mapping(
-                conn, args.vector_table, vectors, query_ids, args.base_table_mapping_sample_size
+                conn,
+                args.vector_table,
+                vectors,
+                query_ids,
+                args.base_table_mapping_sample_size,
+                args.candidate_validity_predicate,
             )
-            run_spec = build_run_spec(args, filters, query_ids, source_hashes, backend_config, base_table_mapping)
+            run_spec = build_run_spec(
+                args,
+                filters,
+                query_ids,
+                source_hashes,
+                backend_config,
+                base_table_mapping,
+                query_cohort.provenance,
+            )
             run_spec_hash = canonical_sha256(run_spec)
             args.artifact_dir.mkdir(parents=True, exist_ok=True)
             out = args.out or args.artifact_dir / "amazon10m_sql_native_exact_truth_q200.csv"
@@ -1572,7 +2095,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "truth_csv_sha256": sha256_text(csv_payload),
         },
         backend=backend_config,
-        pairs=[{key: payload[key] for key in ("workload", "filter", "as_of", "session", "relations", "candidate_sql", "candidate_sql_sha256", "candidate_explain", "candidate_explain_gate", "spot_check_sql", "spot_check_sql_sha256", "spot_check_explain", "spot_check_explain_gate", "candidate", "exact_scan_ms", "exact_backend", "spot_checks")} for payload in completed],
+        pairs=[{key: payload[key] for key in (
+            "workload", "filter", "as_of", "workload_scalar_predicate",
+            "workload_scalar_predicate_sha256", "candidate_universe_predicate",
+            "candidate_universe_predicate_sha256", "session", "relations",
+            "candidate_sql", "candidate_sql_sha256", "candidate_explain",
+            "candidate_explain_gate", "spot_check_sql", "spot_check_sql_sha256",
+            "spot_check_explain", "spot_check_explain_gate", "candidate",
+            "exact_scan_ms", "exact_backend", "spot_checks",
+        )} for payload in completed],
         data_version_proof=data_version_proof,
         rls_security_proof=rls_security_proof,
     )

@@ -1,3 +1,4 @@
+import argparse
 import csv
 import hashlib
 import io
@@ -23,22 +24,33 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         fbin = directory / "vectors.fbin"
         filters_csv = directory / "filters.csv"
         query_ids_csv = directory / "queries.csv"
+        query_cohort_manifest = directory / "queries.manifest.json"
         candidate = directory / "candidate.ids"
         truth_csv = directory / "truth.csv"
         manifest_path = directory / "truth.manifest.json"
         fbin.write_bytes(b"fixture-fbin")
         filters_csv.write_text("fixture-filters\n", encoding="utf-8")
         query_ids_csv.write_text("fixture-queries\n", encoding="utf-8")
+        query_cohort_manifest.write_text("{}\n", encoding="utf-8")
         candidate.write_text("1\n2\n3\n", encoding="ascii")
         workload = benchmark.WorkloadSpec("acl_only", "fixture", 50.0, False)
         spec = benchmark.FilterSpec("f", "1%", "rating = 5", ("sql:rating = 5",), 3, 1.0)
         query_ids = {0: 10}
         query_splits = {0: "calibration"}
+        cohort_hash = benchmark.query_cohort_sha256(query_ids, query_splits)
+        validity_predicate = "embedding_valid"
+        validity_hash = benchmark.candidate_universe_predicate_sha256(
+            validity_predicate
+        )
+        scalar_hash = benchmark.workload_scalar_predicate_sha256(spec.predicate)
         as_of = {workload.name: 123}
         candidate_hash = benchmark.sha256_file(candidate)
         distance_sq = 4.0
         row = {
             "workload": workload.name, "filter_name": spec.name, "predicate": spec.predicate,
+            "workload_scalar_predicate_sha256": scalar_hash,
+            "candidate_universe_predicate": validity_predicate,
+            "candidate_universe_predicate_sha256": validity_hash,
             "query_no": 0, "query_id": 10, "query_split": "calibration", "k": 1,
             "as_of": 123, "self_excluded": True, "candidate_count": 3,
             "candidate_min_id": 1, "candidate_max_id": 3, "candidate_ids_sha256": candidate_hash,
@@ -55,6 +67,7 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
             "script": "0" * 64,
             "filters_csv": benchmark.sha256_file(filters_csv),
             "query_ids_csv": benchmark.sha256_file(query_ids_csv),
+            "query_cohort_manifest": benchmark.sha256_file(query_cohort_manifest),
             "fbin": benchmark.sha256_file(fbin),
         }
         run_spec = {
@@ -63,7 +76,30 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
             "filters": [{"name": spec.name, "target_rate": spec.target_rate, "predicate": spec.predicate,
                          "expected_rows": spec.expected_rows, "actual_pct": spec.actual_pct}],
             "workloads": [{"name": workload.name, "bucket_pct": workload.bucket_pct, "temporal_kind": "none"}],
-            "query_ids": {"0": 10}, "source_hashes": source_hashes,
+            "query_ids": {"0": 10}, "query_splits": {"0": "calibration"},
+            "query_cohort_sha256": cohort_hash,
+            "query_cohort_hash_contract": exact_truth.QUERY_COHORT_HASH_CONTRACT,
+            "query_cohort": {
+                "source_csv_sha256": source_hashes["query_ids_csv"],
+                "source_manifest": {
+                    "path": str(query_cohort_manifest),
+                    "sha256": source_hashes["query_cohort_manifest"],
+                },
+                "query_count": 1,
+                "query_cohort_sha256": cohort_hash,
+                "query_cohort_hash_contract": exact_truth.QUERY_COHORT_HASH_CONTRACT,
+            },
+            "candidate_universe": {
+                "predicate": validity_predicate,
+                "predicate_sha256": validity_hash,
+                "sql_role": "candidate_relation_only; separate from workload scalar predicate",
+            },
+            "workload_scalar_predicates": [{
+                "filter_name": spec.name,
+                "predicate": spec.predicate,
+                "predicate_sha256": scalar_hash,
+            }],
+            "source_hashes": source_hashes,
         }
         backend = {
             "backend": "faiss", "class": "IndexFlatL2", "faiss_version": "1.14.2",
@@ -86,23 +122,37 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         }
         run_spec["backend"] = backend
         run_spec["base_table_mapping"] = mapping
-        candidate_sql = (
-            "SELECT v.id FROM t AS v JOIN public.amazon_review_facts AS fact ON fact.review_id = v.id "
-            "JOIN public.amazon_product_dim AS product ON product.parent_asin = fact.parent_asin "
-            "JOIN public.amazon_principal_tenant_grants AS grant_row ON grant_row.tenant_id = product.tenant_id "
-            "WHERE current_user IS NOT NULL ORDER BY v.id"
+        exact_workload = exact_truth.WorkloadSpec(
+            workload.name, workload.description, workload.bucket_pct, "none"
         )
-        spot_sql = "SELECT v.id FROM t AS v WHERE current_user IS NOT NULL"
-        trigger = [["amazon_sql_native_epoch_bump", "CREATE TRIGGER ..."]]
+        candidate_sql = exact_truth.build_candidate_sql(
+            "t", spec.predicate, exact_workload, validity_predicate
+        )
+        spot_sql = exact_truth.build_spot_check_sql(
+            "t", spec.predicate, exact_workload, validity_predicate
+        )
+        trigger = [[
+            "amazon_sql_native_epoch_bump",
+            "O",
+            "public.amazon_sql_native_bump_relation_epoch()",
+            "INSERT INTO public.amazon_sql_native_relation_epoch VALUES (1); "
+            "ON CONFLICT DO UPDATE SET epoch = epoch + 1",
+            "CREATE TRIGGER amazon_sql_native_epoch_bump AFTER INSERT OR DELETE OR UPDATE OR TRUNCATE "
+            "ON t FOR EACH STATEMENT EXECUTE FUNCTION amazon_sql_native_bump_relation_epoch()",
+        ]]
         relation_data = {
-            "t": {"oid": 1, "policies": [], "triggers": trigger},
-            "public.amazon_review_facts": {"oid": 2, "policies": [], "triggers": trigger},
-            "public.amazon_product_dim": {"oid": 3, "triggers": trigger},
-            "public.amazon_principal_tenant_grants": {"oid": 4, "triggers": trigger},
-            "public.amazon_sql_native_buckets": {"oid": 5, "triggers": trigger},
+            "t": {"oid": 1, "data_epoch": 11, "policies": [], "triggers": trigger},
+            "public.amazon_review_facts": {"oid": 2, "data_epoch": 12, "policies": [], "triggers": trigger},
+            "public.amazon_product_dim": {"oid": 3, "data_epoch": 13, "triggers": trigger},
+            "public.amazon_principal_tenant_grants": {"oid": 4, "data_epoch": 14, "triggers": trigger},
+            "public.amazon_sql_native_buckets": {"oid": 5, "data_epoch": 15, "triggers": trigger},
         }
         pair = {
             "workload": workload.name, "filter": {"name": spec.name}, "as_of": 123,
+            "workload_scalar_predicate": spec.predicate,
+            "workload_scalar_predicate_sha256": scalar_hash,
+            "candidate_universe_predicate": validity_predicate,
+            "candidate_universe_predicate_sha256": validity_hash,
             "session": {"current_user": "principal"},
             "relations": relation_data, "candidate": {"count": 3, "min_id": 1, "max_id": 3,
                                                         "sha256": candidate_hash, "path": str(candidate)},
@@ -121,8 +171,13 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
                              "sql_ids": [1, 2], "sql_distances": [4.0, 9.0]}],
         }
         manifest = {
-            "artifact_valid": True, "artifact": "amazon10m_sql_native_exact_truth", "version": 3,
+            "artifact_valid": True, "artifact": "amazon10m_sql_native_exact_truth", "version": 4,
             "run_spec": run_spec, "run_spec_hash": benchmark.canonical_sha256(run_spec),
+            "query_cohort": run_spec["query_cohort"],
+            "query_cohort_sha256": cohort_hash,
+            "candidate_universe": run_spec["candidate_universe"],
+            "candidate_universe_predicate_sha256": validity_hash,
+            "relation_epoch": benchmark.relation_epoch_contract(relation_data),
             "source_hashes": source_hashes,
             "fbin": {"path": str(fbin)},
             "backend": backend, "base_table_mapping": mapping,
@@ -145,6 +200,7 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         return {
             "fbin": fbin, "filters_csv": filters_csv, "query_ids_csv": query_ids_csv,
+            "query_cohort_manifest": query_cohort_manifest,
             "truth_csv": truth_csv, "manifest_path": manifest_path, "manifest": manifest,
             "workload": workload, "spec": spec, "query_ids": query_ids, "query_splits": query_splits,
             "as_of": as_of, "relations": relation_data,
@@ -156,6 +212,7 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
             fixture["query_ids_csv"], [fixture["workload"]], [fixture["spec"]], fixture["query_ids"],
             fixture["query_splits"], fixture["as_of"], "t", "principal", 1, fixture["relations"],
             require_formal_keyspace=False,
+            query_cohort_manifest=fixture["query_cohort_manifest"],
         )
 
     def test_defaults_are_formal_disjoint_q100_q100_and_r2_r5(self):
@@ -177,6 +234,8 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         self.assertEqual(args.exact_truth_csv, benchmark.DEFAULT_EXACT_TRUTH_CSV)
         self.assertEqual(args.exact_truth_manifest, benchmark.DEFAULT_EXACT_TRUTH_MANIFEST)
         self.assertFalse(args.debug_compute_exact_truth)
+        self.assertEqual(args.candidate_validity_predicate, "embedding_valid")
+        self.assertIn("valid_embeddings_formal", args.query_ids_csv.name)
         filters = benchmark.read_filters(
             ROOT / "configs" / "amazon10m_selectivity14_filters.csv"
         )
@@ -208,6 +267,15 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
                 "backend": lambda data: data["manifest"]["pairs"][0]["exact_backend"].update({"exact": False}),
                 "mapping": lambda data: data["manifest"]["base_table_mapping"].update({"checked_rows": 1}),
                 "data_version": lambda data: data["manifest"]["data_version_proof"].update({"end_hash": "d" * 64}),
+                "candidate_universe_manifest": lambda data: data["manifest"].update(
+                    {"candidate_universe_predicate_sha256": "f" * 64}
+                ),
+                "query_cohort_manifest": lambda data: data["manifest"].update(
+                    {"query_cohort_sha256": "e" * 64}
+                ),
+                "relation_epoch_manifest": lambda data: data["manifest"]["relation_epoch"].update(
+                    {"sha256": "d" * 64}
+                ),
                 "rls_probe": lambda data: data["manifest"]["rls_security_proof"].update({"negative_probe_hidden": False}),
                 "stale": lambda data: data["truth_csv"].write_text(data["truth_csv"].read_text(encoding="utf-8").replace(",4.0,", ",5.0,"), encoding="utf-8"),
                 "incomplete": lambda data: data["truth_csv"].write_text(data["truth_csv"].read_text(encoding="utf-8").split("\n", 1)[0] + "\n", encoding="utf-8"),
@@ -224,6 +292,23 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
                     current["manifest_path"].write_text(json.dumps(current["manifest"]), encoding="utf-8")
                     with self.assertRaisesRegex(RuntimeError, "exact-truth artifact rejected"):
                         self._load_external_fixture(current)
+
+    def test_external_truth_rejects_query_cohort_mismatch_before_loading_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._external_truth_fixture(Path(tmp))
+            fixture["query_ids"] = {0: 11}
+            with self.assertRaisesRegex(RuntimeError, "query cohort"):
+                self._load_external_fixture(fixture)
+
+    def test_external_truth_explicitly_rejects_legacy_artifact_version(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._external_truth_fixture(Path(tmp))
+            fixture["manifest"]["version"] = 3
+            fixture["manifest_path"].write_text(
+                json.dumps(fixture["manifest"]), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(RuntimeError, "legacy/incompatible.*observed=3"):
+                self._load_external_fixture(fixture)
 
     def test_external_truth_rejects_manifest_and_record_checkpoint_staleness(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -258,6 +343,8 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
                         "query_split",
                         "self_excluded",
                         "kth_distance_sq",
+                        "candidate_validity_predicate",
+                        "query_validity_predicate",
                     ],
                 )
                 writer.writeheader()
@@ -270,6 +357,8 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
                             "query_split": "calibration" if query_no < 2 else "final",
                             "self_excluded": True,
                             "kth_distance_sq": 1.0,
+                            "candidate_validity_predicate": "embedding_valid",
+                            "query_validity_predicate": "embedding_valid",
                         }
                     )
             calibration = benchmark.load_query_ids(path, 0, 2)
@@ -284,6 +373,8 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         normalized = " ".join(sql_text.lower().split())
         self.assertIn("order by v.embedding <-> query_vector.embedding", normalized)
         self.assertIn("v.id <> query_vector.query_id", normalized)
+        self.assertIn("v.embedding_valid", normalized)
+        self.assertIn("query_row.embedding_valid", normalized)
         self.assertIn("vector_hnsw_guidance_bind", normalized)
         self.assertIn("%(binding_kind)s", sql_text)
         self.assertNotIn("vector_hnsw_guidance_bind", exact_text.lower())
@@ -307,7 +398,19 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         self.assertIn("current_user", normalized)
         self.assertIn("fact.valid_from <= %(as_of)s", normalized)
         self.assertIn("v.rating = 5", normalized)
+        self.assertIn("v.embedding_valid", exact_normalized)
         self.assertEqual(normalized.count("select"), 3)
+
+    def test_candidate_validity_predicate_rejects_nonformal_expressions(self):
+        for predicate in (
+            "embedding_valid; DROP TABLE x",
+            "embedding_valid -- comment",
+            "embedding_valid /* comment */",
+            "embedding_valid) OR true OR (embedding_valid",
+        ):
+            with self.subTest(predicate=predicate):
+                with self.assertRaisesRegex(argparse.ArgumentTypeError, "must be exactly"):
+                    benchmark.validate_candidate_validity_predicate(predicate)
 
     def test_sqlens_provenance_gate_rejects_old_or_incomplete_profiles(self):
         profile = {
@@ -651,6 +754,13 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
             "workload": workload.name,
             "filter_name": spec.name,
             "predicate": spec.predicate,
+            "workload_scalar_predicate_sha256": benchmark.workload_scalar_predicate_sha256(
+                spec.predicate
+            ),
+            "candidate_universe_predicate": "embedding_valid",
+            "candidate_universe_predicate_sha256": benchmark.candidate_universe_predicate_sha256(
+                "embedding_valid"
+            ),
             "as_of": 123,
             "principal": "principal",
             "snapshot_as_of": 123,
@@ -961,7 +1071,13 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
             [benchmark.FilterSpec("f", "1%", "rating = 5", ("sql:rating = 5",), 10, 1.0)],
             {0: 10},
             {100: 20},
-            {"sqlens_build_id": "build-x", "relations": {"t": {"oid": 1}}},
+            {
+                "sqlens_build_id": "build-x",
+                "relations": {"t": {"oid": 1, "data_epoch": 9}},
+                "formal_data_version_proof": {
+                    "start_relations": {"t": {"oid": 1, "data_epoch": 9}}
+                },
+            },
             {"join_acl": 1000},
         )
         self.assertEqual(manifest["database"]["sqlens_build_id"], "build-x")
@@ -972,6 +1088,10 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         self.assertEqual(manifest["source_index"], benchmark.DEFAULT_SOURCE_INDEX)
         self.assertEqual(manifest["clone_index"], benchmark.DEFAULT_CLONE_INDEX)
         self.assertTrue(manifest["sql_contract"]["single_select"])
+        self.assertEqual(manifest["relation_epoch"]["relations"], {"t": 9})
+        self.assertEqual(
+            manifest["candidate_universe"]["predicate"], "embedding_valid"
+        )
         self.assertTrue(manifest["rls_and_guidance_contract"]["facts_policy_always_enforced"])
         self.assertEqual(
             manifest["rls_and_guidance_contract"]["executor_recheck"],
