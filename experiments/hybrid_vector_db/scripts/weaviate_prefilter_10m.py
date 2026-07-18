@@ -152,6 +152,7 @@ def create_schema(base_url: str, vector_dim: int, ef: int | None) -> None:
             {"name": "price", "dataType": ["number"], "indexFilterable": True, "indexRangeFilters": True},
             {"name": "has_price", "dataType": ["boolean"], "indexFilterable": True},
             {"name": "item_rating_number", "dataType": ["int"], "indexFilterable": True, "indexRangeFilters": True},
+            {"name": "embedding_valid", "dataType": ["boolean"], "indexFilterable": True},
         ],
     }
     post_json(base_url, "/v1/schema", payload)
@@ -259,6 +260,9 @@ def import_data(args: argparse.Namespace, xb: np.memmap, rows: int) -> None:
                     "price": price,
                     "has_price": row["has_price"] == "True",
                     "item_rating_number": int(float(row["item_rating_number"])),
+                    "embedding_valid": bool(
+                        np.linalg.norm(np.asarray(xb[i], dtype=np.float32)) > 0
+                    ),
                 },
                 "vector": np.asarray(xb[i], dtype=np.float32).tolist(),
             }

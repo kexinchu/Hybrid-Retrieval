@@ -282,6 +282,9 @@ class Amazon10mMatchedRecallBaselineTests(unittest.TestCase):
                 "tie_tolerance",
                 "self_excluded",
                 "query_split",
+                "candidate_validity_predicate",
+                "query_validity_predicate",
+                "candidate_rows",
             ]
             with path.open("w", newline="", encoding="utf-8") as target:
                 writer = csv.DictWriter(target, fieldnames=fieldnames)
@@ -299,6 +302,9 @@ class Amazon10mMatchedRecallBaselineTests(unittest.TestCase):
                         "tie_tolerance": 1e-9,
                         "self_excluded": True,
                         "query_split": "calibration",
+                        "candidate_validity_predicate": "embedding_valid",
+                        "query_validity_predicate": "embedding_valid",
+                        "candidate_rows": 20,
                     }
                 )
                 writer.writerow(
@@ -314,6 +320,9 @@ class Amazon10mMatchedRecallBaselineTests(unittest.TestCase):
                         "tie_tolerance": 1e-9,
                         "self_excluded": True,
                         "query_split": "final",
+                        "candidate_validity_predicate": "embedding_valid",
+                        "query_validity_predicate": "embedding_valid",
+                        "candidate_rows": 20,
                     }
                 )
 
@@ -577,7 +586,8 @@ class Amazon10mMatchedRecallBaselineTests(unittest.TestCase):
             truth = root / "truth.csv"
             fields = ["query_no", "query_id", "filter_name", "method", "exact_filtered_topk_ids",
                       "recall_at_10_exact_filtered", "filtered_rows", "kth_distance_sq", "tie_tolerance",
-                      "self_excluded", "query_split"]
+                      "self_excluded", "query_split", "candidate_validity_predicate",
+                      "query_validity_predicate", "candidate_rows"]
             with truth.open("w", newline="", encoding="utf-8") as target:
                 writer = csv.DictWriter(target, fieldnames=fields)
                 writer.writeheader()
@@ -585,7 +595,9 @@ class Amazon10mMatchedRecallBaselineTests(unittest.TestCase):
                     writer.writerow({"query_no": query_no, "query_id": query_no + 2,
                         "filter_name": SPEC.name, "method": "pre_filter_exact", "exact_filtered_topk_ids": "5,6",
                         "recall_at_10_exact_filtered": 1.0, "filtered_rows": 20, "kth_distance_sq": 1.0,
-                        "tie_tolerance": 1e-9, "self_excluded": True, "query_split": split})
+                        "tie_tolerance": 1e-9, "self_excluded": True, "query_split": split,
+                        "candidate_validity_predicate": "embedding_valid",
+                        "query_validity_predicate": "embedding_valid", "candidate_rows": 20})
             fbin, faiss = root / "vectors.fbin", root / "index.faiss"
             fbin.write_bytes(b"vectors")
             faiss.write_bytes(b"index")

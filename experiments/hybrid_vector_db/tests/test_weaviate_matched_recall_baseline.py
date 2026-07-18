@@ -246,8 +246,8 @@ class WeaviateMatchedRecallBaselineTests(unittest.TestCase):
     def test_truth_loader_requires_tie_aware_self_excluded_contract(self):
         spec = runner.FILTERS[0]
         rows = [
-            {"query_no": 0, "query_id": 10, "filter_name": spec.name, "method": "pre_filter_exact", "filtered_rows": spec.expected_rows, "k": 10, "kth_distance_sq": "0", "tie_tolerance": "1e-7", "self_excluded": "true", "query_split": "calibration"},
-            {"query_no": 1, "query_id": 11, "filter_name": spec.name, "method": "pre_filter_exact", "filtered_rows": spec.expected_rows, "k": 10, "kth_distance_sq": "2.5", "tie_tolerance": "2.5e-6", "self_excluded": "true", "query_split": "final"},
+            {"query_no": 0, "query_id": 10, "filter_name": spec.name, "method": "pre_filter_exact", "filtered_rows": spec.expected_rows, "candidate_rows": spec.expected_rows, "candidate_validity_predicate": "embedding_valid", "query_validity_predicate": "embedding_valid", "k": 10, "kth_distance_sq": "0", "tie_tolerance": "1e-7", "self_excluded": "true", "query_split": "calibration"},
+            {"query_no": 1, "query_id": 11, "filter_name": spec.name, "method": "pre_filter_exact", "filtered_rows": spec.expected_rows, "candidate_rows": spec.expected_rows, "candidate_validity_predicate": "embedding_valid", "query_validity_predicate": "embedding_valid", "k": 10, "kth_distance_sq": "2.5", "tie_tolerance": "2.5e-6", "self_excluded": "true", "query_split": "final"},
         ]
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "truth.csv"
@@ -349,8 +349,9 @@ class WeaviateMatchedRecallBaselineTests(unittest.TestCase):
         }
         args = runner.build_parser().parse_args(["--ef-values", "100", "--out", "/unused/out.csv"])
         total = {"data": {"Aggregate": {runner.CLASS_NAME: [{"meta": {"count": runner.EXPECTED_ROWS}}]}}}
+        valid = {"data": {"Aggregate": {runner.CLASS_NAME: [{"meta": {"count": runner.EXPECTED_VALID_ROWS}}]}}}
         filtered = {"data": {"Aggregate": {runner.CLASS_NAME: [{"meta": {"count": spec.expected_rows}}]}}}
-        with mock.patch.object(runner, "isolate_existing_outputs", return_value=None), mock.patch.object(runner, "load_filter_specs", return_value=(spec,)), mock.patch.object(runner, "read_fbin_memmap", return_value=(vectors, len(vectors), 2)), mock.patch.object(runner, "load_truth", return_value=(truth, query_ids)), mock.patch.object(runner, "request_json", side_effect=[(initial, 0), ({"version": "test"}, 0), (ready_nodes(), 0)]), mock.patch.object(runner, "graphql", side_effect=[(total, 0), (filtered, 0)]), mock.patch.object(runner, "put_hnsw_config", side_effect=RuntimeError("update failed")), mock.patch.object(runner, "put_schema_definition", return_value=(initial, 0)) as restore, mock.patch.object(runner, "get_ready_nodes", side_effect=[(ready_nodes(), 0), (ready_nodes(), 0)]):
+        with mock.patch.object(runner, "isolate_existing_outputs", return_value=None), mock.patch.object(runner, "load_filter_specs", return_value=(spec,)), mock.patch.object(runner, "read_fbin_memmap", return_value=(vectors, len(vectors), 2)), mock.patch.object(runner, "load_truth", return_value=(truth, query_ids)), mock.patch.object(runner, "request_json", side_effect=[(initial, 0), ({"version": "test"}, 0), (ready_nodes(), 0)]), mock.patch.object(runner, "graphql", side_effect=[(total, 0), (valid, 0), (filtered, 0)]), mock.patch.object(runner, "put_hnsw_config", side_effect=RuntimeError("update failed")), mock.patch.object(runner, "put_schema_definition", return_value=(initial, 0)) as restore, mock.patch.object(runner, "get_ready_nodes", side_effect=[(ready_nodes(), 0), (ready_nodes(), 0)]):
             with self.assertRaisesRegex(RuntimeError, "update failed"):
                 runner.run(args)
         self.assertEqual(restore.call_count, 1)
@@ -538,12 +539,13 @@ class WeaviateMatchedRecallBaselineTests(unittest.TestCase):
         query_ids = {0: 19, 1: 19}
         truth = {(spec.name, query_no): truth_entry(query_no, 19, spec.name) for query_no in query_ids}
         total = {"data": {"Aggregate": {runner.CLASS_NAME: [{"meta": {"count": runner.EXPECTED_ROWS}}]}}}
+        valid = {"data": {"Aggregate": {runner.CLASS_NAME: [{"meta": {"count": runner.EXPECTED_VALID_ROWS}}]}}}
         filtered = {"data": {"Aggregate": {runner.CLASS_NAME: [{"meta": {"count": spec.expected_rows}}]}}}
         result = runner.QueryResult(tuple(range(10)), 1.0, 0, "", "")
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(runner, "CALIBRATION_QUERY_NOS", (0,)), mock.patch.object(runner, "FINAL_QUERY_NOS", (1,)), mock.patch.object(runner, "CALIBRATION_REPEATS", 1), mock.patch.object(runner, "FINAL_REPEATS", 1):
             out = Path(tmp) / "run.csv"
             args = runner.build_parser().parse_args(["--ef-values", "100", "250", "--targets", "0.9", "--warmup-queries", "1", "--out", str(out)])
-            with mock.patch.object(runner, "load_filter_specs", return_value=(spec,)), mock.patch.object(runner, "read_fbin_memmap", return_value=(vectors, len(vectors), 2)), mock.patch.object(runner, "load_truth", return_value=(truth, query_ids)), mock.patch.object(runner, "sha256_file", return_value="hash"), mock.patch.object(runner, "request_json", side_effect=[(initial, 0), ({"version": "test"}, 0)]), mock.patch.object(runner, "get_ready_nodes", return_value=(ready_nodes(), 0)), mock.patch.object(runner, "graphql", side_effect=[(total, 0), (filtered, 0)]), mock.patch.object(runner, "put_hnsw_config", return_value=(initial, 0.0, 0)) as put_config, mock.patch.object(runner, "put_schema_definition", return_value=(initial, 0)), mock.patch.object(runner, "query_once", return_value=result):
+            with mock.patch.object(runner, "load_filter_specs", return_value=(spec,)), mock.patch.object(runner, "read_fbin_memmap", return_value=(vectors, len(vectors), 2)), mock.patch.object(runner, "load_truth", return_value=(truth, query_ids)), mock.patch.object(runner, "sha256_file", return_value="hash"), mock.patch.object(runner, "request_json", side_effect=[(initial, 0), ({"version": "test"}, 0)]), mock.patch.object(runner, "get_ready_nodes", return_value=(ready_nodes(), 0)), mock.patch.object(runner, "graphql", side_effect=[(total, 0), (valid, 0), (filtered, 0)]), mock.patch.object(runner, "put_hnsw_config", return_value=(initial, 0.0, 0)) as put_config, mock.patch.object(runner, "put_schema_definition", return_value=(initial, 0)), mock.patch.object(runner, "query_once", return_value=result):
                 self.assertEqual(runner.run(args), 0)
             self.assertEqual([call.args[2] for call in put_config.call_args_list], [100, 100])
             self.assertTrue(out.is_file())

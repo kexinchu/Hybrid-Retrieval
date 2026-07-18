@@ -44,8 +44,8 @@ NA = "N/A"
 TARGET_SELECTION_RULE = "query-level mean recall@10 >= target; bootstrap CI/LCB reporting only"
 ACORN_REPORTED_STRATEGY = "acorn_configured_auto_fallback"
 ACORN_RATIO_ENV = "HNSW_ACORN_FILTER_RATIO"
-DEFAULT_FILTERS = ROOT / "experiments/hybrid_vector_db/configs/amazon10m_selectivity14_filters.csv"
-DEFAULT_TRUTH = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_formal.csv"
+DEFAULT_FILTERS = ROOT / "experiments/hybrid_vector_db/configs/amazon10m_selectivity14_valid_embeddings_filters.csv"
+DEFAULT_TRUTH = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_valid_embeddings_formal.csv"
 DEFAULT_FBIN = ROOT / "data/amazon_reviews_2023/processed/grocery_reviews_10m_tfidf_svd128.fbin"
 DEFAULT_OUT = ROOT / "results/hybrid_vector_db/weaviate_matched_recall_baseline.csv"
 
@@ -61,7 +61,9 @@ class FilterSpec:
 
     def __post_init__(self) -> None:
         if not self.where:
-            object.__setattr__(self, "where", predicate_to_where(self.predicate))
+            object.__setattr__(
+                self, "where", with_candidate_universe(predicate_to_where(self.predicate))
+            )
 
 
 @dataclass(frozen=True)
@@ -89,19 +91,19 @@ class QueryResult:
 
 
 EXPECTED_FILTERS = {
-    "popular_ge1000": ("item_rating_number >= 1000", 5_031_984),
-    "popular_ge1340": ("item_rating_number >= 1340", 4_500_375),
-    "popular_ge1780": ("item_rating_number >= 1780", 4_000_444),
-    "popular_ge2428": ("item_rating_number >= 2428", 3_499_884),
-    "popular_ge3284": ("item_rating_number >= 3284", 3_000_207),
-    "popular_ge4559": ("item_rating_number >= 4559", 2_500_079),
-    "price_10_to_20": ("has_price AND price > 10 AND price <= 20", 2_189_009),
-    "popular_ge10066": ("item_rating_number >= 10066", 1_500_795),
-    "rating5_price_le10": ("has_price AND price <= 10 AND rating = 5", 958_716),
-    "long_review_ge500": ("review_text_len >= 500", 588_019),
-    "grocery_rating5": ("main_category = 'Grocery' AND rating = 5", 234_056),
-    "grocery_helpful": ("main_category = 'Grocery' AND helpful_vote >= 1", 101_481),
-    "helpful_ge20": ("helpful_vote >= 20", 60_689),
+    "popular_ge1000": ("item_rating_number >= 1000", 5_019_997),
+    "popular_ge1340": ("item_rating_number >= 1340", 4_489_429),
+    "popular_ge1780": ("item_rating_number >= 1780", 3_990_500),
+    "popular_ge2428": ("item_rating_number >= 2428", 3_491_010),
+    "popular_ge3284": ("item_rating_number >= 3284", 2_992_481),
+    "popular_ge4559": ("item_rating_number >= 4559", 2_493_459),
+    "price_10_to_20": ("has_price AND price > 10 AND price <= 20", 2_184_326),
+    "popular_ge10066": ("item_rating_number >= 10066", 1_496_628),
+    "rating5_price_le10": ("has_price AND price <= 10 AND rating = 5", 955_625),
+    "long_review_ge500": ("review_text_len >= 500", 588_018),
+    "grocery_rating5": ("main_category = 'Grocery' AND rating = 5", 233_510),
+    "grocery_helpful": ("main_category = 'Grocery' AND helpful_vote >= 1", 101_387),
+    "helpful_ge20": ("helpful_vote >= 20", 60_683),
     "grocery_long500": ("main_category = 'Grocery' AND review_text_len >= 500", 21_317),
 }
 
@@ -115,7 +117,21 @@ PROPERTY_TYPES = {
     "price": "number",
     "has_price": "boolean",
     "item_rating_number": "int",
+    "embedding_valid": "boolean",
 }
+
+EXPECTED_VALID_ROWS = 9_979_556
+CANDIDATE_VALIDITY_PREDICATE = "embedding_valid"
+
+
+def with_candidate_universe(where: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "operator": "And",
+        "operands": [
+            copy.deepcopy(where),
+            {"path": ["embedding_valid"], "operator": "Equal", "valueBoolean": True},
+        ],
+    }
 
 
 def _tokenize_predicate(value: str) -> list[str]:
@@ -233,7 +249,7 @@ def builtin_filter_specs() -> tuple[FilterSpec, ...]:
                 predicate=predicate,
                 expected_rows=expected_rows,
                 actual_pct=expected_rows / EXPECTED_ROWS * 100.0,
-                where=predicate_to_where(predicate),
+                where=with_candidate_universe(predicate_to_where(predicate)),
             )
         )
     return tuple(specs)
@@ -267,7 +283,7 @@ def load_filter_specs(path: Path = DEFAULT_FILTERS) -> tuple[FilterSpec, ...]:
                 predicate=predicate,
                 expected_rows=expected_rows,
                 actual_pct=float(row["actual_pct"]),
-                where=predicate_to_where(predicate),
+                where=with_candidate_universe(predicate_to_where(predicate)),
             )
         )
     if {spec.name for spec in specs} != expected_names:
@@ -281,6 +297,9 @@ TRUTH_REQUIRED_FIELDS = {
     "kth_distance_sq",
     "tie_tolerance",
     "self_excluded",
+    "candidate_validity_predicate",
+    "query_validity_predicate",
+    "candidate_rows",
 }
 
 
@@ -306,7 +325,14 @@ def parse_truth_csv_row(row: dict[str, str], k: int = K) -> TruthEntry | None:
     self_excluded = parse_bool(row["self_excluded"])
     if not self_excluded:
         raise ValueError("truth rows must have self_excluded=true")
+    if (
+        row.get("candidate_validity_predicate") != CANDIDATE_VALIDITY_PREDICATE
+        or row.get("query_validity_predicate") != CANDIDATE_VALIDITY_PREDICATE
+    ):
+        raise ValueError("truth row candidate/query universe is not embedding_valid")
     filtered_rows = int(row["filtered_rows"])
+    if int(row["candidate_rows"]) != filtered_rows:
+        raise ValueError("truth row candidate_rows/filtered_rows mismatch")
     kth_distance_sq = float(row["kth_distance_sq"])
     tie_tolerance = float(row["tie_tolerance"])
     if filtered_rows < k:
@@ -1120,6 +1146,10 @@ def run_specification(
     return {
         "version": 1,
         "class": CLASS_NAME,
+        "candidate_universe": {
+            "predicate": CANDIDATE_VALIDITY_PREDICATE,
+            "expected_rows": EXPECTED_VALID_ROWS,
+        },
         "source_hashes": source_hashes,
         "endpoint": {"host": args.host, "port": args.port},
         "configured_filter_strategies": list(strategies),
@@ -1396,6 +1426,19 @@ def _count_query(spec: FilterSpec) -> str:
     return "{ Aggregate { " + f"{CLASS_NAME}(where:{json_to_graphql(spec.where)}) {{ meta {{ count }} }}" + " } }"
 
 
+def _candidate_universe_count_query() -> str:
+    where = {
+        "path": ["embedding_valid"],
+        "operator": "Equal",
+        "valueBoolean": True,
+    }
+    return (
+        "{ Aggregate { "
+        + f"{CLASS_NAME}(where:{json_to_graphql(where)}) {{ meta {{ count }} }}"
+        + " } }"
+    )
+
+
 def _run_measurements(
     args: argparse.Namespace,
     base_url: str,
@@ -1605,6 +1648,7 @@ def run(args: argparse.Namespace) -> int:
     target_statuses: dict[tuple[str, str, float], str] = {}
     service_meta: dict[str, Any] = {}
     total_count = 0
+    candidate_universe_count = 0
     filter_counts: dict[str, int] = {}
     configuration_schedule = calibration_configuration_schedule(strategies, args.ef_values)
     schema_restore_required = False
@@ -1641,6 +1685,20 @@ def run(args: argparse.Namespace) -> int:
         total_count = int(count_data["data"]["Aggregate"][CLASS_NAME][0]["meta"]["count"])
         if total_count != EXPECTED_ROWS:
             raise RuntimeError(f"Weaviate count mismatch: expected={EXPECTED_ROWS} actual={total_count}")
+        count_data, _ = graphql(
+            base_url,
+            _candidate_universe_count_query(),
+            timeout=args.timeout,
+            retries=args.retries,
+        )
+        candidate_universe_count = int(
+            count_data["data"]["Aggregate"][CLASS_NAME][0]["meta"]["count"]
+        )
+        if candidate_universe_count != EXPECTED_VALID_ROWS:
+            raise RuntimeError(
+                "Weaviate candidate universe count mismatch: "
+                f"expected={EXPECTED_VALID_ROWS} actual={candidate_universe_count}"
+            )
         for spec in filters:
             count_data, _ = graphql(base_url, _count_query(spec), timeout=args.timeout, retries=args.retries)
             actual = int(count_data["data"]["Aggregate"][CLASS_NAME][0]["meta"]["count"])
@@ -1828,6 +1886,11 @@ def run(args: argparse.Namespace) -> int:
         "k": K,
         "query_limit": K + 1,
         "recall_contract": "returned filter-valid self-excluded IDs with exact fbin squared L2 <= kth_distance_sq + tie_tolerance, capped at k",
+        "candidate_universe": {
+            "predicate": CANDIDATE_VALIDITY_PREDICATE,
+            "expected_rows": EXPECTED_VALID_ROWS,
+            "observed_rows": candidate_universe_count,
+        },
         "target_selection_rule": TARGET_SELECTION_RULE,
         "filters": [asdict(spec) for spec in filters],
         "configured_filter_strategies": strategies,
@@ -1883,6 +1946,10 @@ def run(args: argparse.Namespace) -> int:
         "service": {
             "meta": service_meta,
             "count": total_count,
+            "candidate_universe": {
+                "predicate": CANDIDATE_VALIDITY_PREDICATE,
+                "count": candidate_universe_count,
+            },
             "filter_counts": filter_counts,
             "result_order": "ascending _additional.distance",
             "measurement_mode": "single_client_sequential",

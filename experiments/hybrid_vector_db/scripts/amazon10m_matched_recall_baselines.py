@@ -35,12 +35,14 @@ except ImportError:  # Direct script execution puts this directory on sys.path.
 
 
 ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_FILTERS = ROOT / "experiments/hybrid_vector_db/configs/amazon10m_selectivity14_filters.csv"
-DEFAULT_TRUTH = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_formal.csv"
+DEFAULT_FILTERS = ROOT / "experiments/hybrid_vector_db/configs/amazon10m_selectivity14_valid_embeddings_filters.csv"
+DEFAULT_TRUTH = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_valid_embeddings_formal.csv"
 DEFAULT_FBIN = ROOT / "data/amazon_reviews_2023/processed/grocery_reviews_10m_tfidf_svd128.fbin"
 DEFAULT_FAISS_INDEX = ROOT / "data/faiss/amazon_grocery_10m_tfidf_svd128_hnsw_m16.index"
 DEFAULT_RESULTS = ROOT / "results/hybrid_vector_db"
 DEFAULT_TABLE = "amazon_grocery_reviews_10m_pgvector"
+DEFAULT_CANDIDATE_VALIDITY_PREDICATE = "embedding_valid"
+EXPECTED_VALID_ROWS = 9_979_556
 DEFAULT_EF_SEARCH = (250, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000)
 DEFAULT_TARGETS = (0.90, 0.95, 0.99)
 DEFAULT_CALIBRATION_QUERY_OFFSET = 20
@@ -129,6 +131,20 @@ def validate_table_name(value: str) -> str:
         if any(not (char.isalnum() or char in "_$") for char in part):
             raise argparse.ArgumentTypeError("table must contain unquoted SQL identifiers")
     return value
+
+
+def validate_candidate_validity_predicate(value: str) -> str:
+    normalized = " ".join(value.strip().split())
+    if normalized != DEFAULT_CANDIDATE_VALIDITY_PREDICATE:
+        raise argparse.ArgumentTypeError(
+            "formal Amazon-10M baselines require candidate universe embedding_valid"
+        )
+    return normalized
+
+
+def effective_predicate(predicate: str, candidate_validity_predicate: str) -> str:
+    validity = validate_candidate_validity_predicate(candidate_validity_predicate)
+    return f"({predicate}) AND ({validity})"
 
 
 def read_csv(path: Path) -> list[dict[str, str]]:
@@ -288,6 +304,9 @@ def load_truth(
         "tie_tolerance",
         "self_excluded",
         "query_split",
+        "candidate_validity_predicate",
+        "query_validity_predicate",
+        "candidate_rows",
     }
     if not rows or not required_fields.issubset(rows[0]):
         missing = sorted(required_fields - (set(rows[0]) if rows else set()))
@@ -296,6 +315,13 @@ def load_truth(
     for row in rows:
         if row.get("method") != "pre_filter_exact":
             continue
+        if (
+            row.get("candidate_validity_predicate")
+            != DEFAULT_CANDIDATE_VALIDITY_PREDICATE
+            or row.get("query_validity_predicate")
+            != DEFAULT_CANDIDATE_VALIDITY_PREDICATE
+        ):
+            raise ValueError("truth row candidate/query universe is not embedding_valid")
         filter_name = row["filter_name"]
         query_no = int(row["query_no"])
         if filter_name not in filter_names or query_no not in expected_query_nos:
@@ -321,13 +347,17 @@ def load_truth(
             raise ValueError(f"truth pair {key} contains its own query ID")
         if row.get("recall_at_10_exact_filtered") not in (None, "", "1", "1.0"):
             raise ValueError(f"truth pair {key} is not marked exact")
+        candidate_rows = int(row["candidate_rows"])
+        filtered_rows = int(float(row["filtered_rows"]))
+        if candidate_rows != filtered_rows:
+            raise ValueError(f"truth pair {key} candidate_rows/filtered_rows mismatch")
         truth[key] = TruthEntry(
             query_no=query_no,
             query_id=query_id,
             filter_name=filter_name,
             split=split,
             ids=ids,
-            candidate_rows=int(float(row["filtered_rows"])),
+            candidate_rows=candidate_rows,
             kth_distance_sq=float(row["kth_distance_sq"]),
             tie_tolerance=float(row["tie_tolerance"]),
             self_excluded=self_excluded,
@@ -383,7 +413,13 @@ def read_fbin_memmap(path: Path, limit: int | None = None) -> tuple[Any, int, in
     return vectors[:rows], rows, dimensions
 
 
-def exact_sql(table: str, predicate: str, k: int) -> str:
+def exact_sql(
+    table: str,
+    predicate: str,
+    k: int,
+    candidate_validity_predicate: str = DEFAULT_CANDIDATE_VALIDITY_PREDICATE,
+) -> str:
+    predicate = effective_predicate(predicate, candidate_validity_predicate)
     return f"""
 WITH filtered AS MATERIALIZED (
     SELECT id, embedding
@@ -469,6 +505,7 @@ def build_allow_list(
     spec: FilterSpec,
     total_rows: int,
     fetch_rows: int,
+    candidate_validity_predicate: str = DEFAULT_CANDIDATE_VALIDITY_PREDICATE,
 ) -> AllowList:
     import numpy as np
 
@@ -479,7 +516,10 @@ def build_allow_list(
         cursor_name = f"allowlist_{hashlib.sha1(spec.name.encode()).hexdigest()[:12]}"
         with conn.transaction():
             with conn.cursor(name=cursor_name) as cursor:
-                cursor.execute(f"SELECT id FROM {table} WHERE {spec.predicate}")
+                cursor.execute(
+                    f"SELECT id FROM {table} WHERE "
+                    + effective_predicate(spec.predicate, candidate_validity_predicate)
+                )
                 while True:
                     batch = cursor.fetchmany(fetch_rows)
                     if not batch:
@@ -1221,10 +1261,16 @@ def artifact_validation_errors(
     return errors
 
 
-def prefetch_sql_query_vectors(cursor: Any, table: str, query_ids: Iterable[int]) -> dict[int, str]:
+def prefetch_sql_query_vectors(
+    cursor: Any,
+    table: str,
+    query_ids: Iterable[int],
+    candidate_validity_predicate: str = DEFAULT_CANDIDATE_VALIDITY_PREDICATE,
+) -> dict[int, str]:
     wanted = sorted(set(int(query_id) for query_id in query_ids))
     cursor.execute(
-        f"SELECT id, embedding::text FROM {table} WHERE id = ANY(%s::bigint[])",
+        f"SELECT id, embedding::text FROM {table} WHERE id = ANY(%s::bigint[]) "
+        f"AND ({validate_candidate_validity_predicate(candidate_validity_predicate)})",
         (wanted,),
     )
     vectors = {int(row[0]): str(row[1]) for row in cursor.fetchall()}
@@ -1728,7 +1774,22 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                 (args.table,),
             )
             postgres_version, vector_version, table_oid, table_relfilenode = cursor.fetchone()
-            sql_query_vectors = prefetch_sql_query_vectors(cursor, args.table, query_ids.values())
+            cursor.execute(
+                f"SELECT count(*) FROM {args.table} "
+                f"WHERE ({args.candidate_validity_predicate})"
+            )
+            valid_rows = int(cursor.fetchone()[0])
+            if valid_rows != EXPECTED_VALID_ROWS:
+                raise ValueError(
+                    f"candidate universe row mismatch: expected={EXPECTED_VALID_ROWS} "
+                    f"actual={valid_rows}"
+                )
+            sql_query_vectors = prefetch_sql_query_vectors(
+                cursor,
+                args.table,
+                query_ids.values(),
+                args.candidate_validity_predicate,
+            )
             manifest["postgres"] = {
                 "server_version": postgres_version,
                 "vector_extension_version": vector_version,
@@ -1738,6 +1799,10 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                 "min_id": min_id,
                 "max_id": max_id,
                 "hnsw_indexes": hnsw_indexes,
+                "candidate_universe": {
+                    "predicate": args.candidate_validity_predicate,
+                    "rows": valid_rows,
+                },
             }
 
             explain_query_id = query_ids[calibration_query_nos[0]]
@@ -1767,6 +1832,7 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                     spec,
                     vector_rows,
                     args.allowlist_fetch_rows,
+                    args.candidate_validity_predicate,
                 )
                 allow_lists[spec.name] = allow_list
                 raw_rows.append(setup_row(spec, allow_list))
@@ -1983,6 +2049,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fbin", type=Path, default=DEFAULT_FBIN)
     parser.add_argument("--faiss-index", type=Path, default=DEFAULT_FAISS_INDEX)
     parser.add_argument("--table", type=validate_table_name, default=DEFAULT_TABLE)
+    parser.add_argument(
+        "--candidate-validity-predicate",
+        type=validate_candidate_validity_predicate,
+        default=DEFAULT_CANDIDATE_VALIDITY_PREDICATE,
+    )
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_RESULTS)
     parser.add_argument("--tag", default="20260718")
     parser.add_argument("--filter-names", nargs="*", default=[])
