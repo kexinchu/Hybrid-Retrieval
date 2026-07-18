@@ -258,6 +258,39 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
         self.assertEqual((winner["flat_search_cutoff"], winner["ef"]), (100_000, 100))
         self.assertEqual(runner.select_fastest_config(candidates, 0.99)["flat_search_cutoff"], 100_000)
 
+    def test_conservative_selection_requires_predeclared_margin_and_falls_back_to_exact_flat(self):
+        spec = filter_spec()
+        candidates = [
+            summary(250, 0, 0.923, 2.0, strategy="sweeping", recall_mean=0.943),
+            summary(100, 100_000, 1.0, 5.0, strategy="sweeping", recall_mean=1.0),
+        ]
+        selected = runner.select_conservative_config(
+            candidates, 0.90, spec, [0, 100_000], [100, 250], 0.05
+        )
+        self.assertEqual(selected["selection_mode"], "exact_flat_calibration_fallback")
+        self.assertEqual((selected["flat_search_cutoff"], selected["ef"]), (100_000, 100))
+        self.assertAlmostEqual(selected["required_calibration_lcb95"], 0.95)
+        self.assertEqual(selected["calibration_lcb_margin"], 0.05)
+
+        conservative = runner.select_conservative_config(
+            [
+                summary(250, 0, 0.951, 2.0, strategy="sweeping"),
+                candidates[1],
+            ],
+            0.90, spec, [0, 100_000], [100, 250], 0.05,
+        )
+        self.assertEqual(conservative["selection_mode"], "conservative_calibration_lcb")
+        self.assertEqual((conservative["flat_search_cutoff"], conservative["ef"]), (0, 250))
+        self.assertAlmostEqual(runner.required_calibration_lcb(0.95, 0.05), 0.975)
+        self.assertAlmostEqual(runner.required_calibration_lcb(0.99, 0.05), 0.995)
+
+    def test_conservative_selection_fails_closed_without_exact_flat_calibration(self):
+        spec = filter_spec()
+        self.assertIsNone(runner.select_conservative_config(
+            [summary(250, 0, 0.923, 2.0, strategy="sweeping")],
+            0.90, spec, [0, 100_000], [100, 250], 0.05,
+        ))
+
     def test_unattainable_requires_every_cutoff_route_complete_without_errors(self):
         spec = filter_spec()
         cutoff_grid = [0, 25_000, 100_000, 250_000]
@@ -439,6 +472,11 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
         ])
         with self.assertRaisesRegex(ValueError, "dominance guard"):
             runner._validate_args(invalid_guard)
+        invalid_margin = runner.build_parser().parse_args([
+            "--service-image-digest", "sha256:x", "--calibration-lcb-margin", "0.02",
+        ])
+        with self.assertRaisesRegex(ValueError, "calibration-lcb-margin"):
+            runner._validate_args(invalid_margin)
         self.assertEqual(runner.main(["--dry-run"]), 0)
 
     def test_filter_selection_is_ordered_unique_complete_and_run_spec_bound(self):
@@ -457,6 +495,14 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
         self.assertEqual(specification["filter_names"], ["f2", "f1"])
         self.assertEqual(specification["service_image_digest"], "sha256:test")
         self.assertEqual(specification["hnsw_flat_dominance"]["guard"], 1.2)
+        self.assertEqual(
+            specification["calibration"]["conservative_lcb_margin"],
+            runner.DEFAULT_CALIBRATION_LCB_MARGIN,
+        )
+        self.assertEqual(
+            specification["calibration"]["selection_policy"],
+            runner.CALIBRATION_SELECTION_POLICY,
+        )
         self.assertEqual(specification["effective_cutoffs_by_filter"], {
             "f2": [0, 100_000], "f1": [0, 100_000],
         })

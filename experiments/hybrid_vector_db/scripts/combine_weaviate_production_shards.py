@@ -46,6 +46,12 @@ LATENCY_DEFINITION = "end_to_end_http_json_parse_row_id_transfer"
 QPS_DEFINITION = "single_client_sequential_completed_requests_per_measured_service_time"
 RECALL_CONTRACT = "distance_threshold_tie_aware_v1"
 MEASUREMENT_MODE = "single_client_sequential"
+MIN_CALIBRATION_LCB_MARGIN = 0.03
+ALLOWED_CALIBRATION_SELECTION_RULES = {
+    "fastest measured LCB-qualified configuration",
+    "HNSW: per strategy/filter ascending ef at cutoff 0 with highest-target or recomputable guarded flat-dominance early-stop; flat: one source-equivalent representative per filter; system target winner: lowest mean-latency measured LCB-qualified semantic configuration",
+    "calibration-only: select lowest mean-latency complete configuration with recall LCB95 >= target + min(predeclared absolute margin, remaining recall headroom / 2); fallback only to complete calibration exact-flat representative; held-out final evidence cannot reselect",
+}
 ALLOWED_TARGET_STATUSES = {"selected", "unattainable_on_grid"}
 ALLOWED_TARGET_OUTCOMES = {
     "selected_and_confirmed",
@@ -373,6 +379,23 @@ def _run_contract(
     _exact_int(calibration.get("repeats"), 2, f"{manifest_path}: calibration.repeats")
     _exact_int(final.get("queries"), 100, f"{manifest_path}: final.queries")
     _exact_int(final.get("repeats"), 5, f"{manifest_path}: final.repeats")
+    calibration_margin = calibration.get("conservative_lcb_margin")
+    if calibration_margin is not None:
+        margin = _positive_finite(
+            calibration_margin,
+            f"{manifest_path}: calibration.conservative_lcb_margin",
+            allow_zero=True,
+        )
+        if margin < MIN_CALIBRATION_LCB_MARGIN:
+            raise ValidationFailure(
+                f"{manifest_path}: calibration margin is below the publication minimum"
+            )
+        if calibration.get("selection_policy") != "calibration_lcb95_target_plus_headroom_capped_absolute_margin_v1":
+            raise ValidationFailure(f"{manifest_path}: calibration selection policy is invalid")
+        if calibration.get("fallback") != "complete_calibration_exact_flat_representative":
+            raise ValidationFailure(f"{manifest_path}: calibration fallback is invalid")
+    elif calibration.get("selection_policy") or calibration.get("fallback"):
+        raise ValidationFailure(f"{manifest_path}: incomplete calibration selection policy")
     for field, expected in (
         ("runs_selected_system_configs_plus_flat_exactness_controls", True),
         ("reuses_one_exact_measurement_for_multiple_targets", True),
@@ -386,6 +409,8 @@ def _run_contract(
     for field in ("schedule_order", "selection_rule"):
         if not isinstance(calibration.get(field), str) or not calibration[field]:
             raise ValidationFailure(f"{manifest_path}: calibration.{field} is missing")
+    if calibration["selection_rule"] not in ALLOWED_CALIBRATION_SELECTION_RULES:
+        raise ValidationFailure(f"{manifest_path}: calibration selection rule is unknown")
     checkpoint_contract = {
         field: checkpoint.get(field)
         for field in ("persistence", "storage", "complete_block_boundary")
@@ -428,6 +453,9 @@ def _run_contract(
             "repeats": 2,
             "schedule_order": calibration["schedule_order"],
             "selection_rule": calibration["selection_rule"],
+            "selection_policy": calibration.get("selection_policy", "legacy_unmargined"),
+            "conservative_lcb_margin": float(calibration_margin or 0.0),
+            "fallback": calibration.get("fallback", "none"),
         },
         "final": dict(final),
         "checkpoint": checkpoint_contract,
@@ -989,7 +1017,15 @@ def combine(
             "manifest": str(shard.manifest_path),
             "manifest_sha256": shard.manifest_sha256,
             "run_spec_hash": shard.manifest["run_spec_hash"],
+            "git_revision": shard.manifest.get("git_revision"),
+            "source_hashes": shard.manifest.get("source_hashes"),
             "filters": shard.filters,
+            "calibration_selection_policy": shard.config.get("calibration", {}).get(
+                "selection_policy", "legacy_unmargined"
+            ),
+            "calibration_lcb_margin": shard.config.get("calibration", {}).get(
+                "conservative_lcb_margin", 0.0
+            ),
             "outputs": {
                 name: {
                     "path": str(shard.paths[name]),
@@ -1019,6 +1055,12 @@ def combine(
                 "config_sha256": shard.hashes["config_json"],
                 "run_spec_hash": shard.manifest["run_spec_hash"],
                 "filters": shard.filters,
+                "calibration_selection_policy": shard.config.get("calibration", {}).get(
+                    "selection_policy", "legacy_unmargined"
+                ),
+                "calibration_lcb_margin": shard.config.get("calibration", {}).get(
+                    "conservative_lcb_margin", 0.0
+                ),
             }
             for shard in shards
         ],
@@ -1081,6 +1123,8 @@ def combine(
             "calibration_selection": {
                 "targets": target_records,
                 "scope": "exactly one explicit status per filter/target",
+                "policy": "per-shard policy is recorded; held-out final evidence is confirmation-only",
+                "minimum_calibration_lcb_margin": MIN_CALIBRATION_LCB_MARGIN,
             },
             "target_outcomes": outcomes,
             "schema": {

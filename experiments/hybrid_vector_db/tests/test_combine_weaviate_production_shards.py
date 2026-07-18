@@ -446,6 +446,58 @@ class CombineWeaviateProductionShardsTests(unittest.TestCase):
             with self.assertRaisesRegex(combiner.ValidationFailure, "exactly 14"):
                 combiner.combine(fixture.manifests, fixture.filters_csv, fixture.out_prefix)
 
+    def test_accepts_uniform_conservative_policy_and_records_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Fixture(tmp)
+            for shard in range(4):
+                manifest = fixture.manifest(shard)
+                config = read_json(Path(manifest["outputs"]["config_json"]))
+                config["calibration"].update({
+                    "conservative_lcb_margin": 0.03,
+                    "selection_policy": "calibration_lcb95_target_plus_headroom_capped_absolute_margin_v1",
+                    "fallback": "complete_calibration_exact_flat_representative",
+                })
+                fixture.rewrite_output(shard, "config_json", config)
+            outputs = combiner.combine(fixture.manifests, fixture.filters_csv, fixture.out_prefix)
+            combined = read_json(outputs["manifest_json"])
+            evidence = combined["input_shards"][0]
+            self.assertEqual(evidence["calibration_lcb_margin"], 0.03)
+            self.assertEqual(
+                evidence["calibration_selection_policy"],
+                "calibration_lcb95_target_plus_headroom_capped_absolute_margin_v1",
+            )
+            self.assertEqual(
+                combined["calibration_selection"]["minimum_calibration_lcb_margin"], 0.03
+            )
+
+    def test_rejects_mixed_selection_policies_across_shards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Fixture(tmp)
+            manifest = fixture.manifest(0)
+            config = read_json(Path(manifest["outputs"]["config_json"]))
+            config["calibration"].update({
+                "conservative_lcb_margin": 0.03,
+                "selection_policy": "calibration_lcb95_target_plus_headroom_capped_absolute_margin_v1",
+                "fallback": "complete_calibration_exact_flat_representative",
+            })
+            fixture.rewrite_output(0, "config_json", config)
+            with self.assertRaisesRegex(combiner.ValidationFailure, "run contract"):
+                combiner.combine(fixture.manifests, fixture.filters_csv, fixture.out_prefix)
+
+    def test_rejects_conservative_policy_below_publication_minimum(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Fixture(tmp)
+            manifest = fixture.manifest(0)
+            config = read_json(Path(manifest["outputs"]["config_json"]))
+            config["calibration"].update({
+                "conservative_lcb_margin": 0.02,
+                "selection_policy": "calibration_lcb95_target_plus_headroom_capped_absolute_margin_v1",
+                "fallback": "complete_calibration_exact_flat_representative",
+            })
+            fixture.rewrite_output(0, "config_json", config)
+            with self.assertRaisesRegex(combiner.ValidationFailure, "publication minimum"):
+                combiner.combine(fixture.manifests, fixture.filters_csv, fixture.out_prefix)
+
     def test_rejects_missing_duplicate_or_error_pairs_and_schema_restore_gaps(self):
         mutations = {
             "missing target": lambda manifest: manifest["calibration_selection"]["targets"].pop(),

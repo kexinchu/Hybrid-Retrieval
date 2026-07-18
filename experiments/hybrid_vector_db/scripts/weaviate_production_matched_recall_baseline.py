@@ -30,6 +30,12 @@ DEFAULT_EF_VALUES = baseline.DEFAULT_EF_VALUES
 DEFAULT_TARGETS = baseline.DEFAULT_TARGETS
 DEFAULT_FILTER_STRATEGIES = ("acorn", "sweeping")
 FLAT_STRATEGY_REPRESENTATIVE = "sweeping"
+# Predeclared before any production measurements.  This is deliberately an
+# absolute LCB margin, not a quantity estimated from held-out final results.
+DEFAULT_CALIBRATION_LCB_MARGIN = 0.03
+CALIBRATION_SELECTION_POLICY = (
+    "calibration_lcb95_target_plus_headroom_capped_absolute_margin_v1"
+)
 # Covers every published Amazon-10M filter cardinality, including the 5.03M
 # largest allow-list, while retaining a no-flat baseline at zero.
 DEFAULT_FLAT_SEARCH_CUTOFFS = (0, 25_000, 100_000, 250_000, 600_000, 1_000_000,
@@ -254,8 +260,25 @@ def _candidate_summaries(
     return [row for row in summaries if row.get("configured_filter_strategy") == strategy and row.get("filter_name") == filter_name]
 
 
-def select_fastest_config(summaries: Sequence[dict[str, Any]], target: float) -> dict[str, Any] | None:
-    eligible = [row for row in summaries if baseline.reaches_target(row, target)]
+def required_calibration_lcb(target: float, margin: float = DEFAULT_CALIBRATION_LCB_MARGIN) -> float:
+    target = float(target)
+    margin = float(margin)
+    # Preserve a meaningful HNSW frontier at high recall targets. An uncapped
+    # absolute margin would make target=0.99 impossible for every approximate
+    # configuration whenever margin > 0.01.
+    return target + min(margin, max(0.0, 1.0 - target) / 2.0)
+
+
+def select_fastest_config(
+    summaries: Sequence[dict[str, Any]], target: float,
+    calibration_lcb_margin: float = 0.0,
+) -> dict[str, Any] | None:
+    required_lcb = required_calibration_lcb(target, calibration_lcb_margin)
+    eligible = [
+        row for row in summaries
+        if baseline.reaches_target(row, required_lcb)
+        and baseline._finite_number(row.get("latency_mean_ms"))
+    ]
     return min(
         eligible,
         key=lambda row: (
@@ -263,6 +286,67 @@ def select_fastest_config(summaries: Sequence[dict[str, Any]], target: float) ->
             str(row["configured_filter_strategy"]),
         ),
     ) if eligible else None
+
+
+def _exact_flat_calibration_fallback(
+    summaries: Sequence[dict[str, Any]], spec: FilterSpec,
+    flat_search_cutoffs: Sequence[int], ef_values: Sequence[int],
+) -> dict[str, Any] | None:
+    flat = flat_configuration(spec, flat_search_cutoffs, ef_values)
+    candidates = [
+        row for row in summaries
+        if row.get("configured_filter_strategy") == flat["configured_filter_strategy"]
+        and row.get("filter_name") == spec.name
+        and int(row.get("flat_search_cutoff", -1)) == int(flat["flat_search_cutoff"])
+        and int(row.get("ef", -1)) == int(flat["ef"])
+    ]
+    if len(candidates) != 1:
+        return None
+    candidate = candidates[0]
+    if not (
+        candidate.get("complete") is True
+        and baseline._finite_number(candidate.get("recall_mean"))
+        and baseline._finite_number(candidate.get("recall_lcb95"))
+        and float(candidate["recall_mean"]) == 1.0
+        and float(candidate["recall_lcb95"]) == 1.0
+    ):
+        return None
+    return candidate
+
+
+def select_conservative_config(
+    summaries: Sequence[dict[str, Any]], target: float, spec: FilterSpec,
+    flat_search_cutoffs: Sequence[int], ef_values: Sequence[int],
+    calibration_lcb_margin: float = DEFAULT_CALIBRATION_LCB_MARGIN,
+) -> dict[str, Any] | None:
+    """Select from calibration only, with an exact-flat fail-closed fallback."""
+    required_lcb = required_calibration_lcb(target, calibration_lcb_margin)
+    # Keep the exact flat route out of the latency competition.  It is the
+    # predeclared safety fallback, and is always measured as its own control.
+    hnsw_candidates = [
+        row for row in summaries if int(row.get("flat_search_cutoff", -1)) == 0
+    ]
+    selected = select_fastest_config(hnsw_candidates, target, calibration_lcb_margin)
+    if selected is not None:
+        return {
+            **selected,
+            "selection_mode": "conservative_calibration_lcb",
+            "calibration_selection_policy": CALIBRATION_SELECTION_POLICY,
+            "calibration_lcb_margin": float(calibration_lcb_margin),
+            "required_calibration_lcb95": required_lcb,
+        }
+    fallback = _exact_flat_calibration_fallback(
+        summaries, spec, flat_search_cutoffs, ef_values
+    )
+    if fallback is None:
+        return None
+    return {
+        **fallback,
+        "selection_mode": "exact_flat_calibration_fallback",
+        "calibration_selection_policy": CALIBRATION_SELECTION_POLICY,
+        "calibration_lcb_margin": float(calibration_lcb_margin),
+        "required_calibration_lcb95": required_lcb,
+    }
 
 
 def route_grid_proof(candidates: Sequence[dict[str, Any]], ef_values: Sequence[int]) -> dict[str, Any]:
@@ -379,12 +463,14 @@ def hnsw_dominance_proof(
 def hnsw_route_termination(
     summaries: Sequence[dict[str, Any]], strategy: str, spec: FilterSpec,
     flat_search_cutoffs: Sequence[int], ef_values: Sequence[int], highest_target: float,
-    dominance_guard: float,
+    dominance_guard: float, calibration_lcb_margin: float = 0.0,
 ) -> dict[str, Any]:
     route = _route_summaries(summaries, strategy, spec.name, 0)
     reached = [
         index for index, summary in enumerate(route)
-        if baseline.reaches_target(summary, highest_target)
+        if baseline.reaches_target(
+            summary, required_calibration_lcb(highest_target, calibration_lcb_margin)
+        )
     ]
     dominance = hnsw_dominance_proof(
         summaries, strategy, spec, flat_search_cutoffs, ef_values, dominance_guard
@@ -410,9 +496,10 @@ def hnsw_route_termination(
 
 
 def hnsw_route_target_status(
-    route: Sequence[dict[str, Any]], target: float, termination: dict[str, Any]
+    route: Sequence[dict[str, Any]], target: float, termination: dict[str, Any],
+    calibration_lcb_margin: float = 0.0,
 ) -> str:
-    if select_fastest_config(route, target) is not None:
+    if select_fastest_config(route, target, calibration_lcb_margin) is not None:
         return "attained"
     reason = termination["termination_reason"]
     if reason == "dominated_by_exact_flat":
@@ -434,20 +521,22 @@ def flat_configuration(spec: FilterSpec, flat_search_cutoffs: Sequence[int], ef_
 def configuration_grid_proof(
     summaries: Sequence[dict[str, Any]], spec: FilterSpec,
     flat_search_cutoffs: Sequence[int], ef_values: Sequence[int], targets: Sequence[float],
-    dominance_guard: float,
+    dominance_guard: float, calibration_lcb_margin: float = 0.0,
 ) -> dict[str, Any]:
     hnsw_routes: dict[str, dict[str, Any]] = {}
     for strategy in DEFAULT_FILTER_STRATEGIES:
         route = _route_summaries(summaries, strategy, spec.name, 0)
         termination = hnsw_route_termination(
             summaries, strategy, spec, flat_search_cutoffs, ef_values,
-            float(targets[-1]), dominance_guard,
+            float(targets[-1]), dominance_guard, calibration_lcb_margin,
         )
         hnsw_routes[strategy] = {
             "ef_grid_proof": route_grid_proof(route, ef_values),
             "termination": termination,
             "target_statuses": {
-                str(target): hnsw_route_target_status(route, target, termination)
+                str(target): hnsw_route_target_status(
+                    route, target, termination, calibration_lcb_margin
+                )
                 for target in targets
             },
         }
@@ -486,14 +575,16 @@ def configuration_grid_proof(
 def calibration_target_status(
     summaries: Sequence[dict[str, Any]], spec: FilterSpec, target: float,
     flat_search_cutoffs: Sequence[int], ef_values: Sequence[int], targets: Sequence[float],
-    dominance_guard: float,
+    dominance_guard: float, calibration_lcb_margin: float = DEFAULT_CALIBRATION_LCB_MARGIN,
 ) -> str:
-    if select_fastest_config(
-        [row for row in summaries if row.get("filter_name") == spec.name], target
+    candidates = [row for row in summaries if row.get("filter_name") == spec.name]
+    if select_conservative_config(
+        candidates, target, spec, flat_search_cutoffs, ef_values, calibration_lcb_margin
     ):
         return "selected"
     proof = configuration_grid_proof(
-        summaries, spec, flat_search_cutoffs, ef_values, targets, dominance_guard
+        summaries, spec, flat_search_cutoffs, ef_values, targets, dominance_guard,
+        calibration_lcb_margin,
     )
     route_reasons = {
         route["termination"]["termination_reason"]
@@ -512,7 +603,7 @@ def calibration_target_status(
 def validate_monotone_calibration_state(
     summaries: Sequence[dict[str, Any]], filters: Sequence[FilterSpec],
     flat_search_cutoffs: Sequence[int], ef_values: Sequence[int], highest_target: float,
-    dominance_guard: float,
+    dominance_guard: float, calibration_lcb_margin: float = 0.0,
 ) -> None:
     if any(row.get("complete") is not True for row in summaries):
         raise RuntimeError(
@@ -570,6 +661,7 @@ def validate_monotone_calibration_state(
             termination = hnsw_route_termination(
                 prefix, strategy, specs_by_name[filter_name], flat_search_cutoffs,
                 ef_values, highest_target, dominance_guard,
+                calibration_lcb_margin,
             )
             if (termination["termination_reason"] in {
                     "highest_target_reached", "dominated_by_exact_flat"
@@ -730,7 +822,10 @@ def run_specification(
         },
         "targets": [float(value) for value in args.targets], "k": K,
         "calibration": {"query_nos": list(CALIBRATION_QUERY_NOS), "repeats": CALIBRATION_REPEATS,
-                        "warmup_queries": args.warmup_queries},
+                        "warmup_queries": args.warmup_queries,
+                        "conservative_lcb_margin": float(args.calibration_lcb_margin),
+                        "selection_policy": CALIBRATION_SELECTION_POLICY,
+                        "fallback": "complete_calibration_exact_flat_representative"},
         "final": {"query_nos": list(FINAL_QUERY_NOS), "repeats": FINAL_REPEATS},
         "bootstrap_seed": args.bootstrap_seed,
         "calibration_query_budget": calibration_query_budget(
@@ -914,6 +1009,19 @@ def _summary_row_for_target(
         "comparison_status": "confirmed" if target_met else "unconfirmed",
         "calibration_recall_lcb95": selected["recall_lcb95"],
         "calibration_complete": selected["complete"],
+        "calibration_lcb_margin": selected.get(
+            "calibration_lcb_margin", DEFAULT_CALIBRATION_LCB_MARGIN
+        ),
+        "required_calibration_lcb95": selected.get(
+            "required_calibration_lcb95",
+            required_calibration_lcb(target, selected.get(
+                "calibration_lcb_margin", DEFAULT_CALIBRATION_LCB_MARGIN
+            )),
+        ),
+        "calibration_selection_policy": selected.get(
+            "calibration_selection_policy", CALIBRATION_SELECTION_POLICY
+        ),
+        "selection_mode": selected.get("selection_mode", "legacy_calibration_selection"),
     })
     return result
 
@@ -999,6 +1107,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flat-search-cutoffs", type=int, nargs="+", default=list(DEFAULT_FLAT_SEARCH_CUTOFFS))
     parser.add_argument("--filter-names", nargs="+")
     parser.add_argument("--targets", type=float, nargs="+", default=list(DEFAULT_TARGETS))
+    parser.add_argument(
+        "--calibration-lcb-margin", type=float, default=DEFAULT_CALIBRATION_LCB_MARGIN,
+        help="absolute LCB95 margin added to every target during calibration-only selection",
+    )
     parser.add_argument("--hnsw-dominance-guard", type=float, default=1.05)
     parser.add_argument("--expected-service-version", default="1.38.0")
     parser.add_argument("--service-image-digest", default="")
@@ -1021,6 +1133,7 @@ def _dry_run(args: argparse.Namespace) -> int:
                       "filter_names": args.filter_names or "all",
                       "maximum_effective_calibration_timed_queries": query_budget["maximum_timed_queries_before_hnsw_early_stop"],
                       "hnsw_dominance_guard": args.hnsw_dominance_guard,
+                      "calibration_lcb_margin": args.calibration_lcb_margin,
                       "expected_service_version": args.expected_service_version,
                       "service_image_digest": args.service_image_digest or NA,
                       "calibration_query_nos": [0, 99], "final_query_nos": [100, 199]}, sort_keys=True))
@@ -1032,6 +1145,14 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(f"formal runner requires k={K}")
     if sorted(set(args.targets)) != list(args.targets) or any(value <= 0 or value > 1 for value in args.targets):
         raise ValueError("targets must be sorted, unique, and in (0, 1]")
+    if (
+        not baseline._finite_number(args.calibration_lcb_margin)
+        or float(args.calibration_lcb_margin) < DEFAULT_CALIBRATION_LCB_MARGIN
+    ):
+        raise ValueError(
+            "calibration-lcb-margin must be finite and >= "
+            f"{DEFAULT_CALIBRATION_LCB_MARGIN}"
+        )
     if sorted(set(args.ef_values)) != list(args.ef_values) or any(value <= 0 for value in args.ef_values):
         raise ValueError("ef values must be sorted, unique, and positive")
     if sorted(set(args.flat_search_cutoffs)) != list(args.flat_search_cutoffs) or any(value < 0 for value in args.flat_search_cutoffs):
@@ -1086,7 +1207,7 @@ def run(args: argparse.Namespace) -> int:
         validate_checkpoint_state(state)
         validate_monotone_calibration_state(
             calibration_summaries, filters, args.flat_search_cutoffs, args.ef_values,
-            args.targets[-1], args.hnsw_dominance_guard,
+            args.targets[-1], args.hnsw_dominance_guard, args.calibration_lcb_margin,
         )
 
     def save_checkpoint() -> None:
@@ -1152,7 +1273,7 @@ def run(args: argparse.Namespace) -> int:
                     or hnsw_route_termination(
                         calibration_summaries, strategy, spec,
                         args.flat_search_cutoffs, args.ef_values, args.targets[-1],
-                        args.hnsw_dominance_guard,
+                        args.hnsw_dominance_guard, args.calibration_lcb_margin,
                     )["termination_reason"] == "in_progress"
                 )
                 and _block_key("calibration", strategy, spec.name, cutoff, ef) not in completed
@@ -1185,11 +1306,14 @@ def run(args: argparse.Namespace) -> int:
             ]
             for target in args.targets:
                 key = (spec.name, float(target))
-                selections[key] = select_fastest_config(candidates, target)
+                selections[key] = select_conservative_config(
+                    candidates, target, spec, args.flat_search_cutoffs, args.ef_values,
+                    args.calibration_lcb_margin,
+                )
                 statuses[key] = calibration_target_status(
                     calibration_summaries, spec, target,
                     args.flat_search_cutoffs, args.ef_values, args.targets,
-                    args.hnsw_dominance_guard,
+                    args.hnsw_dominance_guard, args.calibration_lcb_margin,
                 )
         selected_groups = add_flat_exactness_controls(
             group_selected_targets(selections), filters,
@@ -1293,7 +1417,7 @@ def run(args: argparse.Namespace) -> int:
     grid_proofs = {
         spec.name: configuration_grid_proof(
             calibration_summaries, spec, args.flat_search_cutoffs, args.ef_values,
-            args.targets, args.hnsw_dominance_guard,
+            args.targets, args.hnsw_dominance_guard, args.calibration_lcb_margin,
         )
         for spec in filters
     }
@@ -1364,7 +1488,16 @@ def run(args: argparse.Namespace) -> int:
         "service_identity": service_identity,
         "calibration": {"queries": 100, "repeats": CALIBRATION_REPEATS, "schedule": schedule,
                         "schedule_order": "all per-filter flat representatives before any HNSW configuration",
-                        "selection_rule": "HNSW: per strategy/filter ascending ef at cutoff 0 with highest-target or recomputable guarded flat-dominance early-stop; flat: one source-equivalent representative per filter; system target winner: lowest mean-latency measured LCB-qualified semantic configuration"},
+                        "selection_rule": (
+                            "calibration-only: select lowest mean-latency complete configuration "
+                            "with recall LCB95 >= target + min(predeclared absolute margin, "
+                            "remaining recall headroom / 2); "
+                            "fallback only to complete calibration exact-flat representative; "
+                            "held-out final evidence cannot reselect"
+                        ),
+                        "conservative_lcb_margin": args.calibration_lcb_margin,
+                        "selection_policy": CALIBRATION_SELECTION_POLICY,
+                        "fallback": "complete_calibration_exact_flat_representative"},
         "final": {"queries": 100, "repeats": FINAL_REPEATS,
                   "runs_selected_system_configs_plus_flat_exactness_controls": True,
                   "deduplication_key": ["configured_filter_strategy", "filter_name", "flat_search_cutoff", "ef"],
@@ -1425,6 +1558,11 @@ def run(args: argparse.Namespace) -> int:
              "selected_filter_strategy": selected["configured_filter_strategy"] if selected else NA,
              "selected_ef": selected["ef"] if selected else NA,
              "selected_flat_search_cutoff": selected["flat_search_cutoff"] if selected else NA,
+             "selection_mode": selected["selection_mode"] if selected else NA,
+             "calibration_selection_policy": selected.get("calibration_selection_policy", NA) if selected else NA,
+             "calibration_lcb_margin": selected.get("calibration_lcb_margin", args.calibration_lcb_margin) if selected else args.calibration_lcb_margin,
+             "required_calibration_lcb95": required_calibration_lcb(target, args.calibration_lcb_margin),
+             "calibration_recall_lcb95": selected.get("recall_lcb95", NA) if selected else NA,
              "grid_proof": grid_proofs[name]}
             for (name, target), selected in sorted(selections.items())],
             "scope": "one best valid production route per filter/target"},
