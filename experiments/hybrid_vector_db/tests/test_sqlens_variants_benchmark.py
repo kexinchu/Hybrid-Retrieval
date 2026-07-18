@@ -1,5 +1,7 @@
+import csv
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,13 +19,16 @@ class SqlensVariantBindingTests(unittest.TestCase):
     @staticmethod
     def _gate_cursor(build_id="sqlens-v11-test", profile=None):
         cursor = mock.MagicMock()
-        profile = profile or {
-            "profile_semantics_version": 6,
+        supplied_profile = profile is not None
+        profile = dict(profile) if supplied_profile else {
+            "profile_semantics_version": 7,
             "graph_elements_visited": 1,
             "raw_index_tids_returned": 1,
             "hnsw_am_callback_ms": 0.1,
             "executor_residual_ms": 0.2,
         }
+        if not supplied_profile:
+            profile.update({field: 0 for field in yfcc.SQLENS_PROFILE_FIELDS if field not in profile})
         cursor.execute.side_effect = lambda sql, *args: cursor
         cursor.fetchone.side_effect = [(build_id,), (json.dumps(profile),)]
         return cursor
@@ -33,7 +38,7 @@ class SqlensVariantBindingTests(unittest.TestCase):
             with self.subTest(runner=runner.__name__):
                 build_id, profile = runner.require_sqlens_provenance(self._gate_cursor())
                 self.assertTrue(build_id.startswith("sqlens-v11-"))
-                self.assertEqual(profile["profile_semantics_version"], 6)
+                self.assertEqual(profile["profile_semantics_version"], 7)
 
     def test_sqlens_v11_gate_rejects_old_build(self):
         for runner in (yfcc, laion):
@@ -50,7 +55,7 @@ class SqlensVariantBindingTests(unittest.TestCase):
 
     def test_sqlens_v9_gate_rejects_missing_profile_fields(self):
         profile = {
-            "profile_semantics_version": 6,
+            "profile_semantics_version": 7,
             "graph_elements_visited": 1,
             "raw_index_tids_returned": 1,
             "hnsw_am_callback_ms": 0.1,
@@ -59,6 +64,135 @@ class SqlensVariantBindingTests(unittest.TestCase):
             with self.subTest(runner=runner.__name__):
                 with self.assertRaisesRegex(runner.SqlensProvenanceGateError, "executor_residual_ms"):
                     runner.require_sqlens_provenance(self._gate_cursor(profile=profile))
+
+    def test_v7_raw_profile_contract_preserves_old_block_columns(self):
+        old_fields = {
+            "index_page_neighbor_distinct_pages",
+            "index_page_element_distinct_pages",
+            "index_page_prefetches",
+            "page_access_batches",
+            "page_access_candidates",
+            "page_access_prefetches",
+            "page_access_distinct_pages",
+            "idx_blks_hit",
+            "idx_blks_read",
+            "heap_blks_hit",
+            "heap_blks_read",
+        }
+        expected_v7 = {
+            "index_page_loads",
+            "index_page_runs",
+            "index_page_distinct_pages",
+            "index_page_distinct_pages_exact",
+            "index_page_profile_scope",
+            "heap_tid_returns",
+            "heap_tid_page_runs",
+            "heap_tid_distinct_pages",
+            "heap_tid_distinct_pages_exact",
+            "heap_tid_sequence_scope",
+            "executor_residual_ms",
+            "heap_fetch_ms",
+            "heap_fetch_ms_is_residual_proxy",
+            "blks_hit_before",
+            "blks_hit_after",
+            "blks_read_before",
+            "blks_read_after",
+            "heap_blks_scope",
+            "heap_blks_are_exact_heap_io",
+        }
+        for runner in (yfcc, laion):
+            with self.subTest(runner=runner.__name__):
+                self.assertTrue(expected_v7.issubset(set(runner.SQLENS_RAW_PROFILE_FIELDS)))
+                self.assertTrue(old_fields.isdisjoint(set(runner.SQLENS_RAW_PROFILE_FIELDS)))
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "raw.csv"
+                    runner.write_csv(path, [{field: field for field in runner.SQLENS_RAW_PROFILE_FIELDS}])
+                    with path.open(newline="", encoding="utf-8") as source:
+                        self.assertEqual(set(csv.DictReader(source).fieldnames or ()), set(runner.SQLENS_RAW_PROFILE_FIELDS))
+
+    def test_v7_summary_reports_means_and_exact_rates(self):
+        common = {
+            "target_band_pct": 1.0,
+            "method": "d1_d2",
+            "error": "",
+            "filter_pct": 1.0,
+            "actual_pct": 1.0,
+            "filter_rows": 10,
+            "filter_name": "sample",
+            "recall": 1.0,
+            "latency_ms": 2.0,
+            "end_to_end_ms": 3.0,
+            "activation_ms": 0.5,
+            "guidance_enabled": False,
+            "composed_exact_active": False,
+            "composed_exact_hit": False,
+        }
+        rows = [
+            dict(
+                common,
+                index_page_loads=10,
+                index_page_runs=2,
+                index_page_distinct_pages=6,
+                index_page_distinct_pages_exact=True,
+                heap_tid_returns=8,
+                heap_tid_page_runs=3,
+                heap_tid_distinct_pages=4,
+                heap_tid_distinct_pages_exact=False,
+                executor_residual_ms=1.0,
+                heap_fetch_ms=2.0,
+                heap_fetch_ms_is_residual_proxy=True,
+                blks_hit_before=10,
+                blks_hit_after=14,
+                blks_read_before=3,
+                blks_read_after=5,
+                idx_blks_hit=7,
+                idx_blks_read=2,
+                heap_blks_hit=4,
+                heap_blks_read=1,
+                heap_blks_are_exact_heap_io=False,
+            ),
+            dict(
+                common,
+                index_page_loads=20,
+                index_page_runs=4,
+                index_page_distinct_pages=10,
+                index_page_distinct_pages_exact="false",
+                heap_tid_returns=12,
+                heap_tid_page_runs=5,
+                heap_tid_distinct_pages=8,
+                heap_tid_distinct_pages_exact="true",
+                executor_residual_ms=3.0,
+                heap_fetch_ms=4.0,
+                heap_fetch_ms_is_residual_proxy="false",
+                blks_hit_before=20,
+                blks_hit_after=28,
+                blks_read_before=5,
+                blks_read_after=9,
+                idx_blks_hit=9,
+                idx_blks_read=4,
+                heap_blks_hit=6,
+                heap_blks_read=3,
+                heap_blks_are_exact_heap_io="true",
+            ),
+        ]
+        for runner in (yfcc, laion):
+            with self.subTest(runner=runner.__name__):
+                summary = runner.summarize(rows)[0]
+                self.assertEqual(summary["index_page_loads_mean"], 15.0)
+                self.assertEqual(summary["index_page_runs_mean"], 3.0)
+                self.assertEqual(summary["index_page_distinct_pages_mean"], 8.0)
+                self.assertEqual(summary["index_page_distinct_pages_exact_rate"], 0.5)
+                self.assertEqual(summary["heap_tid_returns_mean"], 10.0)
+                self.assertEqual(summary["heap_tid_page_runs_mean"], 4.0)
+                self.assertEqual(summary["heap_tid_distinct_pages_mean"], 6.0)
+                self.assertEqual(summary["heap_tid_distinct_pages_exact_rate"], 0.5)
+                self.assertEqual(summary["executor_residual_ms_mean"], 2.0)
+                self.assertEqual(summary["heap_fetch_ms_mean"], 3.0)
+                self.assertEqual(summary["idx_blks_hit_mean"], 8.0)
+                self.assertEqual(summary["heap_blks_read_mean"], 2.0)
+                self.assertEqual(summary["heap_blks_exact_io_claim_rate"], 0.5)
+                self.assertNotIn("index_page_distinct_pages_exact_mean", summary)
+                self.assertNotIn("heap_tid_distinct_pages_exact_mean", summary)
 
     def test_guided_collect_measurements_require_tid_and_traversal_checks(self):
         for runner in (yfcc, laion):

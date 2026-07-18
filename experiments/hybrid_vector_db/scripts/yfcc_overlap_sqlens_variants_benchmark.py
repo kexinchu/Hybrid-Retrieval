@@ -19,12 +19,44 @@ from yfcc_pgvector_filtered_benchmark import parse_int_array, recall_at_k
 
 METHODS = ["stock", "d1", "d1_d2", "d1_d2_d3"]
 SQLENS_V11_BUILD_PREFIX = "sqlens-v11-"
-SQLENS_MIN_PROFILE_SEMANTICS = 6.0
+SQLENS_MIN_PROFILE_SEMANTICS = 7.0
 SQLENS_PROFILE_FIELDS = (
     "graph_elements_visited",
     "raw_index_tids_returned",
     "hnsw_am_callback_ms",
     "executor_residual_ms",
+    "index_page_loads",
+    "index_page_runs",
+    "index_page_distinct_pages",
+    "index_page_distinct_pages_exact",
+    "index_page_profile_scope",
+    "heap_tid_returns",
+    "heap_tid_page_runs",
+    "heap_tid_distinct_pages",
+    "heap_tid_distinct_pages_exact",
+    "heap_tid_sequence_scope",
+    "heap_blks_are_exact_heap_io",
+)
+SQLENS_RAW_PROFILE_FIELDS = (
+    "executor_residual_ms",
+    "heap_fetch_ms",
+    "heap_fetch_ms_is_residual_proxy",
+    "blks_hit_before",
+    "blks_hit_after",
+    "blks_read_before",
+    "blks_read_after",
+    "index_page_loads",
+    "index_page_runs",
+    "index_page_distinct_pages",
+    "index_page_distinct_pages_exact",
+    "index_page_profile_scope",
+    "heap_tid_returns",
+    "heap_tid_page_runs",
+    "heap_tid_distinct_pages",
+    "heap_tid_distinct_pages_exact",
+    "heap_tid_sequence_scope",
+    "heap_blks_scope",
+    "heap_blks_are_exact_heap_io",
 )
 
 
@@ -36,6 +68,12 @@ def timed_ms(fn):
     start = time.perf_counter()
     value = fn()
     return value, (time.perf_counter() - start) * 1000.0
+
+
+def profile_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "t", "yes", "on"}
+    return bool(value)
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -421,6 +459,9 @@ def summarize(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         def vals(key: str) -> list[float]:
             return [float(row.get(key, 0) or 0) for row in ok]
 
+        def bool_rate(key: str) -> float:
+            return statistics.fmean(1.0 if profile_bool(row.get(key, False)) else 0.0 for row in ok)
+
         checks = statistics.fmean(vals("guidance_checks")) if ok else 0.0
         skips = statistics.fmean(vals("guidance_skips")) if ok else 0.0
         out.append(
@@ -438,6 +479,13 @@ def summarize(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "latency_ms_mean": statistics.fmean(vals("latency_ms")),
                 "end_to_end_ms_mean": statistics.fmean(vals("end_to_end_ms")),
                 "activation_ms_mean": statistics.fmean(vals("activation_ms")),
+                "executor_residual_ms_mean": statistics.fmean(vals("executor_residual_ms")),
+                "heap_fetch_ms_mean": statistics.fmean(vals("heap_fetch_ms")),
+                "blks_hit_before_mean": statistics.fmean(vals("blks_hit_before")),
+                "blks_hit_after_mean": statistics.fmean(vals("blks_hit_after")),
+                "blks_read_before_mean": statistics.fmean(vals("blks_read_before")),
+                "blks_read_after_mean": statistics.fmean(vals("blks_read_after")),
+                "heap_fetch_ms_is_residual_proxy_rate": bool_rate("heap_fetch_ms_is_residual_proxy"),
                 "guidance_enabled_rate": statistics.fmean(vals("guidance_enabled")),
                 "composed_exact_active_rate": statistics.fmean(vals("composed_exact_active")),
                 "composed_exact_hit_rate": statistics.fmean(vals("composed_exact_hit")),
@@ -465,10 +513,19 @@ def summarize(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "traversal_initial_batches_mean": statistics.fmean(vals("traversal_initial_batches")),
                 "traversal_resume_batches_mean": statistics.fmean(vals("traversal_resume_batches")),
                 "traversal_strict_order_drops_mean": statistics.fmean(vals("traversal_strict_order_drops")),
+                "index_page_loads_mean": statistics.fmean(vals("index_page_loads")),
+                "index_page_runs_mean": statistics.fmean(vals("index_page_runs")),
+                "index_page_distinct_pages_mean": statistics.fmean(vals("index_page_distinct_pages")),
+                "index_page_distinct_pages_exact_rate": bool_rate("index_page_distinct_pages_exact"),
+                "heap_tid_returns_mean": statistics.fmean(vals("heap_tid_returns")),
+                "heap_tid_page_runs_mean": statistics.fmean(vals("heap_tid_page_runs")),
+                "heap_tid_distinct_pages_mean": statistics.fmean(vals("heap_tid_distinct_pages")),
+                "heap_tid_distinct_pages_exact_rate": bool_rate("heap_tid_distinct_pages_exact"),
                 "idx_blks_hit_mean": statistics.fmean(vals("idx_blks_hit")),
                 "idx_blks_read_mean": statistics.fmean(vals("idx_blks_read")),
                 "heap_blks_hit_mean": statistics.fmean(vals("heap_blks_hit")),
                 "heap_blks_read_mean": statistics.fmean(vals("heap_blks_read")),
+                "heap_blks_exact_io_claim_rate": bool_rate("heap_blks_are_exact_heap_io"),
                 "index_page_neighbor_distinct_pages_mean": statistics.fmean(vals("index_page_neighbor_distinct_pages")),
                 "index_page_element_distinct_pages_mean": statistics.fmean(vals("index_page_element_distinct_pages")),
                 "index_page_prefetches_mean": statistics.fmean(vals("index_page_prefetches")),
@@ -663,6 +720,7 @@ def main() -> None:
                 "idx_blks_read",
                 "heap_blks_hit",
                 "heap_blks_read",
+                *SQLENS_RAW_PROFILE_FIELDS,
                 "returned",
                 "ids",
                 "error",
@@ -721,6 +779,15 @@ def main() -> None:
                             "latency_ms": latency_ms,
                             "activation_ms": activation_ms,
                             "end_to_end_ms": activation_ms + latency_ms,
+                            "executor_residual_ms": float(scan_profile.get("executor_residual_ms", 0) or 0),
+                            "heap_fetch_ms": float(scan_profile.get("heap_fetch_ms", 0) or 0),
+                            "heap_fetch_ms_is_residual_proxy": profile_bool(
+                                scan_profile.get("heap_fetch_ms_is_residual_proxy", False)
+                            ),
+                            "blks_hit_before": float(scan_profile.get("blks_hit_before", 0) or 0),
+                            "blks_hit_after": float(scan_profile.get("blks_hit_after", 0) or 0),
+                            "blks_read_before": float(scan_profile.get("blks_read_before", 0) or 0),
+                            "blks_read_after": float(scan_profile.get("blks_read_after", 0) or 0),
                             "activation_build_ms": float(activation_profile.get("last_cache_build_ms", 0) or 0),
                             "guidance_enabled": bool(activation_profile.get("guidance_enabled", method != "stock")),
                             "guidance_route": str(activation_profile.get("guidance_route", "")),
@@ -790,6 +857,20 @@ def main() -> None:
                             "traversal_initial_batches": float(scan_profile.get("traversal_initial_batches", 0) or 0),
                             "traversal_resume_batches": float(scan_profile.get("traversal_resume_batches", 0) or 0),
                             "traversal_strict_order_drops": float(scan_profile.get("traversal_strict_order_drops", 0) or 0),
+                            "index_page_loads": float(scan_profile.get("index_page_loads", 0) or 0),
+                            "index_page_runs": float(scan_profile.get("index_page_runs", 0) or 0),
+                            "index_page_distinct_pages": float(scan_profile.get("index_page_distinct_pages", 0) or 0),
+                            "index_page_distinct_pages_exact": profile_bool(
+                                scan_profile.get("index_page_distinct_pages_exact", False)
+                            ),
+                            "index_page_profile_scope": str(scan_profile.get("index_page_profile_scope", "")),
+                            "heap_tid_returns": float(scan_profile.get("heap_tid_returns", 0) or 0),
+                            "heap_tid_page_runs": float(scan_profile.get("heap_tid_page_runs", 0) or 0),
+                            "heap_tid_distinct_pages": float(scan_profile.get("heap_tid_distinct_pages", 0) or 0),
+                            "heap_tid_distinct_pages_exact": profile_bool(
+                                scan_profile.get("heap_tid_distinct_pages_exact", False)
+                            ),
+                            "heap_tid_sequence_scope": str(scan_profile.get("heap_tid_sequence_scope", "")),
                             "index_page_neighbor_distinct_pages": float(scan_profile.get("index_page_neighbor_distinct_pages", 0) or 0),
                             "index_page_element_distinct_pages": float(scan_profile.get("index_page_element_distinct_pages", 0) or 0),
                             "index_page_prefetches": float(scan_profile.get("index_page_prefetches", 0) or 0),
@@ -801,6 +882,10 @@ def main() -> None:
                             "idx_blks_read": float(scan_profile.get("idx_blks_read", 0) or 0),
                             "heap_blks_hit": float(scan_profile.get("heap_blks_hit", 0) or 0),
                             "heap_blks_read": float(scan_profile.get("heap_blks_read", 0) or 0),
+                            "heap_blks_scope": str(scan_profile.get("heap_blks_scope", "")),
+                            "heap_blks_are_exact_heap_io": profile_bool(
+                                scan_profile.get("heap_blks_are_exact_heap_io", False)
+                            ),
                             "returned": len(ids),
                             "ids": ",".join(str(x) for x in ids),
                             "error": error,
