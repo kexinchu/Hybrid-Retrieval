@@ -75,6 +75,16 @@ class Amazon10MSqlNativeWorkloadTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "workload populations"):
                     workload.validate_distinct_workload_populations(*counts)
 
+    def test_temporal_population_targets_are_enforced_in_percentage_points(self):
+        self.assertAlmostEqual(
+            float(workload.validate_temporal_target("grant", 2001, 10_000, Decimal("20"))),
+            20.01,
+        )
+        with self.assertRaisesRegex(RuntimeError, "missed its target"):
+            workload.validate_temporal_target("grant", 2101, 10_000, Decimal("20"))
+        with self.assertRaisesRegex(RuntimeError, "population is invalid"):
+            workload.validate_temporal_target("fact", 0, 10_000, Decimal("5"))
+
     def test_tenant_policy_prefers_real_store_then_real_asin(self):
         store_tenant = workload.tenant_identity("  Real Store  ", "ASIN-1")
         asin_tenant = workload.tenant_identity("  ", "ASIN-1")
@@ -181,6 +191,17 @@ class Amazon10MSqlNativeWorkloadTests(unittest.TestCase):
         self.assertIn("over (order by valid_from)", normalized)
         self.assertIn("cumulative_count", normalized)
         self.assertNotIn("review_id", normalized)
+
+    def test_grant_temporal_calibration_uses_tenant_units_and_real_times(self):
+        normalized = " ".join(workload.CALIBRATE_GRANT_VALIDITY_SQL.lower().split())
+        self.assertIn("bucket.target_pct = %s", normalized)
+        self.assertIn("sum(review_count) over (order by review_count, tenant_id)", normalized)
+        self.assertIn("cumulative_count - ranked.review_count < target.target_count", normalized)
+        self.assertIn("min(fact.valid_from)::bigint", normalized)
+        self.assertIn("least(grant_row.valid_from, target.as_of)", normalized)
+        self.assertNotIn("generate_series", normalized)
+        self.assertNotIn("random()", normalized)
+        self.assertNotRegex(normalized, r"\b(review_id|tenant_id)\s*%")
 
     def test_acl_selection_uses_volume_coverage_not_fixed_tenant_count(self):
         normalized = " ".join(workload.INSERT_GRANTS_SQL.lower().split())

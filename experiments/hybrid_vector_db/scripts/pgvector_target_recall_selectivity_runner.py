@@ -343,11 +343,25 @@ def csv_bool(value: object) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes"}
 
 
-def validate_tie_aware_raw_row(row: dict[str, str]) -> float:
+def required_csv_bool(value: object, field: str) -> bool:
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes"}:
+        return True
+    if text in {"0", "false", "no"}:
+        return False
+    raise ValueError(f"{field} must be an explicit boolean")
+
+
+def validate_tie_aware_raw_row(
+    row: dict[str, str],
+    expected_truth_self_excluded: bool = True,
+) -> float:
     if row.get("recall_contract") != TIE_AWARE_RECALL_CONTRACT:
         raise ValueError("raw row does not use the tie-aware recall contract")
-    if not csv_bool(row.get("truth_self_excluded", "")):
-        raise ValueError("raw row truth is not self-excluded")
+    if required_csv_bool(row.get("truth_self_excluded", ""), "truth_self_excluded") != expected_truth_self_excluded:
+        raise ValueError(
+            "raw row truth self_excluded does not match the expected query contract"
+        )
     if not row.get("sqlens_build_id", "").startswith(SQLENS_V11_BUILD_PREFIX):
         raise ValueError("raw row is missing the exact SQLens build ID")
     vector_sha = row.get("vector_so_sha256", "")
@@ -374,16 +388,22 @@ def validate_tie_aware_raw_row(row: dict[str, str]) -> float:
             raise ValueError("D3 warm row lacks pre-request admission/reuse proof")
     if row.get("guidance_filter_strategy") == "traversal_guided" and not row.get("error"):
         k = int(row.get("k") or 0)
-        if row.get("self_exclusion_contract") != "limit_k_plus_1_client_remove_query_id":
+        expected_contract = (
+            "limit_k_plus_1_client_remove_query_id"
+            if expected_truth_self_excluded
+            else "none_external_query_source"
+        )
+        if row.get("self_exclusion_contract") != expected_contract:
             raise ValueError("formal traversal raw row has the wrong self-exclusion contract")
-        if int(row.get("scan_limit") or 0) != k + 1:
-            raise ValueError("formal traversal raw row did not measure LIMIT k+1")
+        expected_limit = k + 1 if expected_truth_self_excluded else k
+        if int(row.get("scan_limit") or 0) != expected_limit:
+            raise ValueError("formal traversal raw row has the wrong measured LIMIT")
         if int(row.get("returned") or 0) > k:
             raise ValueError("formal traversal raw row returned more than k rows after self removal")
-        if int(row.get("raw_returned_before_self_exclusion") or 0) > k + 1:
-            raise ValueError("formal traversal raw row fetched more than LIMIT k+1")
+        if int(row.get("raw_returned_before_self_exclusion") or 0) > expected_limit:
+            raise ValueError("formal traversal raw row fetched more than its measured LIMIT")
         ids = [value for value in row.get("ids", "").split(",") if value]
-        if str(row.get("query_id", "")) in ids:
+        if expected_truth_self_excluded and str(row.get("query_id", "")) in ids:
             raise ValueError("formal traversal raw row still contains the query row")
         mode = row.get("mode")
         guidance_enabled = csv_bool(row.get("guidance_enabled", ""))
@@ -452,11 +472,14 @@ def summarize_raw(
     seed: int = 20260718,
     expected_queries: int | None = None,
     expected_repeats: int | None = None,
+    expected_truth_self_excluded: bool = True,
 ) -> list[dict[str, object]]:
     with path.open(newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     for row in rows:
-        row["recall"] = str(validate_tie_aware_raw_row(row))
+        row["recall"] = str(
+            validate_tie_aware_raw_row(row, expected_truth_self_excluded)
+        )
     groups: dict[tuple[str, str], list[dict[str, str]]] = {}
     for row in rows:
         groups.setdefault((row["filter_name"], row["mode"]), []).append(row)
@@ -512,7 +535,11 @@ def summarize_raw(
                 "complete_queries": complete_queries,
                 "rows_complete": rows_complete,
                 "recall_contract": TIE_AWARE_RECALL_CONTRACT,
-                "truth_self_excluded": all(csv_bool(row["truth_self_excluded"]) for row in items),
+                "truth_self_excluded": all(
+                    required_csv_bool(row.get("truth_self_excluded", ""), "truth_self_excluded")
+                    == expected_truth_self_excluded
+                    for row in items
+                ),
                 "tie_aware_rows": len(items),
                 "latency_mean_ms": statistics.fmean(latencies) if latencies else 0.0,
                 "latency_p50_ms": statistics.median(latencies) if latencies else 0.0,
@@ -679,13 +706,21 @@ def require_plan_evidence(raw: Path) -> dict[str, object]:
         raise RuntimeError(f"missing production backend SQLens identity in {path}")
     if payload.get("guidance_filter_strategy") == "traversal_guided":
         query_contract = payload.get("query_contract")
-        if not isinstance(query_contract, dict) or query_contract.get("self_exclusion") != (
+        expected_self_excluded = (
+            bool(query_contract.get("self_excluded", True))
+            if isinstance(query_contract, dict)
+            else True
+        )
+        expected_contract = (
             "limit_k_plus_1_client_remove_query_id"
-        ):
+            if expected_self_excluded
+            else "none_external_query_source"
+        )
+        if not isinstance(query_contract, dict) or query_contract.get("self_exclusion") != expected_contract:
             raise RuntimeError(f"invalid traversal-guided query contract in {path}")
         if any(
             check.get("self_exclusion_contract")
-            != "limit_k_plus_1_client_remove_query_id"
+            != expected_contract
             or check.get("residual_self_qual_present") is not False
             or int(check.get("scan_limit") or 0) <= 0
             for check in checks
@@ -760,6 +795,9 @@ def plan_evidence_manifest_entry(raw: Path) -> dict[str, object]:
                     "mode",
                     "filter_name",
                     "query_id",
+                    "query_table",
+                    "query_id_column",
+                    "query_vector_column",
                     "self_excluded",
                     "self_exclusion_contract",
                     "scan_limit",
@@ -911,10 +949,50 @@ def database_fingerprint(args: argparse.Namespace, sqlens_build_id: str) -> dict
                 "valid": row[4],
                 "ready": row[5],
             }
+        out["query_table"] = query_relation_provenance(
+            cur, str(getattr(args, "query_table", None) or args.insertion_table)
+        )
     return out
 
 
-def truth_query_ids(path: Path) -> dict[int, int]:
+def relation_identifier(relation: str) -> psycopg.sql.Identifier:
+    parts = relation.split(".")
+    if len(parts) not in {1, 2} or any(not part for part in parts):
+        raise RuntimeError(f"invalid relation name: {relation!r}")
+    return psycopg.sql.Identifier(*parts)
+
+
+def query_relation_provenance(cur: psycopg.Cursor, table: str) -> dict[str, object]:
+    cur.execute(
+        "SELECT %s::regclass::text, %s::regclass::oid::bigint, "
+        "pg_relation_filenode(%s::regclass)::bigint",
+        (table, table, table),
+    )
+    identity = cur.fetchone()
+    if identity is None or identity[2] is None:
+        raise RuntimeError(f"could not fingerprint query table {table}")
+    cur.execute(psycopg.sql.SQL("SELECT count(*) FROM {}").format(relation_identifier(table)))
+    count_row = cur.fetchone()
+    cur.execute(
+        "SELECT COALESCE(array_agg(attname || ':' || format_type(atttypid, atttypmod) "
+        "ORDER BY attnum), ARRAY[]::text[]) "
+        "FROM pg_attribute WHERE attrelid=%s::regclass "
+        "AND attnum > 0 AND NOT attisdropped",
+        (table,),
+    )
+    columns_row = cur.fetchone()
+    if count_row is None or columns_row is None:
+        raise RuntimeError(f"could not read query table provenance for {table}")
+    return {
+        "name": str(identity[0]),
+        "oid": int(identity[1]),
+        "relfilenode": int(identity[2]),
+        "row_count": int(count_row[0]),
+        "columns": list(columns_row[0] or []),
+    }
+
+
+def truth_query_ids(path: Path, expected_self_excluded: bool = True) -> dict[int, int]:
     query_ids: dict[int, int] = {}
     with path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -930,8 +1008,10 @@ def truth_query_ids(path: Path) -> dict[int, int]:
         for row in reader:
             if row.get("method") != "pre_filter_exact":
                 continue
-            if not csv_bool(row["self_excluded"]):
-                raise RuntimeError("truth CSV contains a non-self-excluded row")
+            if required_csv_bool(row.get("self_excluded", ""), "self_excluded") != expected_self_excluded:
+                raise RuntimeError(
+                    "truth CSV self_excluded value does not match the expected query contract"
+                )
             filtered_rows = int(row["filtered_rows"])
             if filtered_rows < 0:
                 raise RuntimeError("truth CSV contains a negative filtered_rows value")
@@ -991,16 +1071,14 @@ def d2_graph_proof_from_env(args: argparse.Namespace) -> dict[str, object]:
 def acquire_formal_data_guard(
     args: argparse.Namespace,
 ) -> tuple[psycopg.Connection, dict[str, object]]:
-    tables = sorted({str(args.insertion_table), str(args.bfs_table)})
+    query_table = str(getattr(args, "query_table", None) or args.insertion_table)
+    tables = sorted({str(args.insertion_table), str(args.bfs_table), query_table})
     connection = psycopg.connect(pg_config_from_env().conninfo, autocommit=False)
     try:
         cur = connection.cursor()
         identifiers = []
         for table in tables:
-            parts = table.split(".")
-            if len(parts) not in {1, 2} or any(not part for part in parts):
-                raise RuntimeError(f"invalid formal table name: {table!r}")
-            identifiers.append(psycopg.sql.Identifier(*parts))
+            identifiers.append(relation_identifier(table))
         cur.execute(
             psycopg.sql.SQL("LOCK TABLE {} IN SHARE MODE").format(
                 psycopg.sql.SQL(", ").join(identifiers)
@@ -1023,10 +1101,12 @@ def acquire_formal_data_guard(
             }
         cur.execute("SELECT pg_backend_pid(), txid_current_snapshot()::text")
         context = cur.fetchone()
+        query_provenance = query_relation_provenance(cur, query_table)
         return connection, {
             "lock_mode": "SHARE",
             "tables": tables,
             "relations": relation_identity,
+            "query_table": query_provenance,
             "backend_pid": int(context[0]),
             "transaction_snapshot": str(context[1]),
             "acquired_at": utc_now(),
@@ -1041,7 +1121,10 @@ def acquire_formal_data_guard(
 def build_run_spec(args: argparse.Namespace) -> dict[str, object]:
     source_files = list((ROOT / "third_party/pgvector-sqlens/src").glob("*.c"))
     source_files.extend((ROOT / "third_party/pgvector-sqlens/src").glob("*.h"))
-    query_ids = truth_query_ids(args.truth_csv)
+    query_ids = truth_query_ids(
+        args.truth_csv,
+        expected_self_excluded=args.expected_truth_self_excluded,
+    )
     sqlens_runtime = sqlens_runtime_provenance()
     d2_proof = d2_graph_proof_from_env(args)
     spec = {
@@ -1057,6 +1140,10 @@ def build_run_spec(args: argparse.Namespace) -> dict[str, object]:
         "sqlens_runtime_provenance": sqlens_runtime,
         "d2_graph_proof": d2_proof,
         "query_contract": {
+            "query_table": args.query_table or args.insertion_table,
+            "query_id_column": args.query_id_column,
+            "query_vector_column": args.query_vector_column,
+            "self_excluded": args.expected_truth_self_excluded,
             "predicate_contract": (
                 "exact_activated_predicate_no_residual_scan_qual"
                 if args.guidance_filter_strategy == "traversal_guided"
@@ -1064,12 +1151,20 @@ def build_run_spec(args: argparse.Namespace) -> dict[str, object]:
             ),
             "self_exclusion": (
                 "limit_k_plus_1_client_remove_query_id"
-                if args.guidance_filter_strategy == "traversal_guided"
-                else "sql_residual_id_not_equal"
+                if (
+                    args.guidance_filter_strategy == "traversal_guided"
+                    and args.expected_truth_self_excluded
+                )
+                else (
+                    "sql_residual_id_not_equal"
+                    if args.expected_truth_self_excluded
+                    else "none_external_query_source"
+                )
             ),
             "all_modes_share_identical_sql_shape": True,
             "measured_latency_includes_limit_k_plus_1_and_client_self_exclusion": (
                 args.guidance_filter_strategy == "traversal_guided"
+                and args.expected_truth_self_excluded
             ),
         },
         "database": database_fingerprint(args, str(sqlens_runtime["loaded_vector_sqlens_build_id"])),
@@ -1099,6 +1194,7 @@ def reusable_summary(
     bootstrap_seed: int,
     expected_queries: int,
     expected_repeats: int,
+    expected_truth_self_excluded: bool = True,
 ) -> list[dict[str, object]] | None:
     if not path.is_file() or path.stat().st_size == 0:
         return None
@@ -1109,6 +1205,7 @@ def reusable_summary(
             bootstrap_seed,
             expected_queries,
             expected_repeats,
+            expected_truth_self_excluded,
         )
     except (KeyError, TypeError, ValueError, csv.Error):
         return None
@@ -1203,6 +1300,11 @@ def run_d123(
     append_option(cmd, "--insertion-index", args.insertion_index)
     append_option(cmd, "--bfs-table", args.bfs_table)
     append_option(cmd, "--bfs-index", args.bfs_index)
+    append_option(cmd, "--query-table", getattr(args, "query_table", None))
+    append_option(cmd, "--query-id-column", getattr(args, "query_id_column", "id"))
+    append_option(cmd, "--query-vector-column", getattr(args, "query_vector_column", "embedding"))
+    if not getattr(args, "expected_truth_self_excluded", True):
+        cmd.append("--no-expected-truth-self-excluded")
     append_option(cmd, "--backend-cpu-list", getattr(args, "backend_cpu_list", None))
     append_expected_runtime_identity(cmd, args)
     if not args.require_preferred_index_guc:
@@ -1288,6 +1390,11 @@ def run_d123_interleaved(
     append_option(cmd, "--insertion-index", args.insertion_index)
     append_option(cmd, "--bfs-table", args.bfs_table)
     append_option(cmd, "--bfs-index", args.bfs_index)
+    append_option(cmd, "--query-table", getattr(args, "query_table", None))
+    append_option(cmd, "--query-id-column", getattr(args, "query_id_column", "id"))
+    append_option(cmd, "--query-vector-column", getattr(args, "query_vector_column", "embedding"))
+    if not getattr(args, "expected_truth_self_excluded", True):
+        cmd.append("--no-expected-truth-self-excluded")
     append_option(cmd, "--backend-cpu-list", getattr(args, "backend_cpu_list", None))
     append_expected_runtime_identity(cmd, args)
     if not args.require_preferred_index_guc:
@@ -1490,6 +1597,7 @@ def calibrate_mode_filter(
                     args.bootstrap_seed,
                     args.calibration_queries,
                     args.calibration_repeats,
+                    getattr(args, "expected_truth_self_excluded", True),
                 ) if args.resume else None
                 if summary is not None:
                     try:
@@ -1516,6 +1624,7 @@ def calibrate_mode_filter(
                         args.bootstrap_seed,
                         args.calibration_queries,
                         args.calibration_repeats,
+                        getattr(args, "expected_truth_self_excluded", True),
                     )
                     if len(summary) != 1:
                         raise RuntimeError(
@@ -1752,12 +1861,12 @@ def formal_completion_gate(
     final_rows: list[dict[str, object]],
     skip_final: bool,
 ) -> dict[str, object]:
-    expected_filters = set(FILTER_ORDER)
+    expected_filters = list(filters)
     expected_modes = set(DEFAULT_MODES)
     expected_targets = set(FORMAL_TARGETS)
     requested_formal_matrix = (
-        len(filters) == len(expected_filters)
-        and set(filters) == expected_filters
+        len(expected_filters) == 14
+        and len(set(expected_filters)) == 14
         and len(modes) == len(expected_modes)
         and set(modes) == expected_modes
         and len(targets) == len(expected_targets)
@@ -1765,7 +1874,7 @@ def formal_completion_gate(
     )
     expected_keys = {
         (filter_name, float(target), mode)
-        for filter_name in FILTER_ORDER
+        for filter_name in expected_filters
         for target in FORMAL_TARGETS
         for mode in DEFAULT_MODES
     }
@@ -1895,6 +2004,7 @@ def run_final_interleaved(
                     args.bootstrap_seed,
                     args.final_queries,
                     args.final_repeats,
+                    getattr(args, "expected_truth_self_excluded", True),
                 )
                 require_plan_evidence(raw)
                 if {str(row["mode"]) for row in candidate} == set(modes):
@@ -1916,6 +2026,7 @@ def run_final_interleaved(
                 args.bootstrap_seed,
                 args.final_queries,
                 args.final_repeats,
+                getattr(args, "expected_truth_self_excluded", True),
             )
         else:
             elapsed_ms = 0.0
@@ -1977,6 +2088,7 @@ def run_final_unique(
             args.bootstrap_seed,
             args.final_queries,
             args.final_repeats,
+            getattr(args, "expected_truth_self_excluded", True),
         ) if args.resume else None
         if summary is not None:
             try:
@@ -2001,6 +2113,7 @@ def run_final_unique(
                 args.bootstrap_seed,
                 args.final_queries,
                 args.final_repeats,
+                getattr(args, "expected_truth_self_excluded", True),
             )
             if len(summary) != 1:
                 raise RuntimeError(f"expected one final summary in {raw}, got {len(summary)}")
@@ -2036,6 +2149,7 @@ def consolidate_final(
     final_results: dict[FinalResultKey, dict[str, object]],
     bootstrap_samples: int = 0,
     bootstrap_seed: int = 20260718,
+    expected_truth_self_excluded: bool = True,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for selected_row in selected:
@@ -2115,8 +2229,8 @@ def consolidate_final(
             and int(row.get("errors") or 0) == 0
             and stock.get("recall_contract") == TIE_AWARE_RECALL_CONTRACT
             and row.get("recall_contract") == TIE_AWARE_RECALL_CONTRACT
-            and stock.get("truth_self_excluded") is True
-            and row.get("truth_self_excluded") is True
+            and stock.get("truth_self_excluded") is expected_truth_self_excluded
+            and row.get("truth_self_excluded") is expected_truth_self_excluded
             and stock.get("plan_gate_passed") is True
             and row.get("plan_gate_passed") is True
         )
@@ -2233,6 +2347,18 @@ def main() -> None:
     parser.add_argument("--insertion-index", default=DEFAULT_INSERTION_INDEX)
     parser.add_argument("--bfs-table", default=DEFAULT_BFS_TABLE)
     parser.add_argument("--bfs-index", default=DEFAULT_BFS_INDEX)
+    parser.add_argument(
+        "--query-table",
+        help="External query relation. Omit to use the candidate table's id and embedding columns.",
+    )
+    parser.add_argument("--query-id-column", default="id")
+    parser.add_argument("--query-vector-column", default="embedding")
+    parser.add_argument(
+        "--expected-truth-self-excluded",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Expected self_excluded value in the supplied exact-truth CSV.",
+    )
     parser.add_argument(
         "--guidance-filter-strategy",
         default="traversal_guided",
@@ -2357,7 +2483,7 @@ def main() -> None:
                 "final_execution_order": args.final_execution_order,
                 "schedule_seed": args.schedule_seed,
                 "recall_contract": TIE_AWARE_RECALL_CONTRACT,
-                "self_excluded": True,
+                "self_excluded": args.expected_truth_self_excluded,
                 "config_count": len(configs),
                 "configs": [asdict(config) for config in configs],
                 "mode_grids": mode_grids,
@@ -2421,6 +2547,7 @@ def main() -> None:
                 final_results,
                 args.bootstrap_samples,
                 args.bootstrap_seed,
+                args.expected_truth_self_excluded,
             )
             write_csv(final_out, final_rows)
             manifest["timestamps"]["final_completed_at"] = utc_now()  # type: ignore[index]

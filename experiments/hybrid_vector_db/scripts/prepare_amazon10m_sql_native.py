@@ -24,6 +24,9 @@ DEFAULT_VECTOR_TABLE = "public.amazon_grocery_reviews_10m_pgvector"
 READER_ROLE = "amazon10m_sql_native_reader"
 DEFAULT_PRINCIPAL = "amazon10m_sql_native_benchmark"
 DEFAULT_EXPECTED_ROWS = 10_000_000
+GRANT_TEMPORAL_TARGET_PCT = Decimal("20")
+FACT_TEMPORAL_TARGET_PCT = Decimal("5")
+MAX_TEMPORAL_TARGET_ERROR_PCT_POINTS = Decimal("0.1")
 
 CSV_COLUMNS = (
     "id",
@@ -129,6 +132,28 @@ def validate_distinct_workload_populations(
             + json.dumps(counts, sort_keys=True)
         )
     return counts
+
+
+def validate_temporal_target(
+    name: str,
+    observed: int,
+    population: int,
+    target_pct: Decimal,
+    *,
+    max_error_pct_points: Decimal = MAX_TEMPORAL_TARGET_ERROR_PCT_POINTS,
+) -> Decimal:
+    if population <= 0 or observed <= 0 or observed > population:
+        raise RuntimeError(
+            f"{name} temporal population is invalid: "
+            f"observed={observed} population={population}"
+        )
+    actual_pct = Decimal(100) * Decimal(observed) / Decimal(population)
+    if abs(actual_pct - target_pct) > max_error_pct_points:
+        raise RuntimeError(
+            f"{name} temporal selectivity missed its target: target={target_pct}% "
+            f"actual={actual_pct}% tolerance={max_error_pct_points} percentage points"
+        )
+    return actual_pct
 
 
 def reference_temporal_buckets(
@@ -341,6 +366,64 @@ SELECT %s,
        100.0 * cumulative_count / visible_count
 FROM selected
 ORDER BY target_pct
+"""
+
+# Calibrate grant-time visibility over the ACL-visible population. Tenants are
+# indivisible policy units, so the deterministic ascending-volume order keeps
+# the boundary overshoot small without inventing per-review ACLs. Both active
+# and inactive validity times are anchored to real review timestamps.
+CALIBRATE_GRANT_VALIDITY_SQL = """
+WITH target AS (
+    SELECT bucket.as_of,
+           bucket.target_count,
+           (
+               SELECT min(fact.valid_from)::bigint
+               FROM public.amazon_review_facts AS fact
+               JOIN public.amazon_product_dim AS product
+                 ON product.parent_asin = fact.parent_asin
+               JOIN public.amazon_principal_tenant_grants AS grant_row
+                 ON grant_row.tenant_id = product.tenant_id
+                AND grant_row.principal_name = bucket.principal_name
+                AND grant_row.can_read
+               WHERE fact.valid_from > bucket.as_of
+           ) AS inactive_valid_from
+    FROM public.amazon_sql_native_buckets AS bucket
+    WHERE bucket.principal_name = %s
+      AND bucket.target_pct = %s
+), tenant_review_counts AS (
+    SELECT grant_row.tenant_id,
+           count(*)::bigint AS review_count
+    FROM public.amazon_principal_tenant_grants AS grant_row
+    JOIN public.amazon_product_dim AS product
+      ON product.tenant_id = grant_row.tenant_id
+    JOIN public.amazon_review_facts AS fact
+      ON fact.parent_asin = product.parent_asin
+    WHERE grant_row.principal_name = %s
+      AND grant_row.can_read
+    GROUP BY grant_row.tenant_id
+), ranked AS (
+    SELECT tenant_id,
+           review_count,
+           sum(review_count) OVER (ORDER BY review_count, tenant_id) AS cumulative_count
+    FROM tenant_review_counts
+), chosen AS (
+    SELECT ranked.tenant_id
+    FROM ranked
+    CROSS JOIN target
+    WHERE ranked.cumulative_count - ranked.review_count < target.target_count
+)
+UPDATE public.amazon_principal_tenant_grants AS grant_row
+SET valid_from = CASE
+        WHEN EXISTS (
+            SELECT 1 FROM chosen WHERE chosen.tenant_id = grant_row.tenant_id
+        ) THEN least(grant_row.valid_from, target.as_of)
+        ELSE target.inactive_valid_from
+    END,
+    valid_to = NULL::bigint
+FROM target
+WHERE grant_row.principal_name = %s
+  AND grant_row.can_read
+  AND target.inactive_valid_from IS NOT NULL
 """
 
 SECONDARY_INDEXES = (
@@ -561,6 +644,12 @@ def materialize_relations(cur, principal: str, acl_coverage_pct: Decimal) -> Non
         INSERT_BUCKETS_SQL,
         ([value for value in TEMPORAL_TARGET_PCTS], principal, principal),
     )
+    cur.execute(
+        CALIBRATE_GRANT_VALIDITY_SQL,
+        (principal, GRANT_TEMPORAL_TARGET_PCT, principal, principal),
+    )
+    if cur.rowcount <= 0:
+        raise RuntimeError("grant temporal calibration updated no ACL rows")
     for _, ddl in SECONDARY_INDEXES:
         cur.execute(ddl)
     cur.execute("ANALYZE public.amazon_tenants")
@@ -899,7 +988,16 @@ def validate_database(cur, sql, args: argparse.Namespace) -> dict[str, int]:
                     f"explicit fact-temporal count mismatch for target_pct={target_pct}: "
                     f"query={observed} bucket={achieved_count}"
                 )
-        grant_bucket = next(row for row in bucket_rows if Decimal(row[0]) == Decimal("20"))
+        grant_bucket = next(
+            row
+            for row in bucket_rows
+            if Decimal(row[0]) == GRANT_TEMPORAL_TARGET_PCT
+        )
+        fact_bucket = next(
+            row
+            for row in bucket_rows
+            if Decimal(row[0]) == FACT_TEMPORAL_TARGET_PCT
+        )
         grant_as_of = int(grant_bucket[1])
         cur.execute(
             """
@@ -920,12 +1018,24 @@ def validate_database(cur, sql, args: argparse.Namespace) -> dict[str, int]:
     finally:
         cur.execute("RESET ROLE")
     population_proof = validate_distinct_workload_populations(
-        visible_count, grant_temporal_count, int(grant_bucket[4])
+        visible_count, grant_temporal_count, int(fact_bucket[4])
+    )
+    validate_temporal_target(
+        "grant",
+        grant_temporal_count,
+        visible_count,
+        GRANT_TEMPORAL_TARGET_PCT,
+    )
+    validate_temporal_target(
+        "fact",
+        population_proof["fact_temporal_selectivity"],
+        visible_count,
+        FACT_TEMPORAL_TARGET_PCT,
     )
 
     counts["acl_visible_reviews"] = visible_count
     counts["grant_temporal_reviews_at_20pct_as_of"] = grant_temporal_count
-    counts["fact_temporal_reviews_at_20pct_as_of"] = population_proof[
+    counts["fact_temporal_reviews_at_5pct_as_of"] = population_proof[
         "fact_temporal_selectivity"
     ]
     counts["vector_rows"] = _validate_vector_ids(

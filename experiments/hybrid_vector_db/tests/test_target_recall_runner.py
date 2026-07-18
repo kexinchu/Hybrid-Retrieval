@@ -15,7 +15,6 @@ from experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_run
     DEFAULT_INSERTION_INDEX,
     DEFAULT_INSERTION_TABLE,
     DEFAULT_TRUTH_CSV,
-    FILTER_ORDER,
     SQLENS_PROFILE_REQUIRED_FIELDS,
     SQLENS_TRAVERSAL_PROFILE_REQUIRED_FIELDS,
     TIE_AWARE_RECALL_CONTRACT,
@@ -40,6 +39,7 @@ from experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_run
     selected_rows,
     sha256_file,
     sqlens_runtime_provenance,
+    truth_query_ids,
     validate_tie_aware_raw_row,
 )
 
@@ -90,12 +90,20 @@ class TargetRecallRunnerTests(unittest.TestCase):
     def test_formal_data_guard_holds_share_lock_and_records_relation_identity(self):
         cursor = mock.Mock()
         cursor.fetchone.side_effect = [
+            ("public.external_queries", 30, 40),
             ("public.items", 10, 20),
             (4321, "100:100:"),
+            ("public.external_queries", 30, 40),
+            (200,),
+            (["query_key:bigint", "query_embedding:vector"],),
         ]
         connection = mock.Mock()
         connection.cursor.return_value = cursor
-        args = argparse.Namespace(insertion_table="public.items", bfs_table="public.items")
+        args = argparse.Namespace(
+            insertion_table="public.items",
+            bfs_table="public.items",
+            query_table="public.external_queries",
+        )
         with (
             mock.patch(
                 "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.psycopg.connect",
@@ -111,9 +119,32 @@ class TargetRecallRunnerTests(unittest.TestCase):
         self.assertEqual(evidence["lock_mode"], "SHARE")
         self.assertEqual(evidence["backend_pid"], 4321)
         self.assertEqual(evidence["relations"]["public.items"]["relfilenode"], 20)
+        self.assertEqual(
+            evidence["query_table"],
+            {
+                "name": "public.external_queries",
+                "oid": 30,
+                "relfilenode": 40,
+                "row_count": 200,
+                "columns": ["query_key:bigint", "query_embedding:vector"],
+            },
+        )
         self.assertIn("LOCK TABLE", str(cursor.execute.call_args_list[0].args[0]))
         connection.commit.assert_not_called()
         connection.close.assert_not_called()
+
+    def test_q200_external_truth_requires_non_self_excluded_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            truth = Path(tmp) / "q200.csv"
+            truth.write_text(
+                "method,filter_name,query_no,query_id,filtered_rows,kth_distance_sq,tie_tolerance,self_excluded\n"
+                "pre_filter_exact,yfcc_filter,200,9001,10,0.25,1e-12,false\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(truth_query_ids(truth, expected_self_excluded=False), {200: 9001})
+            with self.assertRaisesRegex(RuntimeError, "expected query contract"):
+                truth_query_ids(truth, expected_self_excluded=True)
 
     def test_percentile_uses_sorted_floor_index_and_empty_is_zero(self):
         self.assertEqual(percentile([], 0.95), 0.0)
@@ -434,7 +465,7 @@ class TargetRecallRunnerTests(unittest.TestCase):
         self.assertEqual([row["iterative_scan"] for row in grids["design1_bloom"]], ["off"])
 
     def test_formal_completion_gate_distinguishes_matrix_measurement_and_comparison(self):
-        filters = FILTER_ORDER
+        filters = [f"dataset_filter_{number}" for number in range(14)]
         modes = DEFAULT_MODES
         targets = [0.90, 0.95, 0.99]
         selected = [
@@ -460,6 +491,7 @@ class TargetRecallRunnerTests(unittest.TestCase):
         self.assertTrue(complete["matrix_complete"])
         self.assertTrue(complete["measurement_complete"])
         self.assertTrue(complete["comparison_valid"])
+        self.assertEqual(complete["expected_cells"], 168)
         self.assertEqual(complete["status"], "complete")
 
         duplicate = formal_completion_gate(

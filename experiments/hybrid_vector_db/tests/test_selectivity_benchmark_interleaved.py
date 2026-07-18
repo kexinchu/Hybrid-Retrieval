@@ -811,6 +811,42 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
         self.assertNotIn("id <>", query_sql)
         self.assertEqual(query_params, (99,))
 
+    def test_external_query_sql_reads_the_query_table_without_candidate_self_exclusion(self):
+        sql = benchmark.search_query_sql(
+            "public.candidates",
+            "rating = 5",
+            2,
+            query_table="public.queries",
+            query_id_column="query_key",
+            query_vector_column="query_embedding",
+            self_exclusion=False,
+        )
+
+        self.assertIn("FROM public.queries AS q", sql)
+        self.assertIn('q."query_key" = %s', sql)
+        self.assertIn('q."query_embedding"', sql)
+        self.assertNotIn("id <>", sql)
+        self.assertIn("LIMIT 2", sql)
+
+        cursor = mock.Mock()
+        cursor.fetchall.return_value = [(99, 0.125), (10, 0.5)]
+        cursor.fetchone.return_value = ('{"visited_tuples":2}',)
+        ids, _, _ = benchmark.run_query(
+            cursor,
+            "public.candidates",
+            "rating = 5",
+            99,
+            2,
+            query_table="public.queries",
+            query_id_column="query_key",
+            query_vector_column="query_embedding",
+            self_exclusion=False,
+        )
+
+        self.assertEqual(ids, [99, 10])
+        _, query_params = cursor.execute.call_args_list[1].args
+        self.assertEqual(query_params, (99,))
+
     def test_d2_graph_proof_gate_requires_same_logical_graph_but_new_layout(self):
         valid = self._d2_proof()
         proof = benchmark.validate_d2_graph_proof(

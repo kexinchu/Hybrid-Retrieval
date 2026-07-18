@@ -237,6 +237,7 @@ def enforce_backend_cpu_provenance(provenance: dict[str, object]) -> None:
 def load_tie_aware_truth(
     path: Path,
     method: str = "pre_filter_exact",
+    expected_self_excluded: bool = True,
 ) -> tuple[dict[tuple[str, int], TruthEntry], dict[int, int]]:
     truth: dict[tuple[str, int], TruthEntry] = {}
     query_by_no: dict[int, int] = {}
@@ -260,8 +261,11 @@ def load_tie_aware_truth(
             if previous != query_id:
                 raise ValueError(f"query_no={query_no} maps to multiple query IDs")
             self_excluded = parse_bool(row["self_excluded"])
-            if not self_excluded:
-                raise ValueError(f"truth row {(row['filter_name'], query_no)} is not self-excluded")
+            if self_excluded != expected_self_excluded:
+                raise ValueError(
+                    f"truth row {(row['filter_name'], query_no)} self_excluded="
+                    f"{self_excluded!r} does not match expected {expected_self_excluded!r}"
+                )
             filtered_rows = int(row["filtered_rows"])
             kth_distance_sq = (
                 float(row["kth_distance_sq"]) if row["kth_distance_sq"].strip() else None
@@ -964,23 +968,69 @@ def uses_exact_predicate_scan_contract(filter_strategy: str) -> bool:
     return filter_strategy == "traversal_guided"
 
 
+def query_table_for_candidate(args: argparse.Namespace, candidate_table: str) -> str:
+    """Use the candidate heap as the query source unless an external query heap is supplied."""
+    return str(getattr(args, "query_table", None) or candidate_table)
+
+
+def candidate_self_exclusion(args: argparse.Namespace, candidate_table: str) -> bool:
+    return query_table_for_candidate(args, candidate_table) == candidate_table
+
+
+def validate_query_source_contract(args: argparse.Namespace) -> None:
+    observed = {
+        candidate_self_exclusion(args, mode_table_index(args, mode)[0])
+        for mode in args.modes
+    }
+    if len(observed) != 1:
+        raise RuntimeError(
+            "query source has inconsistent self-exclusion semantics across candidate tables; "
+            "supply a query table that is either external to every mode or the candidate table"
+        )
+    actual = observed.pop()
+    if actual != args.expected_truth_self_excluded:
+        raise RuntimeError(
+            "query/truth self-exclusion contract mismatch: "
+            f"candidate_self_excluded={actual!r}, "
+            f"expected_truth_self_excluded={args.expected_truth_self_excluded!r}"
+        )
+
+
+def quoted_column(identifier: str) -> str:
+    if not identifier or "." in identifier or "\x00" in identifier:
+        raise ValueError(f"invalid column identifier: {identifier!r}")
+    return '"' + identifier.replace('"', '""') + '"'
+
+
 def search_query_sql(
     table: str,
     predicate: str,
     k: int,
     bind_guidance: bool = False,
     client_self_exclusion: bool = False,
+    *,
+    query_table: str | None = None,
+    query_id_column: str = "id",
+    query_vector_column: str = "embedding",
+    self_exclusion: bool = True,
 ) -> str:
     binding = (
         "(SELECT vector_hnsw_guidance_bind(%s::regclass, %s::text[], %s) OFFSET 0) AND "
         if bind_guidance
         else ""
     )
-    self_qual = "" if client_self_exclusion else " AND id <> %s"
+    source_table = query_table or table
+    query_id = quoted_column(query_id_column)
+    query_vector = quoted_column(query_vector_column)
+    self_qual = "" if client_self_exclusion or not self_exclusion else " AND id <> %s"
     scan_limit = int(k) + 1 if client_self_exclusion else int(k)
     return f"""
         SELECT id,
-               embedding <-> (SELECT embedding FROM {table} WHERE id = %s) AS distance
+               embedding <-> (
+                   SELECT q.{query_vector}
+                   FROM {source_table} AS q
+                   WHERE q.{query_id} = %s
+               ) AS distance
         FROM {table}
         WHERE {binding}({predicate}){self_qual}
         ORDER BY distance
@@ -1015,6 +1065,11 @@ def explain_hnsw_plan(
     k: int,
     binding: tuple[str, list[str], str] | None = None,
     client_self_exclusion: bool = False,
+    *,
+    query_table: str | None = None,
+    query_id_column: str = "id",
+    query_vector_column: str = "embedding",
+    self_exclusion: bool = True,
 ) -> dict[str, object]:
     cur.execute(
         "SELECT idx.oid::bigint, idx.relname, idx_ns.nspname, am.amname, "
@@ -1045,11 +1100,15 @@ def explain_hnsw_plan(
         k,
         binding is not None,
         client_self_exclusion,
+        query_table=query_table,
+        query_id_column=query_id_column,
+        query_vector_column=query_vector_column,
+        self_exclusion=self_exclusion,
     )
     params: tuple[object, ...] = (int(query_id),)
     if binding is not None:
         params += binding
-    if not client_self_exclusion:
+    if self_exclusion and not client_self_exclusion:
         params += (int(query_id),)
     cur.execute("EXPLAIN (FORMAT JSON, VERBOSE) " + sql, params)
     explain_value: Any = cur.fetchone()[0]
@@ -1075,14 +1134,17 @@ def explain_hnsw_plan(
         "expected_table_oid": table_oid,
         "expected_table_identity": f"{table_schema}.{table_name}",
         "query_id": query_id,
-        "self_excluded": True,
+        "query_table": query_table or table,
+        "query_id_column": query_id_column,
+        "query_vector_column": query_vector_column,
+        "self_excluded": self_exclusion,
         "self_exclusion_contract": (
             "limit_k_plus_1_client_remove_query_id"
             if client_self_exclusion
-            else "sql_residual_id_not_equal"
+            else "sql_residual_id_not_equal" if self_exclusion else "none_external_query_source"
         ),
         "scan_limit": int(k) + 1 if client_self_exclusion else int(k),
-        "residual_self_qual_present": not client_self_exclusion,
+        "residual_self_qual_present": self_exclusion and not client_self_exclusion,
         "statement_binding_present": binding is not None,
         "observed_index_nodes": observed,
         "matched_index_nodes": matched,
@@ -1125,6 +1187,10 @@ def write_plan_evidence(
         "execution_lifecycle": getattr(args, "execution_lifecycle", None),
         "guidance_filter_strategy": args.guidance_filter_strategy,
         "query_contract": {
+            "query_table": args.query_table or "candidate_table_per_mode",
+            "query_id_column": args.query_id_column,
+            "query_vector_column": args.query_vector_column,
+            "self_excluded": args.expected_truth_self_excluded,
             "predicate_contract": (
                 "exact_activated_predicate_no_residual_scan_qual"
                 if uses_exact_predicate_scan_contract(args.guidance_filter_strategy)
@@ -1132,10 +1198,20 @@ def write_plan_evidence(
             ),
             "self_exclusion": (
                 "limit_k_plus_1_client_remove_query_id"
-                if uses_exact_predicate_scan_contract(args.guidance_filter_strategy)
-                else "sql_residual_id_not_equal"
+                if (
+                    uses_exact_predicate_scan_contract(args.guidance_filter_strategy)
+                    and args.expected_truth_self_excluded
+                )
+                else (
+                    "sql_residual_id_not_equal"
+                    if args.expected_truth_self_excluded
+                    else "none_external_query_source"
+                )
             ),
-            "measured_latency_includes_client_self_exclusion": True,
+            "measured_latency_includes_client_self_exclusion": bool(
+                uses_exact_predicate_scan_contract(args.guidance_filter_strategy)
+                and args.expected_truth_self_excluded
+            ),
         },
         "d2_graph_proof": getattr(args, "d2_graph_proof", {"required": False}),
         "d2_graph_proof_final": getattr(
@@ -1264,6 +1340,10 @@ def run_query(
     binding: tuple[str, list[str], str] | None = None,
     client_self_exclusion: bool = False,
     *,
+    query_table: str | None = None,
+    query_id_column: str = "id",
+    query_vector_column: str = "embedding",
+    self_exclusion: bool = True,
     reset_profile: bool = True,
     read_profile: bool = True,
 ) -> tuple[list[int], list[float], dict[str, object]]:
@@ -1272,7 +1352,7 @@ def run_query(
     params: tuple[object, ...] = (int(query_id),)
     if binding is not None:
         params += binding
-    if not client_self_exclusion:
+    if self_exclusion and not client_self_exclusion:
         params += (int(query_id),)
     cur.execute(
         search_query_sql(
@@ -1281,6 +1361,10 @@ def run_query(
             k,
             binding is not None,
             client_self_exclusion,
+            query_table=query_table,
+            query_id_column=query_id_column,
+            query_vector_column=query_vector_column,
+            self_exclusion=self_exclusion,
         ),
         params,
     )
@@ -1315,6 +1399,11 @@ def gate_runtime_plans(
     query_id: int,
 ) -> None:
     table, expected_index = mode_table_index(args, runtime.mode)
+    query_table = query_table_for_candidate(args, table)
+    self_exclusion = candidate_self_exclusion(args, table)
+    client_self_exclusion = (
+        uses_exact_predicate_scan_contract(args.guidance_filter_strategy) and self_exclusion
+    )
     try:
         for filter_name, _, predicate in filters:
             try:
@@ -1328,7 +1417,11 @@ def gate_runtime_plans(
                     query_id,
                     args.k,
                     binding,
-                    uses_exact_predicate_scan_contract(args.guidance_filter_strategy),
+                    client_self_exclusion,
+                    query_table=query_table,
+                    query_id_column=getattr(args, "query_id_column", "id"),
+                    query_vector_column=getattr(args, "query_vector_column", "embedding"),
+                    self_exclusion=self_exclusion,
                 )
             except Exception as exc:
                 evidence = {
@@ -1338,7 +1431,8 @@ def gate_runtime_plans(
                     "expected_index": expected_index,
                     "expected_table": table,
                     "query_id": query_id,
-                    "self_excluded": True,
+                    "query_table": query_table,
+                    "self_excluded": self_exclusion,
                     "failure": f"{exc.__class__.__name__}: {exc}",
                 }
                 args.plan_evidence.append(evidence)
@@ -1489,14 +1583,20 @@ def run_warmup(
         evidence["cache_before"] = read_cache_profile(runtime.cur)
         activation_profile = activate(runtime.cur, args, runtime.mode, filter_name)
         binding = activation_binding(args, runtime.mode, filter_name, activation_profile)
+        candidate_table = str(activation_profile["table"])
+        self_exclusion = candidate_self_exclusion(args, candidate_table)
         run_query(
             runtime.cur,
-            str(activation_profile["table"]),
+            candidate_table,
             predicate,
             query_id,
             args.k,
             binding,
-            uses_exact_predicate_scan_contract(args.guidance_filter_strategy),
+            uses_exact_predicate_scan_contract(args.guidance_filter_strategy) and self_exclusion,
+            query_table=query_table_for_candidate(args, candidate_table),
+            query_id_column=getattr(args, "query_id_column", "id"),
+            query_vector_column=getattr(args, "query_vector_column", "embedding"),
+            self_exclusion=self_exclusion,
         )
         evidence["guidance_after"] = read_guidance_profile(runtime.cur)
         evidence["cache_after"] = read_cache_profile(runtime.cur)
@@ -1719,6 +1819,11 @@ def run_measured_query(
     end_to_end_ms = 0.0
     error_detail = ""
     table, index = mode_table_index(args, mode)
+    query_table = query_table_for_candidate(args, table)
+    self_exclusion = candidate_self_exclusion(args, table)
+    client_self_exclusion = (
+        uses_exact_predicate_scan_contract(args.guidance_filter_strategy) and self_exclusion
+    )
     try:
         runtime.cur.execute("SELECT vector_hnsw_reset_scan_profile()")
         guidance_before = read_guidance_profile(runtime.cur)
@@ -1742,7 +1847,11 @@ def run_measured_query(
             query_id,
             args.k,
             binding,
-            uses_exact_predicate_scan_contract(args.guidance_filter_strategy),
+            client_self_exclusion,
+            query_table=query_table,
+            query_id_column=getattr(args, "query_id_column", "id"),
+            query_vector_column=getattr(args, "query_vector_column", "embedding"),
+            self_exclusion=self_exclusion,
             reset_profile=False,
             read_profile=False,
         )
@@ -1806,6 +1915,9 @@ def run_measured_query(
         "mode_label": MODE_LABELS[mode],
         "table": table,
         "index": index,
+        "query_table": query_table,
+        "query_id_column": getattr(args, "query_id_column", "id"),
+        "query_vector_column": getattr(args, "query_vector_column", "embedding"),
         "d2_page_access": args.d2_page_access if mode_uses_d2(mode) else "off",
         "d2_index_page_access": args.d2_index_page_access if mode_uses_d2(mode) else "off",
         "preferred_index_guc": getattr(args, "preferred_index_guc", "hnsw.preferred_index"),
@@ -1838,13 +1950,13 @@ def run_measured_query(
         "k": args.k,
         "scan_limit": (
             args.k + 1
-            if uses_exact_predicate_scan_contract(args.guidance_filter_strategy)
+            if client_self_exclusion
             else args.k
         ),
         "self_exclusion_contract": (
             "limit_k_plus_1_client_remove_query_id"
-            if uses_exact_predicate_scan_contract(args.guidance_filter_strategy)
-            else "sql_residual_id_not_equal"
+            if client_self_exclusion
+            else "sql_residual_id_not_equal" if self_exclusion else "none_external_query_source"
         ),
         "recall": tie_aware_recall(distances, truth_entry, args.k) if not error else 0.0,
         "recall_contract": "distance_squared_threshold_tie_aware_v1",
@@ -2341,6 +2453,18 @@ def main() -> None:
     parser.add_argument("--bfs-table", default=BFS_TABLE)
     parser.add_argument("--bfs-index", default=BFS_INDEX)
     parser.add_argument(
+        "--query-table",
+        help="External query relation. Omit to read each mode's query vector from its candidate table.",
+    )
+    parser.add_argument("--query-id-column", default="id")
+    parser.add_argument("--query-vector-column", default="embedding")
+    parser.add_argument(
+        "--expected-truth-self-excluded",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require this exact self_excluded value in every formal truth row.",
+    )
+    parser.add_argument(
         "--truth-csv",
         type=Path,
         default=Path("results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_formal.csv"),
@@ -2450,6 +2574,9 @@ def main() -> None:
     args.backend_cpu_evidence = []
     args.runtime_sqlens_identity_evidence = []
     try:
+        quoted_column(args.query_id_column)
+        quoted_column(args.query_vector_column)
+        validate_query_source_contract(args)
         require_sqlens_provenance_from_env()
         args.sqlens_runtime_identity = require_exact_sqlens_identity_from_env(
             args.expected_sqlens_build_id,
@@ -2474,7 +2601,10 @@ def main() -> None:
             )
         else:
             args.d2_graph_proof = {"required": False}
-        truth, query_by_no = load_tie_aware_truth(args.truth_csv)
+        truth, query_by_no = load_tie_aware_truth(
+            args.truth_csv,
+            expected_self_excluded=args.expected_truth_self_excluded,
+        )
         query_nos = sorted(query_by_no)[args.query_offset : args.query_offset + args.queries]
         if len(query_nos) != args.queries:
             raise RuntimeError(f"requested {args.queries} queries, found {len(query_nos)}")
