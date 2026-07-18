@@ -52,6 +52,7 @@ research/
 *.log
 *.out
 *.synctex.gz
+!third_party/pgvector-sqlens/test/expected/*.out
 
 # IDE
 .vscode/

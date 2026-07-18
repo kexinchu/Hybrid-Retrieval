@@ -17,7 +17,8 @@ locally.
 | `experiments/hybrid_vector_db/scripts/` | Data preparation, benchmark, and result-summary scripts |
 | `experiments/hybrid_vector_db/sql/` | SQL schemas and smoke-test queries |
 | `experiments/hybrid_vector_db/pg_ext/` | Small PostgreSQL helper extension used for profiling |
-| `patches/pgvector-sqlens.patch` | Patch against upstream pgvector with SQLens instrumentation and HNSW changes |
+| `third_party/pgvector-sqlens/` | Vendored pgvector source with SQLens instrumentation and HNSW changes |
+| `patches/pgvector-sqlens.patch` | Audit patch against upstream pgvector commit `cab9da72c04353f143bb06b42ab70a403daac64a` |
 
 ## Dependencies
 
@@ -48,19 +49,19 @@ export LAION10M_DATA_DIR=/path/to/LAION10M
 export YFCC10M_DATA_DIR=/path/to/YFCC10M
 ```
 
-## pgvector Patch
+## pgvector Source
 
-The SQLens prototype is distributed as a patch instead of vendoring the full
-pgvector source tree:
+Build and install the vendored SQLens pgvector source:
 
 ```bash
-git clone https://github.com/pgvector/pgvector.git external/pgvector-src
-cd external/pgvector-src
-git checkout cab9da72c04353f143bb06b42ab70a403daac64a
-git apply ../../patches/pgvector-sqlens.patch
+cd third_party/pgvector-sqlens
 make
 make install
 ```
+
+The patch in `patches/pgvector-sqlens.patch` is kept for auditability. It shows
+the SQLens changes relative to upstream pgvector commit
+`cab9da72c04353f143bb06b42ab70a403daac64a`.
 
 ## Reproducibility Notes
 
