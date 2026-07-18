@@ -16,7 +16,7 @@
 #include "utils/sampling.h"
 #include "vector.h"
 
-#define SQLENS_BUILD_ID "sqlens-v11-admission-join-safe-20260718-r6"
+#define SQLENS_BUILD_ID "sqlens-v11-admission-writer-safe-20260718-r7"
 
 #if PG_VERSION_NUM >= 190000
 typedef Pointer Item;
