@@ -563,6 +563,15 @@ class RunPgvectorBinaryAbControlTests(unittest.TestCase):
 
             manifest = json.loads(Path(args.manifest).read_text())
             self.assertEqual(manifest["runner_runs"][0]["exit_code"], 17)
+            self.assertEqual(
+                manifest["runner_runs"][0]["child_logs"]["stderr"]["tail"],
+                "runner failed",
+            )
+            self.assertTrue(
+                Path(
+                    manifest["runner_runs"][0]["child_logs"]["stderr"]["path"]
+                ).is_file()
+            )
             self.assertEqual(manifest["restoration"]["status"], "verified")
             self.assertEqual(manifest["switches"][-1]["implementation"], "restore_initial")
             self.assertEqual(manifest["switches"][-1]["status"], "installed_and_verified")

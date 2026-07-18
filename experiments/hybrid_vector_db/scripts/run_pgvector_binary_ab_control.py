@@ -136,6 +136,27 @@ def parse_target_recalls(value: str) -> list[float]:
     return sorted(set(recalls))
 
 
+def atomic_write_text(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=str(path.parent), text=True
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as target:
+            target.write(value)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent), text=True)
@@ -983,6 +1004,28 @@ def run_external_runner(
             "started_at_utc": started,
             "finished_at_utc": utc_now(),
             "exit_code": result.returncode,
+        }
+        log_dir = args.out_dir / "staging" / args.run_uuid / "controller_logs"
+        log_stem = (
+            f"{execution_stage}_{'none' if final_block is None else final_block}_"
+            f"{implementation}_{started.replace(':', '').replace('-', '')}"
+        )
+        stdout_path = log_dir / f"{log_stem}.stdout.log"
+        stderr_path = log_dir / f"{log_stem}.stderr.log"
+        atomic_write_text(stdout_path, result.stdout or "")
+        atomic_write_text(stderr_path, result.stderr or "")
+        record["child_logs"] = {
+            "stdout": {
+                "path": str(stdout_path),
+                "sha256": sha256_file(stdout_path),
+                "bytes": stdout_path.stat().st_size,
+            },
+            "stderr": {
+                "path": str(stderr_path),
+                "sha256": sha256_file(stderr_path),
+                "bytes": stderr_path.stat().st_size,
+                "tail": (result.stderr or "")[-4096:],
+            },
         }
     except OSError as exc:
         record = {

@@ -1714,7 +1714,9 @@ def database_fingerprint(
         raise ValueError("formal database fingerprint requires a nonempty data_epoch")
     cur.execute(
         "SELECT (SELECT system_identifier::text FROM pg_control_system()), "
-        "current_database(), current_database()::regdatabase::oid::bigint, current_user, "
+        "current_database(), "
+        "(SELECT oid::bigint FROM pg_database WHERE datname=current_database()), "
+        "current_user, "
         "inet_server_addr()::text, inet_server_port(), current_setting('server_version'), "
         "COALESCE((SELECT extversion FROM pg_extension WHERE extname='vector'), '')"
     )
