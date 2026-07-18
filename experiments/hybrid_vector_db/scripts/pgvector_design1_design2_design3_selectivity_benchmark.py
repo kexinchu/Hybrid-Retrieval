@@ -768,8 +768,8 @@ def validate_d2_bfs_locality(value: object, field: str) -> None:
     same_or_next_pairs = nonnegative_int("same_or_next_page_pairs")
     nondecreasing_pairs = nonnegative_int("nondecreasing_pairs")
     backward_pairs = nonnegative_int("backward_pairs")
-    nonnegative_int("total_abs_block_delta")
-    nonnegative_int("max_abs_block_delta")
+    total_abs_block_delta = nonnegative_int("total_abs_block_delta")
+    max_abs_block_delta = nonnegative_int("max_abs_block_delta")
     page_runs = nonnegative_int("page_runs")
     sample_limit = nonnegative_int("sample_limit")
     sample_count = nonnegative_int("sample_count")
@@ -783,9 +783,17 @@ def validate_d2_bfs_locality(value: object, field: str) -> None:
         raise D2GraphProofGateError(f"D2 {field} locality has too many same/next pairs")
     if nondecreasing_pairs + backward_pairs != adjacent_pairs:
         raise D2GraphProofGateError(f"D2 {field} locality monotonicity counters disagree")
-    if page_runs < (0 if sequence_nodes == 0 else 1) or page_runs > sequence_nodes:
+    if page_runs != sequence_nodes - same_block_pairs:
         raise D2GraphProofGateError(f"D2 {field} locality page-run count is invalid")
-    if sample_limit != 256 or sample_count > sample_limit or sample_count > sequence_nodes:
+    if next_block_pairs > nondecreasing_pairs:
+        raise D2GraphProofGateError(f"D2 {field} locality forward counters disagree")
+    if max_abs_block_delta > total_abs_block_delta:
+        raise D2GraphProofGateError(f"D2 {field} locality block-delta counters disagree")
+    if adjacent_pairs == same_block_pairs and (
+        total_abs_block_delta != 0 or max_abs_block_delta != 0
+    ):
+        raise D2GraphProofGateError(f"D2 {field} locality zero-delta counters disagree")
+    if sample_limit != 256 or sample_count != min(sample_limit, sequence_nodes):
         raise D2GraphProofGateError(f"D2 {field} locality sample bound is invalid")
     if value["sample_truncated"] is not (sample_count < sequence_nodes):
         raise D2GraphProofGateError(f"D2 {field} locality sample truncation is invalid")
@@ -795,34 +803,51 @@ def validate_d2_bfs_locality(value: object, field: str) -> None:
     if not isinstance(samples, list) or len(samples) != sample_count:
         raise D2GraphProofGateError(f"D2 {field} locality rank samples are incomplete")
     previous_rank = -1
-    for sample in samples:
+    for sample_index, sample in enumerate(samples):
         if not isinstance(sample, dict):
             raise D2GraphProofGateError(f"D2 {field} locality has an invalid rank sample")
         rank = sample.get("rank")
+        block = sample.get("block")
+        offset = sample.get("offset")
+        expected_rank = (
+            0
+            if sample_count == 1
+            else sample_index * (sequence_nodes - 1) // (sample_count - 1)
+        )
         if (
             isinstance(rank, bool)
             or not isinstance(rank, int)
             or rank <= previous_rank
             or rank < 0
             or rank >= sequence_nodes
-            or not isinstance(sample.get("block"), int)
-            or not isinstance(sample.get("offset"), int)
+            or rank != expected_rank
+            or isinstance(block, bool)
+            or not isinstance(block, int)
+            or block < 0
+            or isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or offset <= 0
         ):
             raise D2GraphProofGateError(f"D2 {field} locality has invalid rank samples")
         previous_rank = rank
     if sample_count and (samples[0]["rank"] != 0 or samples[-1]["rank"] != sequence_nodes - 1):
         raise D2GraphProofGateError(f"D2 {field} locality samples do not cover sequence ends")
-    for ratio_name in (
-        "same_block_ratio",
-        "same_or_next_page_ratio",
-        "nondecreasing_ratio",
-    ):
+    ratio_counters = {
+        "same_block_ratio": same_block_pairs,
+        "same_or_next_page_ratio": same_or_next_pairs,
+        "nondecreasing_ratio": nondecreasing_pairs,
+    }
+    denominator = adjacent_pairs if adjacent_pairs else 1
+    for ratio_name, numerator in ratio_counters.items():
         ratio = value[ratio_name]
         if (
             isinstance(ratio, bool)
             or not isinstance(ratio, (int, float))
             or not math.isfinite(ratio)
             or not 0 <= ratio <= 1
+            or not math.isclose(
+                float(ratio), numerator / denominator, rel_tol=1e-15, abs_tol=1e-15
+            )
         ):
             raise D2GraphProofGateError(f"D2 {field} locality has invalid {ratio_name}")
 

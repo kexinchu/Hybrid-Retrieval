@@ -61,6 +61,41 @@ class PgvectorBfsLocalityProofTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "sample truncation"):
             benchmark.validate_d2_bfs_locality(value, "left_bfs_locality")
 
+    def test_counter_ratios_page_runs_and_sample_positions_fail_closed(self) -> None:
+        value = locality([10, 10, 11, 15, 14])
+        value["page_runs"] = 2
+        with self.assertRaisesRegex(RuntimeError, "page-run"):
+            benchmark.validate_d2_bfs_locality(value, "left_bfs_locality")
+
+        value = locality([10, 10, 11, 15, 14])
+        value["same_block_ratio"] = 0.9
+        with self.assertRaisesRegex(RuntimeError, "same_block_ratio"):
+            benchmark.validate_d2_bfs_locality(value, "left_bfs_locality")
+
+        value = locality(list(range(300)))
+        value["sample_limit"] = 256
+        value["sample_count"] = 256
+        value["sample_truncated"] = True
+        value["rank_samples"] = [
+            {
+                "rank": index * 299 // 255,
+                "block": index * 299 // 255,
+                "offset": 1,
+            }
+            for index in range(256)
+        ]
+        benchmark.validate_d2_bfs_locality(value, "left_bfs_locality")
+        value["rank_samples"][100]["rank"] += 1
+        with self.assertRaisesRegex(RuntimeError, "rank samples"):
+            benchmark.validate_d2_bfs_locality(value, "left_bfs_locality")
+
+    def test_rank_sample_block_and_offset_are_real_integers(self) -> None:
+        for field, replacement in (("block", True), ("offset", 0)):
+            value = locality([10, 11])
+            value["rank_samples"][0][field] = replacement
+            with self.assertRaisesRegex(RuntimeError, "rank samples"):
+                benchmark.validate_d2_bfs_locality(value, "left_bfs_locality")
+
     def test_stable_d2_proof_keeps_both_symmetric_locality_objects(self) -> None:
         comparison = {
             field: True
