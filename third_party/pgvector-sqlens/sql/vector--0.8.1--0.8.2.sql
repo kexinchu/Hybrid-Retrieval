@@ -1,6 +1,10 @@
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
 \echo Use "ALTER EXTENSION vector UPDATE TO '0.8.2'" to load this file. \quit
 
+ALTER FUNCTION vector_hnsw_fragment_epoch_bump_trigger() SECURITY DEFINER;
+ALTER FUNCTION vector_hnsw_fragment_epoch_bump_trigger()
+	SET search_path = pg_catalog, pg_temp;
+
 CREATE FUNCTION vector_hnsw_guidance_bind(regclass, text[], text) RETURNS boolean
 	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
 

@@ -56,7 +56,8 @@ include $(PGXS)
 
 SQLENS_SMOKE_SQL = \
 	$(abspath ../../experiments/hybrid_vector_db/sql/pgvector_clone_formality_smoke.sql) \
-	$(abspath ../../experiments/hybrid_vector_db/sql/pgvector_preferred_index_smoke.sql)
+	$(abspath ../../experiments/hybrid_vector_db/sql/pgvector_preferred_index_smoke.sql) \
+	$(abspath ../../experiments/hybrid_vector_db/sql/pgvector_epoch_writer_permissions_smoke.sql)
 
 .PHONY: sqlens_smoke_installcheck
 

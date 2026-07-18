@@ -1831,7 +1831,7 @@ HnswMetadataEnsureFragmentStore(void)
 		"bloom_bit_count bigint NOT NULL,"
 		"payload bytea NOT NULL,"
 		"format_version integer NOT NULL DEFAULT 3,"
-		"built_at timestamptz NOT NULL DEFAULT now(),"
+		"built_at timestamptz NOT NULL DEFAULT pg_catalog.now(),"
 		"PRIMARY KEY (heap_oid, filter_name, kind)"
 		")",
 		false, 0);
@@ -1842,7 +1842,7 @@ HnswMetadataEnsureFragmentStore(void)
 		"CREATE TABLE IF NOT EXISTS public.pgvector_hnsw_fragment_epoch ("
 		"heap_oid oid PRIMARY KEY,"
 		"epoch bigint NOT NULL DEFAULT 0,"
-		"updated_at timestamptz NOT NULL DEFAULT now()"
+		"updated_at timestamptz NOT NULL DEFAULT pg_catalog.now()"
 		")",
 		false, 0);
 	if (spiStatus != SPI_OK_UTILITY)
@@ -1889,8 +1889,19 @@ HnswMetadataGetRelationVersion(Oid heapOid, int64 *epoch, Oid *relFileNode)
 				"AND t.tgname = 'pgvector_hnsw_fragment_epoch' "
 				"AND NOT t.tgisinternal "
 				"AND t.tgenabled IN ('O', 'A') "
-				"AND t.tgfoid = pg_catalog.to_regprocedure("
-				"'public.vector_hnsw_fragment_epoch_bump_trigger()') "
+				"AND EXISTS (SELECT 1 "
+				"FROM pg_catalog.pg_proc AS p "
+				"JOIN pg_catalog.pg_depend AS d ON d.objid = p.oid "
+				"AND d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass "
+				"AND d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass "
+				"AND d.deptype = 'e' "
+				"JOIN pg_catalog.pg_extension AS x ON x.oid = d.refobjid "
+				"WHERE p.oid = t.tgfoid "
+				"AND p.proname = 'vector_hnsw_fragment_epoch_bump_trigger' "
+				"AND p.pronamespace = x.extnamespace "
+				"AND p.pronargs = 0 "
+				"AND p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype "
+				"AND x.extname = 'vector') "
 				"AND t.tgnargs = 0 "
 				"AND t.tgqual IS NULL "
 				"AND t.tgattr::text = '' "
@@ -1943,6 +1954,14 @@ vector_hnsw_fragment_epoch_bump_trigger(PG_FUNCTION_ARGS)
 				 errmsg("vector_hnsw_fragment_epoch_bump_trigger must be called as a trigger")));
 
 	triggerData = (TriggerData *) fcinfo->context;
+	if (!TRIGGER_FIRED_FOR_STATEMENT(triggerData->tg_event) ||
+		!(TRIGGER_FIRED_BY_INSERT(triggerData->tg_event) ||
+		  TRIGGER_FIRED_BY_UPDATE(triggerData->tg_event) ||
+		  TRIGGER_FIRED_BY_DELETE(triggerData->tg_event) ||
+		  TRIGGER_FIRED_BY_TRUNCATE(triggerData->tg_event)))
+		ereport(ERROR,
+				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+				 errmsg("vector_hnsw_fragment_epoch_bump_trigger requires a statement-level data-change trigger")));
 	heapOid = RelationGetRelid(triggerData->tg_relation);
 	values[0] = ObjectIdGetDatum(heapOid);
 
@@ -1950,12 +1969,17 @@ vector_hnsw_fragment_epoch_bump_trigger(PG_FUNCTION_ARGS)
 	if (spiStatus != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed: %d", spiStatus);
 	spiStatus = SPI_execute_with_args(
-		"INSERT INTO public.pgvector_hnsw_fragment_epoch (heap_oid, epoch) VALUES ($1, 1) "
-		"ON CONFLICT (heap_oid) DO UPDATE SET epoch = "
-		"public.pgvector_hnsw_fragment_epoch.epoch + 1, updated_at = now()",
+		"UPDATE public.pgvector_hnsw_fragment_epoch "
+		"SET epoch = epoch + 1, updated_at = pg_catalog.now() "
+		"WHERE heap_oid = $1",
 		1, argTypes, values, nulls, false, 0);
-	if (spiStatus != SPI_OK_INSERT && spiStatus != SPI_OK_UPDATE)
+	if (spiStatus != SPI_OK_UPDATE)
 		elog(ERROR, "SPI_execute_with_args failed: %d", spiStatus);
+	if (SPI_processed != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("fragment epoch tracking is not registered for relation %u", heapOid),
+				 errhint("Call vector_hnsw_fragment_tracking_enable() before modifying the relation.")));
 	SPI_finish();
 
 	PG_RETURN_POINTER(NULL);
@@ -1975,6 +1999,8 @@ vector_hnsw_fragment_tracking_enable(PG_FUNCTION_ARGS)
 	char	   *relName;
 	char	   *namespaceName;
 	char	   *qualifiedName;
+	char	   *functionNamespaceName;
+	char	   *qualifiedTriggerFunction;
 	StringInfoData sql;
 	int64		epoch;
 	bool		isnull;
@@ -1986,6 +2012,13 @@ vector_hnsw_fragment_tracking_enable(PG_FUNCTION_ARGS)
 				 errmsg("relation with OID %u does not exist", heapOid)));
 	namespaceName = get_namespace_name(get_rel_namespace(heapOid));
 	qualifiedName = quote_qualified_identifier(namespaceName, relName);
+	functionNamespaceName = get_namespace_name(get_func_namespace(fcinfo->flinfo->fn_oid));
+	if (functionNamespaceName == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_SCHEMA),
+				 errmsg("could not resolve the vector extension schema")));
+	qualifiedTriggerFunction = quote_qualified_identifier(functionNamespaceName,
+		"vector_hnsw_fragment_epoch_bump_trigger");
 	HnswMetadataEnsureFragmentStore();
 
 	initStringInfo(&sql);
@@ -2024,8 +2057,19 @@ vector_hnsw_fragment_tracking_enable(PG_FUNCTION_ARGS)
 			"AND t.tgname = 'pgvector_hnsw_fragment_epoch' "
 			"AND NOT t.tgisinternal "
 			"AND t.tgenabled IN ('O', 'A') "
-			"AND t.tgfoid = pg_catalog.to_regprocedure("
-			"'public.vector_hnsw_fragment_epoch_bump_trigger()') "
+			"AND EXISTS (SELECT 1 "
+			"FROM pg_catalog.pg_proc AS p "
+			"JOIN pg_catalog.pg_depend AS d ON d.objid = p.oid "
+			"AND d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass "
+			"AND d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass "
+			"AND d.deptype = 'e' "
+			"JOIN pg_catalog.pg_extension AS x ON x.oid = d.refobjid "
+			"WHERE p.oid = t.tgfoid "
+			"AND p.proname = 'vector_hnsw_fragment_epoch_bump_trigger' "
+			"AND p.pronamespace = x.extnamespace "
+			"AND p.pronargs = 0 "
+			"AND p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype "
+			"AND x.extname = 'vector') "
 			"AND t.tgnargs = 0 "
 			"AND t.tgqual IS NULL "
 			"AND t.tgattr::text = '' "
@@ -2072,8 +2116,8 @@ vector_hnsw_fragment_tracking_enable(PG_FUNCTION_ARGS)
 		appendStringInfo(&sql,
 						 "CREATE TRIGGER pgvector_hnsw_fragment_epoch "
 						 "AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON %s "
-						 "FOR EACH STATEMENT EXECUTE FUNCTION public.vector_hnsw_fragment_epoch_bump_trigger()",
-						 qualifiedName);
+						 "FOR EACH STATEMENT EXECUTE FUNCTION %s()",
+						 qualifiedName, qualifiedTriggerFunction);
 		spiStatus = SPI_connect();
 		if (spiStatus != SPI_OK_CONNECT)
 			elog(ERROR, "SPI_connect failed: %d", spiStatus);
@@ -2090,7 +2134,7 @@ vector_hnsw_fragment_tracking_enable(PG_FUNCTION_ARGS)
 			elog(ERROR, "SPI_connect failed: %d", spiStatus);
 		spiStatus = SPI_execute_with_args(
 			"UPDATE public.pgvector_hnsw_fragment_epoch "
-			"SET epoch = epoch + 1, updated_at = now() "
+			"SET epoch = epoch + 1, updated_at = pg_catalog.now() "
 			"WHERE heap_oid = $1 RETURNING epoch",
 			1, argTypes, values, nulls, false, 1);
 		if (spiStatus != SPI_OK_UPDATE_RETURNING || SPI_processed != 1)
@@ -2104,6 +2148,7 @@ vector_hnsw_fragment_tracking_enable(PG_FUNCTION_ARGS)
 
 	CommandCounterIncrement();
 	pfree(qualifiedName);
+	pfree(qualifiedTriggerFunction);
 	PG_RETURN_INT64(epoch);
 }
 
@@ -2320,7 +2365,7 @@ HnswMetadataSaveFragmentStore(Oid heapOid, const char *filterName, HnswGuidanceK
 		"build_epoch = EXCLUDED.build_epoch,"
 		"relfilenode = EXCLUDED.relfilenode,"
 		"format_version = EXCLUDED.format_version,"
-		"built_at = now() "
+		"built_at = pg_catalog.now() "
 		"WHERE pgvector_hnsw_fragment_store.relfilenode <> EXCLUDED.relfilenode "
 		"OR pgvector_hnsw_fragment_store.build_epoch <= EXCLUDED.build_epoch",
 		10, argTypes, values, nulls, false, 0);

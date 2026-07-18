@@ -140,7 +140,8 @@ REVOKE ALL ON FUNCTION vector_hnsw_graph_fingerprint(regclass) FROM PUBLIC;
 REVOKE ALL ON FUNCTION vector_hnsw_graph_compare(regclass, regclass) FROM PUBLIC;
 
 CREATE FUNCTION vector_hnsw_fragment_epoch_bump_trigger() RETURNS trigger
-	AS 'MODULE_PATHNAME' LANGUAGE C;
+	AS 'MODULE_PATHNAME' LANGUAGE C SECURITY DEFINER
+	SET search_path = pg_catalog, pg_temp;
 
 CREATE FUNCTION vector_hnsw_fragment_tracking_enable(regclass) RETURNS int8
 	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
